@@ -6,6 +6,9 @@ timezone = "America/New_York"
 autonomy_mode = "shadow" # shadow | internal | active
 tick_seconds = 30
 reconciliation_seconds = 300
+# Full eventless LLM reconsideration. Lightweight recovery still runs at the
+# reconciliation interval, while events wake reasoning immediately.
+reasoning_refresh_seconds = 3600
 max_events_per_pass = 25
 max_parallel_work = 4
 # Maximum dispatch authorizations one validated model pass may issue.
@@ -32,14 +35,15 @@ enabled = false
 binary = "hermes"
 profile = "operator"
 board = "default"
-# This release uses one attested profile. Keep all profile fields identical.
+# These defaults and allowed_profiles form the execution-profile allowlist.
+# Install the plugin and attest each selected profile independently.
 default_assignee = "operator"
 orchestrator_profile = "operator"
 command_timeout_seconds = 120
 goal_mode = false
 default_skills = []
-# Parallel compute is bounded task-scoped delegate_task within this profile.
-# Native Kanban child creation and unmanaged profile fan-out are not authorized.
+# Parallel compute uses independent canonical Operator cards up to
+# max_parallel_work. Current background delegate_task is blocked on managed cards.
 allowed_profiles = ["operator"]
 allowed_skills = []
 # Only explicitly named environment variables are added to the safe Hermes child env.
@@ -55,11 +59,11 @@ control_timeout_seconds = 10
 require_policy_attestation = true
 # The native plugin heartbeat defaults to 120 seconds. Keep this core TTL above it.
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.2.0"]
-allowed_policy_versions = ["3.0.0"]
+allowed_plugin_versions = ["1.3.0"]
+allowed_policy_versions = ["4.0.0"]
 # Exact SHA-256 of integrations/hermes_operator_plugin/policy.py in this release.
 # Recompute, review, and update this allowlist whenever that policy source changes.
-allowed_policy_digests = ["6b8b21ef6d4a7f7ee5d04c9cf8b4a2fe15e9ed434d42980c879fda150df21d2f"]
+allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
 
 [obsidian]
 enabled = false
@@ -67,6 +71,22 @@ vault_path = ""
 discover = true
 operator_root = "Hermes Operator"
 write_mode = "projection"
+
+[native_automation]
+# Desired Hermes-owned loops. Installation is explicit because OAuth, gateway,
+# private delivery targets, and the vault path are deployment-owned.
+enabled = false
+delivery = "local" # Set a private Hermes target such as telegram or slack.
+google_intake_enabled = true
+google_intake_schedule = "every 10m"
+reminder_delivery_enabled = true
+reminder_schedule = "every 15m"
+attention_redelivery_seconds = 3600
+briefing_enabled = true
+briefing_schedule = "0 8 * * *"
+attach_to_session = true
+google_skill = "google-workspace"
+obsidian_skill = "obsidian"
 
 [server]
 enabled = true
@@ -94,7 +114,30 @@ trusted_event_sources = ["operator", "system"]
 allow_memory_auto_promotion = false
 max_llm_priority_adjustment = 10.0
 
-# Optional read-only command poller. Duplicate this table per inbound surface.
+[verification]
+enabled = true
+max_artifacts = 64
+max_files_per_directory = 2000
+max_artifact_bytes = 268435456
+max_total_artifact_bytes = 536870912
+
+# Late-bind each Hermes workspace or artifact store visible to the core.
+# Native completion artifacts outside these roots fail verification closed.
+[verification.artifact_roots]
+# workspace = "${HERMES_OPERATOR_WORKSPACE:-/srv/hermes/workspace}"
+
+# Checks are optional, fixed deployment-owned argv. A work item runs a check
+# only when its protected verification_contract names it.
+# [[verification.checks]]
+# name = "unit-tests"
+# command = ["python", "-m", "pytest", "-q"]
+# cwd = "${HERMES_OPERATOR_WORKSPACE:-/srv/hermes/workspace}"
+# timeout_seconds = 300
+# max_output_bytes = 1048576
+# pass_env = []
+
+# Optional extension for non-Google providers or externally managed readers.
+# Native Google intake above uses Hermes OAuth and the google-workspace skill.
 # [[inbound_connectors]]
 # name = "mail-reader"
 # source = "mail"

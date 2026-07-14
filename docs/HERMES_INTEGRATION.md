@@ -11,28 +11,50 @@ The bridge depends on an HTTP contract, not a Hermes installation path, database
 Obsidian vault path, or shared Python environment. Hermes and the control plane may run
 on the same host, in different containers, or on separate private-network hosts.
 
-## Security boundary
+The integration also supplies installable Hermes Cron contracts for read-only Google
+Workspace intake, private reminder and pending-question delivery, and a daily briefing.
+They use Hermes' bundled Google Workspace and Obsidian skills, account OAuth, Gateway,
+and native delivery rather than duplicating provider SDKs, vault indexing, or scheduling
+inside the Operator daemon.
 
-The plugin intentionally exposes only three read-only tools:
+```bash
+hermes-operator --config operator.toml native-jobs plan
+hermes-operator --config operator.toml native-jobs install --dry-run
+hermes-operator --config operator.toml native-jobs install
+```
 
-- `operator_status`
-- `operator_next_work`
-- `operator_open_questions`
+## Scope and policy boundary
 
-It has no tool or command for sending messages, publishing, deploying, purchasing,
-answering a user question, approving an action, issuing an approval grant, or consuming
-an approval grant. Lifecycle POST requests only record internal observations. They do
-not execute work and do not constitute user approval.
+The plugin exposes eleven scoped tools:
+
+- Reads: `operator_status`, `operator_next_work`, `operator_open_questions`,
+  `operator_due_reminders`, and `operator_diagnostics`.
+- Private delivery: `operator_claim_attention`.
+- Conversational management: `operator_create_work`, `operator_answer_question`,
+  `operator_authorize_work`, and `operator_update_work`.
+- Provider evidence: `operator_ingest_inbound`.
+
+These tools do not send messages, publish, deploy, purchase, issue approval grants, or
+consume approval grants. Work creation is reversible triage. Exact question answers,
+execution authorization, terminal or hierarchy changes, Cron mutations, and identifiable
+Google writes require Hermes-native human confirmation outside managed worker cards.
+Lifecycle POST requests record internal observations and do not constitute user approval.
 
 The plugin also installs a required `pre_tool_call` policy hook. Hermes documents this
 hook as firing before every built-in and plugin tool and accepting
-`{"action": "block", "message": "..."}` as a veto. The guard blocks direct worker
+`{"action": "block", "message": "..."}` as a veto. The strict task-scoped guard applies
+when the hook identifies an Operator-managed Kanban card. It blocks direct managed-worker
 attempts to cause external or destructive side effects. It has no configuration flag,
 approval argument, model-visible token, or prompt phrase that bypasses the block.
 
+Outside an Operator-managed card, the plugin defers normal interactive and Cron behavior
+to Hermes. It requests the harness' native approval UI for identifiable scheduler and
+external Google mutations. This preserves native Hermes behavior instead of attempting
+host-wide plugin ordering or end-to-end mediation.
+
 The guard covers these classes:
 
-| Class | Examples blocked in a worker |
+| Class | Examples blocked on an Operator-managed card |
 | --- | --- |
 | Communication | Email, chat, DM, comment, reply, and notification sends |
 | Publication | Web and social publishing, releases, package publishing, deployments |
@@ -44,14 +66,14 @@ The guard covers these classes:
 | Code change | Push, merge, remote pull-request creation, review, and repository mutation |
 | Generic mutation | Raw HTTP, every unreviewed MCP or plugin tool, device control |
 
-Hermes multiplexed tools receive action-level checks. Read-only Discord fetches, cron
+On managed cards, Hermes multiplexed tools receive action-level checks. Read-only Discord fetches, cron
 listing, process polling, Spotify inspection, and browser snapshots remain available.
 Mutating actions through the same tools are blocked. Browser navigation, back, scroll,
 click, typing, key presses, dialogs, raw CDP, raw HTTP including GET, and interactive
 computer-control actions are blocked because URLs and interaction arguments can exfiltrate
 data or commit external state.
 
-Every MCP tool and every unknown plugin tool is fail-closed, including names that appear
+Every MCP tool and every unknown plugin tool is fail-closed on managed cards, including names that appear
 read-only. New tools require a code-reviewed addition to the explicit allowlist. The
 terminal tool always permits a small set of local read-only inspection commands and local
 Git inspection. Additional local writes, tests, and builds are allowed only when the
@@ -60,20 +82,21 @@ Shell escapes, network clients, interpreters, unknown commands, and commands wit
 external or destructive effects remain blocked. `awk` is not allowed because it can
 invoke `system()`.
 
-Explicitly reviewed local file reads and edits, operator tools, bounded delegation,
+Explicitly reviewed local file reads and edits, operator reads,
 clarification, session and skill reads, and selected dedicated read-only retrieval tools
 remain usable. Kanban reads are allowed; completion, blocking, heartbeat, and comments
 may target only the current live task. Native Kanban creation, linking, unblocking, and
-foreign mutation are control-plane owned and blocked in the worker. An action that has
-received user approval still does not run through Hermes. The daemon does not instantiate
-an outbound broker. The separately installed `hermes-outbound-broker` may consume the
-exact one-shot grant only under its own isolated credentials and network policy.
+foreign mutation are control-plane owned and blocked in the managed worker. Current
+top-level `delegate_task` is also blocked there because Hermes runs it in the background
+without durable foreground completion semantics. The daemon does not instantiate an
+outbound broker. The separately installed `hermes-outbound-broker` is an optional path
+for exact grants, not a requirement for the control plane.
 
 Project-defined test and build scripts can execute arbitrary repository code even when
 their command shape was reviewed. Therefore `local_test` and `local_build` are not a hard
-no-egress boundary. Run Hermes workers in an operating-system or container sandbox with
-network egress disabled and filesystem access limited to the authorized workspace. The
-guard still blocks direct network, publication, destructive, and shell-escape forms.
+no-egress boundary. Deployments that need a stronger boundary can add operating-system or
+container filesystem scoping, credential isolation, and network egress controls. The
+managed-card guard still blocks direct network, publication, destructive, and shell-escape forms.
 
 The injected context contains an explicit statement that priorities do not authorize
 external side effects. If the control plane is unavailable, context injection returns
@@ -81,7 +104,7 @@ nothing and Hermes continues normally. Only context availability is fail-open. T
 local `pre_tool_call` guard does not call the service and remains active during a service
 outage.
 
-### Enforcement limits and required defense in depth
+### Enforcement limits and optional defense in depth
 
 The current official hook reliably vetoes a direct tool dispatch before its registered
 handler runs. It cannot prove the implementation of an explicitly allowed tool, stop a
@@ -93,7 +116,7 @@ Malformed arguments and internal policy-evaluation errors return a block respons
 are not allowed to escape as hook exceptions because Hermes treats plugin hook failures
 as non-fatal and would otherwise continue processing.
 
-For the production `operator` worker profile:
+For a deployment that requires a harder managed-worker boundary:
 
 1. Keep messaging, Discord administration, browsers, computer control, raw MCP, and other
    mutation-capable toolsets out of the `operator` worker profile.
@@ -107,14 +130,20 @@ For the production `operator` worker profile:
    outbound broker.
 6. Verify the plugin and `pre_tool_call` hook are loaded before starting worker dispatch.
 
-Credential isolation and outbound network policy are the hard boundary. The hook is a
-second enforcement layer and a useful audit message, but it must not be the only control
-preventing an autonomous worker from reaching external systems.
+Credential isolation and outbound network policy can provide a harder boundary. The hook
+is a task-scoped enforcement layer and useful audit message, but this project does not
+claim that it completely mediates the Hermes host or unmanaged sessions.
 
 Hermes documents plugin failures as non-fatal to the host process. This plugin therefore
 treats `pre_tool_call` registration as required and stops its own registration if Hermes
-rejects the hook, but an operator must still prevent worker startup when plugin health
-verification fails.
+rejects the hook. Operator-managed dispatch should remain disabled until plugin health
+verification succeeds; the plugin does not attempt to stop or reorder the Hermes host.
+
+The plugin records a separate `compatibility_observed` diagnostic and exposes
+`operator_diagnostics`. It reports the host surfaces and detected delegation mode without
+changing policy attestation or attempting to reorder Hermes plugins and hooks. Unsupported
+optional hooks reduce observation only; rejection of the required pre-tool hook disables
+the bridge for managed execution.
 
 ## HTTP contract
 
@@ -123,10 +152,20 @@ The plugin reads these endpoints:
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Service reachability |
+| `GET` | `/v1/hermes/status` | Content-free runtime and operational counters |
 | `GET` | `/v1/next?limit=N` | Prioritized work suggestions |
 | `GET` | `/v1/questions?status=pending&limit=N` | Questions needing operator input |
+| `GET` | `/v1/hermes/attention?limit=N` | Read-only reminder and question preview |
+| `GET` | `/v1/hermes/reminders?limit=N` | Read-only reminder preview |
 | `GET` | `/v1/hermes/execution-contract?task_id=ID` | Exact live task capabilities for the guard |
-| `POST` | `/v1/hermes/delegation-claim` | Atomic one-shot delegation batch claim for the canonical run |
+| `POST` | `/v1/hermes/attention/claim` | Atomic private Cron delivery claim |
+| `POST` | `/v1/hermes/work` | Capture reversible work or a reminder |
+| `POST` | `/v1/hermes/work/{id}/update` | Apply a version-fenced work update |
+| `POST` | `/v1/hermes/work/{id}/reminder` | Snooze, acknowledge, or complete a reminder |
+| `POST` | `/v1/hermes/work/{id}/authorize` | Record exact operator authorization |
+| `POST` | `/v1/hermes/questions/{id}/answer` | Record an exact operator answer |
+| `POST` | `/v1/hermes/inbound` | Record normalized Google evidence |
+| `POST` | `/v1/hermes/delegation-claim` | Compatibility claim if a future host proves foreground delegation |
 | `POST` | `/v1/events/hermes` | Required startup attestation and internal lifecycle observation |
 
 ### Required startup policy attestation
@@ -150,8 +189,8 @@ The request envelope is:
   "occurred_at": "2026-07-13T22:30:00+00:00",
   "payload": {
     "profile": "operator",
-    "plugin_version": "1.2.0",
-    "policy_version": "3.0.0",
+    "plugin_version": "1.3.0",
+    "policy_version": "4.0.0",
     "policy_digest": "<64 lowercase SHA-256 hex characters>",
     "guard_active": true,
     "policy_mode": "default_deny",
@@ -167,6 +206,9 @@ The request envelope is:
 The payload contract is closed: it contains exactly the seven fields shown above and
 no others. `profile` must exactly match `HERMES_OPERATOR_PROFILE`. `policy_digest` is
 the lowercase SHA-256 digest of the exact loaded `policy.py` source bytes.
+`policy_mode = "default_deny"` describes the Operator-managed-card branch. The same
+reviewed policy deliberately defers unmanaged interactive and Cron sessions to native
+Hermes behavior and confirmation.
 `attested_at` must be an offset-aware ISO 8601 timestamp in UTC, and `occurred_at`
 equals it. The external ID and dedupe key are identical and hash the profile, plugin
 version, policy version, policy digest, and timestamp. A new plugin registration thus
@@ -218,7 +260,7 @@ evidence.
 
 #### Dispatcher acceptance rule
 
-Before reserving work for the single Hermes `operator` profile, the control plane
+Before reserving work for any effective allowlisted Hermes profile, the control plane
 requires a fresh stored profile record satisfying every condition below:
 
 1. The record was written only by the exact `policy.attested` contract on the reserved
@@ -237,26 +279,28 @@ requires a fresh stored profile record satisfying every condition below:
 The dispatcher must derive this decision from the authenticated ingress record, never
 from task metadata, model output, a worker claim, or a prompt. This record is startup
 evidence from possession of the scoped bridge credential, not hardware-backed remote
-attestation. Credential isolation, worker network denial, and restricted toolsets remain
-the hard boundary.
+attestation. Credential isolation, worker network denial, and restricted toolsets are
+optional hardening when the deployment needs a stronger boundary than managed-card policy.
 
 ### Task-scoped execution contract and lifecycle
 
 Before allowing delegation, local writes, tests, builds, or a current-task Kanban
 mutation, the guard resolves the exact task ID from the hook and `HERMES_KANBAN_TASK`.
 Conflicting or malformed identities fail closed. It then fetches the live execution
-contract and requires the same task ID, `operator` profile, contract digest, canonical
-running state, and named capability. A cached prompt, worker claim, card description, or
-tool argument cannot create this authority.
+contract and requires the same task ID, exact configured profile, canonical running
+state, contract digest, and named capability. A cached prompt, worker claim, card
+description, or tool argument cannot create this authority.
 
-Before Hermes invokes `delegate_task`, the guard posts exactly `task_id` and
-`requested_children` to `/v1/hermes/delegation-claim`. The child count must be from one
-through three. The core revalidates the live task contract and atomically writes a
-one-shot SQLite claim keyed by canonical run ID. The response is bound to the task, run,
-contract digest, and requested child count. The guard fails closed on a stale contract,
-malformed response, or duplicate claim. Because the core consumes the claim before tool
-execution, plugin or worker restart cannot recover another batch, and a failed tool
-invocation does not restore it.
+Current Hermes reports top-level `delegate_task` as background and non-durable. The guard
+therefore blocks it on Operator-managed cards before any child is launched. Parallel
+execution is represented by independent canonical WorkItems and cards up to
+`operator.max_parallel_work`.
+
+The `/v1/hermes/delegation-claim` contract remains a fail-closed compatibility surface
+for a host that can prove foreground delegation semantics. If such a host is explicitly
+validated, the guard must post exactly `task_id` and `requested_children`, and the core
+atomically binds one claim to the canonical run. The current supported mode does not use
+that path.
 
 When a card reports blocked, the control plane closes that run attempt and releases its
 global compute slot. After a linked operator answer and fresh authorization, it reserves
@@ -301,10 +345,11 @@ it is not bound only to localhost.
 
 Use only the scoped bridge token. Never place the operator API token, approval secret,
 Hermes run-control token, or any outbound connector credential in the Hermes plugin
-environment. The bridge token is authorized only for `/health`, prioritized work and
-question reads, exact task-contract reads, one atomic task-scoped delegation claim, and
-Hermes lifecycle event ingestion. It cannot answer questions, mutate operator work,
-inspect approvals, approve an action, or invoke the outbound broker.
+environment. The bridge token is authorized only for the endpoints in the table above.
+Its mutations are closed contracts for conversational Operator management, atomic private
+attention delivery, and normalized Google evidence. The plugin applies Hermes-native
+confirmation before authority-bearing conversational calls. The token cannot inspect or
+approve external-action grants, fetch the admin graph, or invoke the outbound broker.
 
 ## Installation
 
@@ -312,7 +357,7 @@ The plugin is packaged independently from the control plane. A release wheel can
 
 ```bash
 export HERMES_PLUGIN_ROOT="${HERMES_HOME:-$HOME/.hermes}/plugins"
-export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.2.0-py3-none-any.whl"
+export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.3.0-py3-none-any.whl"
 export PLUGIN_STAGE="$(mktemp -d)"
 python -m pip install --no-deps --target "$PLUGIN_STAGE" "$PLUGIN_WHEEL"
 install -d "$HERMES_PLUGIN_ROOT"
@@ -342,8 +387,11 @@ hermes plugins enable hermes-operator
 hermes plugins list
 ```
 
-In a Hermes conversation, use `/operator status`, `/operator next`, or
-`/operator questions`. The model can also call the three registered tools. The bundled
+In a Hermes conversation, use `/operator status`, `/operator next`, `/operator questions`,
+`/operator reminders`, `/operator add`, `/operator remind`, `/operator answer`,
+`/operator authorize`, `/operator done`, `/operator snooze`, or `/operator diagnostics`.
+The model can also call the eleven registered tools. Authority-bearing tool calls use
+Hermes-native confirmation where described above. The bundled
 skill is namespaced as `hermes-operator:operator-workflow` when the running Hermes build
 supports `ctx.register_skill()`.
 
@@ -387,29 +435,26 @@ The implementation follows the current official general-plugin conventions:
   `{"action": "block", "message": "..."}`.
 - `pre_llm_call` may return `{"context": "..."}`.
 - `ctx.register_command(...)` adds the `/operator` command.
-- `ctx.register_skill(...)` exposes a read-only namespaced skill.
+- `ctx.register_skill(...)` exposes a namespaced workflow skill.
 
 The plugin currently observes `post_llm_call`, `on_session_start`, `on_session_end`,
 `subagent_start`, and `subagent_stop`. Turn completion records contain message lengths,
 not raw user or assistant message bodies. Subagent records contain bounded goals and
-summaries so the control plane can reconcile delegated execution. Stop events use the
-native Hermes `parent_turn_id` and `child_session_id` identities and retain a stable
-content fallback only for hosts that omit a child session ID.
+summaries as observational evidence; they do not become canonical child execution by
+themselves. Stop events use the native Hermes `parent_turn_id` and `child_session_id`
+identities and retain a stable content fallback only for hosts that omit a child session ID.
 
 The control plane passes every validated effective skill as a repeated native
 `hermes kanban create --skill NAME` flag and passes `--goal` when the exact dispatch
-contract enables goal mode. Parallel compute uses the native `delegate_task` tool only
-inside the current live task contract. The guard permits one delegation batch per
-canonical run, containing one foreground goal or a flat batch of one to three foreground
-goals. Its core-backed atomic claim is consumed before the tool handler runs and survives
-plugin and worker restarts. It blocks a second batch in that run, background mode, and an
-orchestrator role. Durable fan-out through `kanban_create` or `kanban_link` is not
-worker-authorized.
-Operator metadata remains in SQLite for reconciliation and audit.
+contract enables goal mode. Parallel compute uses multiple canonical cards. Current
+background `delegate_task` and durable fanout through `kanban_create` or `kanban_link`
+are not authorized on managed cards. Operator metadata remains in SQLite for
+reconciliation and audit.
 
-The core configuration must use the same `operator` value for `profile`,
-`default_assignee`, `orchestrator_profile`, and `allowed_profiles`. Internal and active
-mode also require `hermes.control_base_url` and the daemon-only token named by
+The core configuration forms an effective profile allowlist from `profile`,
+`default_assignee`, `orchestrator_profile`, and `allowed_profiles`. Install the plugin in
+each selected profile and set that profile's exact `HERMES_OPERATOR_PROFILE`. Internal and
+active mode also require `hermes.control_base_url` and the daemon-only token named by
 `hermes.control_token_env`. That credential authenticates native run termination. It
 must not be included in `hermes.pass_env` or the plugin environment.
 
@@ -462,23 +507,28 @@ Then test against a running control plane:
    installed while reservation eligibility expires after the core TTL.
 6. Confirm `/operator next` matches `GET /v1/next`.
 7. Confirm `/operator questions` shows only pending questions.
-8. Start and finish a small delegated Hermes task. Confirm the core records one
-   `execution.delegation_batch_claimed` audit before child execution. Restart the plugin
-   and confirm a second batch for that canonical run remains blocked.
-9. Confirm authenticated `hermes.subagent_started` and `hermes.subagent_stopped` events
-   appear in the control-plane event log.
-10. Confirm there is no plugin tool or slash command that approves or performs an
-   external-facing action.
-11. In a non-production sandbox, ask a worker to call `browser_navigate`, `browser_click`,
+8. Dispatch several independent canonical WorkItems. Confirm their cards run in parallel
+   without exceeding `operator.max_parallel_work`.
+9. On an Operator-managed card, confirm current top-level `delegate_task`, native Kanban
+   fanout, and artifact-bearing completion delivery fail closed. In an unmanaged
+   interactive session, confirm delegation retains Hermes-native behavior.
+10. Confirm authenticated lifecycle events that the host supplies appear in the
+   control-plane event log with stable task and child identities.
+11. Confirm there is no plugin tool or slash command that approves or performs an
+   external-facing action. Confirm identifiable interactive or Cron Google writes show
+   the Hermes-native confirmation gate.
+12. In a non-production sandbox, ask a managed worker to call `browser_navigate`, `browser_click`,
    send a Discord message, run `git push`, run an HTTP GET and POST, call an opaque tool,
    and use `execute_code`. Confirm each call returns the policy block message before any
    handler executes.
-12. Confirm `read_file`, task-scoped `patch`, `git diff`, bounded foreground delegation,
-   operator reads, current-task Kanban lifecycle operations, and contract-authorized local
-   tests and builds remain available. Confirm native Kanban create, link, and unblock,
-   background or orchestrator delegation, network commands, and interpreters remain
-   unavailable inside the autonomous worker profile.
-13. Start Hermes without `pre_tool_call` support or simulate a rejected hook. Confirm the
+13. Confirm `read_file`, task-scoped `patch`, `git diff`, operator reads, current-task
+   Kanban lifecycle operations, and contract-authorized local tests and builds remain
+   available on managed cards. Confirm native Kanban create, link, unblock, and current
+   background delegation remain unavailable there.
+14. Install the three native jobs in a test profile. Confirm Google revisions enter as
+   authenticated untrusted evidence, attention is atomically suppressed within its
+   redelivery window, and the briefing can use the native Obsidian skill.
+15. Start Hermes without `pre_tool_call` support or simulate a rejected hook. Confirm the
    plugin stops registration and the deployment health check prevents worker dispatch.
 
 ## Official references

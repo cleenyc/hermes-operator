@@ -12,7 +12,8 @@ one Hermes Operator service
   -> optional local or wrapped Hermes CLI
   -> required authenticated Hermes run control for internal or active mode
   -> optional HTTP native plugin bridge
-  -> optional fixed-argv read-only inbound readers
+  -> Hermes-native Google, reminder, briefing, and Obsidian skill loops
+  -> optional fixed-argv readers for other providers
   -> optional local Obsidian vault
   -> configured model endpoint or local command
 
@@ -30,11 +31,12 @@ The application does not require fixed installation paths. Configure these at de
 
 - SQLite database and data directory.
 - Model provider, model ID, endpoint, and credential environment name.
-- Hermes executable, single `operator` profile, board, skills, allowlists, authenticated run-control base URL and token, and optional environment passthrough.
+- Hermes executable, one or more explicitly allowed and independently attested profiles, board, skills, allowlists, authenticated run-control base URL and token, and optional environment passthrough.
 - Admin and bridge token environment names.
 - HMAC secrets for generic inbound sources.
-- Optional read-only inbound reader commands and their narrowly scoped credential names.
-- Optional Obsidian vault, managed directory, and bounded Inbox.
+- Hermes Google account OAuth, Gateway, private Cron delivery target, and optional native Obsidian vault path.
+- Optional read-only command readers for non-Google providers and their narrowly scoped credential names.
+- Optional core Obsidian projection path, managed directory, and bounded Inbox.
 
 Relative paths are resolved from the TOML file location.
 
@@ -123,17 +125,17 @@ The two API credentials have different authority:
 | Credential | Intended holder | Capability |
 | --- | --- | --- |
 | Admin token | Operator CLI/UI or trusted administration client | Read canonical work and approvals, ingest operator events, answer questions, approve or deny actions, and review memory |
-| Bridge token | Native Hermes plugin only | Read next work, questions, and the current task execution contract; atomically claim one bounded delegation batch; post Hermes observations and policy attestations |
+| Bridge token | Native Hermes plugin only | Use explicit context, attention, conversational-management, Google-ingress, exact task-contract, lifecycle, compatibility, and attestation routes; no approval inspection or external execution |
 | Run-control token | Hermes Operator daemon only | Authenticate native Hermes run termination; never passed to the worker |
 | Webhook HMAC secret | One inbound reader | Deliver authenticated but untrusted events for one source |
 
 Use TLS termination or a private authenticated network when traffic leaves loopback. The built-in server speaks plain HTTP.
 
-## Hard no-outbound worker boundary
+## Managed-card scope and optional worker hardening
 
-The daemon contains no outbound connector and no execute route. That prevents the control-plane process from sending approved actions. A Hermes worker may still have terminals, interpreters, browsers, custom plugins, MCP tools, or ambient cloud credentials, so the plugin guard alone is not a hard boundary. In particular, contract-authorized `local_test` and `local_build` commands can invoke project-defined scripts that execute arbitrary repository code.
+The daemon contains no outbound connector and no execute route. The plugin adds strict task-scoped policy on Operator-managed cards. Interactive and Cron sessions outside those cards retain Hermes-native behavior, and identifiable mutations use the native confirmation gate. A Hermes worker may still have terminals, interpreters, browsers, custom plugins, MCP tools, or ambient cloud credentials, so this project does not claim host-wide or end-to-end mediation. In particular, contract-authorized `local_test` and `local_build` commands can invoke project-defined scripts that execute arbitrary repository code.
 
-Production internal-autonomy deployment must enforce all of the following:
+When a deployment needs a harder worker boundary, optional controls include:
 
 1. Give the Hermes worker only the scoped bridge token and minimum read or internal-work credentials.
 2. Do not give it the admin token, approval secret, email-send credential, calendar-write credential, messaging credential, publishing credential, repository-write credential, payment credential, or a browser session that can mutate external state.
@@ -141,29 +143,29 @@ Production internal-autonomy deployment must enforce all of the following:
 4. Allow only the specific model, operator API, read-only data, artifact, and internal execution endpoints required for the `operator` profile through a controlled proxy or network policy.
 5. Run `hermes-outbound-broker` under a separate identity and network policy. Do not colocate its connector credentials with the worker or control-plane daemon.
 
-Without these controls, external-action prevention is policy defense in depth rather than a hard security guarantee.
+Without these controls, managed-card policy is defense in depth rather than a hard security guarantee. The core autonomy path can still operate under Hermes-native confirmation and the deployment's existing harness policy.
 
 ## Hermes policy attestation
 
-When `hermes.require_policy_attestation = true`, the single `operator` worker profile cannot receive a new run until a fresh attestation exists for that exact profile.
+When `hermes.require_policy_attestation = true`, each selected worker profile must have a fresh attestation for that exact profile before it can receive a new run.
 
 The example allows:
 
 ```toml
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.2.0"]
-allowed_policy_versions = ["3.0.0"]
-allowed_policy_digests = ["6b8b21ef6d4a7f7ee5d04c9cf8b4a2fe15e9ed434d42980c879fda150df21d2f"]
+allowed_plugin_versions = ["1.3.0"]
+allowed_policy_versions = ["4.0.0"]
+allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
 ```
 
 The plugin performs a synchronous startup attestation and starts one process-scoped daemon heartbeat that attempts refresh every 120 seconds by default. Normal hooks share the same lock and rate limiter. Core dispatch validates freshness, profile, active default-deny guard, plugin version, policy version, and source digest. The dispatch reservation also binds the exact attestation state digest used for its decision. Enabling Hermes with required attestation also requires the built-in HTTP server and a nonempty bridge token; configuration fails closed otherwise.
 
 Internal and active execution additionally require `hermes.control_base_url` and the token named by `hermes.control_token_env`. The value must be an HTTP or HTTPS base URL without embedded credentials, query, or fragment. The daemon uses this authenticated path to terminate the current native run, then blocks the card with the CLI. Never put this token in `hermes.pass_env`, the plugin environment, an inbound reader, or the outbound broker.
 
-## Separate outbound broker deployment
+## Optional separate outbound broker deployment
 
-The package includes `hermes-outbound-broker`, but neither the supplied Compose service nor the systemd unit starts it. Copy [the disabled example](../config/outbound.example.toml) to a separate protected configuration, set a fixed connector argv, allowlist only that connector's mutation credential, and run it under a distinct service account only when approved external delivery is required.
+The package includes `hermes-outbound-broker`, but neither the supplied Compose service nor the systemd unit starts it. It is not required for autonomous intake, planning, Hermes work, reminders, briefings, or Obsidian use. If exact-action delivery is wanted outside Hermes-native confirmation, copy [the disabled example](../config/outbound.example.toml) to a protected configuration, set a fixed connector argv, and allowlist only that connector's mutation credential. A distinct service account and network policy are optional hardening.
 
 The broker must be invoked with an exact approved action ID and grant ID. Its database path points to the canonical SQLite store, so filesystem permissions must allow the broker to atomically claim that action without giving the Hermes worker database access. The default systemd `StateDirectoryMode=0700` and `UMask=0077` intentionally block a second account. If the broker uses a distinct operating-system identity, grant a narrowly scoped group or ACL access to the exact SQLite directory, database, WAL, and SHM files, then audit that access. The broker can read canonical state and is therefore a privileged process.
 
@@ -186,9 +188,19 @@ Use a local filesystem with reliable POSIX or platform SQLite locking. Do not pl
 
 SQLite runs in WAL mode. Use the SQLite backup API for online backups.
 
-## Generic inbound readers
+## Native Google intake and optional generic readers
 
-Email, calendar, meeting, and provider integrations remain separate read-only executables, so provider SDKs and credentials do not become control-plane dependencies. The live observation phase can poll those executables as fixed argv using `[[inbound_connectors]]`, or they can deliver signed webhook events.
+Install the desired native jobs after configuring Hermes' bundled Google Workspace skill and account OAuth:
+
+```bash
+hermes-operator --config operator.toml native-jobs plan
+hermes-operator --config operator.toml native-jobs install --dry-run
+hermes-operator --config operator.toml native-jobs install
+```
+
+The Google job reads Gmail, Calendar, and meeting evidence through Hermes and records normalized revisions with the plugin. The reminder job privately delivers one atomic claim of due reminders and pending questions. The daily briefing combines current priorities with optional Hermes-native Obsidian context. Run Hermes Gateway continuously and configure a private delivery target. These jobs are the implemented default path, not provider placeholders.
+
+For non-Google providers or an intentionally external integration, the live observation phase can poll a fixed argv using `[[inbound_connectors]]`, or a reader can deliver signed webhook events.
 
 Each reader should:
 
@@ -222,6 +234,8 @@ For containers or systemd, add the exact vault mount or writable path at the sam
 
 The service projects managed state and separately reads only direct Markdown children of `<operator_root>/Inbox`. Inbox reads are non-recursive, bounded, symlink-safe, deduplicated by path and content, and always treated as untrusted evidence.
 
+For native vault-wide use, set `OBSIDIAN_VAULT_PATH` in the Hermes profile. The daily briefing uses Hermes' bundled Obsidian skill; the Operator core does not create a second vault index.
+
 ## Rollout
 
 ### Phase 1: shadow
@@ -237,15 +251,15 @@ The service projects managed state and separately reads only direct Markdown chi
 - Install or expose the compatible Hermes CLI.
 - Install the native plugin.
 - Configure the distinct bridge token and exact worker profile.
-- Set every Hermes profile field to `operator` and verify the same attested identity.
+- Configure each selected profile explicitly and verify a fresh attestation for each identity.
 - Verify the plugin guard and startup attestation.
 - Check the allowed policy digest against the deployed source.
 - Confirm shadow mode records but does not create cards.
 
 ### Phase 3: bounded internal autonomy
 
-- Apply mandatory worker credential and egress isolation.
-- Configure only the `operator` profile and a narrow skill allowlist.
+- Choose deployment-appropriate credential and egress hardening.
+- Configure a narrow skill allowlist and only the explicitly needed attested profiles.
 - Configure authenticated Hermes run control and verify terminate-then-block behavior.
 - Set a conservative global `max_parallel_work`.
 - Move to `internal`.
@@ -276,11 +290,11 @@ The current implementation does not provide:
 - PostgreSQL or another server database adapter.
 - Active-active services.
 - Transactional outbox delivery.
-- Bundled provider-specific OAuth or SDK implementations. Provider adapters are deployment-supplied fixed-argv readers or signed webhook senders.
+- Provider SDKs inside the Operator daemon. Google account OAuth is handled by Hermes' bundled Google Workspace skill and the installed native Cron contract.
 - Generic remote Hermes Kanban HTTP transport beyond authenticated native-run termination.
-- Automatic profile discovery or capability routing.
+- Automatic profile discovery or capability routing. Multiple explicitly configured attested profiles are supported.
 - Profile, project, or model-provider concurrency limits.
 - Automatic recovery of an outbound side effect after connector outcome becomes unknown.
 - A broker service in the supplied Compose or systemd deployment.
 
-Design deployment and monitoring around the implemented local SQLite, local CLI, generic webhook, and projection boundaries.
+Design deployment and monitoring around the implemented local SQLite, Hermes CLI and Cron, native plugin bridge, generic webhook extensions, and optional projection boundaries.

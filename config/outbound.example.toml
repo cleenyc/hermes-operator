@@ -1,0 +1,18 @@
+# Deploy this broker separately from the Hermes Operator daemon and worker.
+# It is disabled until an operator deliberately enables this file.
+[broker]
+enabled = false
+database_path = "../data/operator.db"
+actor = "outbound-broker"
+max_grant_lifetime_seconds = 3600
+
+# Each connector command is deployment-owned fixed argv. The broker sends one
+# exact approved action and binding digests as strict bounded JSON on stdin. The
+# command must return a strict bounded JSON object containing `"ok": true`.
+[[connectors]]
+integration = "mail"
+command = ["/opt/hermes-outbound-connectors/mail-send"]
+pass_env = ["MAIL_SEND_TOKEN"]
+timeout_seconds = 60
+max_input_bytes = 1048576
+max_output_bytes = 1048576

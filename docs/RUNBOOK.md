@@ -100,9 +100,13 @@ bridge_token_env = "HERMES_OPERATOR_BRIDGE_TOKEN"
 
 Compose sets `HERMES_OPERATOR_BIND_HOST=0.0.0.0` inside the container and publishes to host loopback. It accepts optional `HERMES_KANBAN_CONTROL_TOKEN` for the daemon but does not forward it through `hermes.pass_env`. To enable Hermes dispatch, build a deployment-specific image with the compatible CLI and `operator` profile state, or run the operator beside Hermes on the host. The native plugin HTTP bridge does not replace the Kanban CLI transport. Internal and active mode also require an authenticated `hermes.control_base_url` reachable by the daemon and the daemon-only control token.
 
-## Required worker isolation
+## Optional independent-boundary hardening
 
-Before changing from `shadow` to `internal`:
+The base system enforces a task-scoped guard for autonomous managed cards and uses
+Hermes-native confirmation for authority-bearing interactive and scheduled actions.
+If a deployment also requires a hard no-outbound guarantee that is independent of
+the Hermes harness, apply the following infrastructure controls before changing from
+`shadow` to `internal`:
 
 1. Confirm the Hermes worker has only `HERMES_OPERATOR_BRIDGE_TOKEN`, never the admin token.
 2. Remove outbound connector, mail-send, messaging, calendar-write, publishing, payment, repository-write, and cloud-write credentials.
@@ -111,7 +115,9 @@ Before changing from `shadow` to `internal`:
 5. Apply the same egress restriction to project-defined test and build scripts. Reviewed `local_test` and `local_build` command shapes can still execute arbitrary repository code.
 6. Allow only required model, operator API, artifact, read-only data, and internal execution endpoints through controlled policy.
 
-The native plugin guard and attestation are defense in depth. Credential and egress isolation are mandatory for a hard no-outbound boundary.
+These controls are optional for the core integration, but credential and egress
+isolation are required if the deployment claims a hard no-outbound boundary that
+remains enforceable even when the Hermes process or plugin is compromised.
 
 ## Native plugin environment
 
@@ -129,6 +135,7 @@ Plugin registration sends a synchronous policy attestation and starts one daemon
 ```bash
 hermes-operator --config operator.toml doctor
 hermes-operator --config operator.toml status
+hermes-operator --config operator.toml event list --state dead_letter
 hermes-operator --config operator.toml next --limit 10
 hermes-operator --config operator.toml question list
 hermes-operator --config operator.toml approval list
@@ -255,7 +262,16 @@ Checks:
 
 The supervisor transaction rolls back on any failure. A claimed event returns to pending until `event_max_attempts`, then moves to dead letter. Dispatch is skipped in a cycle whose reconciliation or event processing failed.
 
-There is no dead-letter replay CLI. Correct the cause, then use a controlled source re-ingest with a new intentional dedupe identity rather than editing SQLite casually.
+After correcting the cause, inspect and replay one dead letter through the audited administration path:
+
+```bash
+hermes-operator --config operator.toml event list \
+  --state dead_letter --source gmail --limit 50
+hermes-operator --config operator.toml event replay EVENT_ID \
+  --reason "Connector parser corrected and payload reviewed"
+```
+
+Replay succeeds only while the exact event is still in `dead_letter`. It clears stale lease and error fields, resets that event's retry budget, preserves its identity and dedupe key, and records the operator, reason, prior error, and prior attempt count in the audit log. A concurrent state change fails closed. Do not edit queue state directly in SQLite.
 
 ## Leader lease conflict
 
@@ -413,8 +429,9 @@ Hermes completion moves local work to `review`. To reach `done`, the next superv
 - Completed local run.
 - Evidence for every exact acceptance criterion.
 - Confidence of at least `0.75`.
+- A passing deterministic report whenever Hermes declares artifacts or the canonical work carries a `verification_contract`.
 
-Failed verification moves work to `blocked`; incomplete evidence moves it to `waiting_input`. Correct evidence or scope rather than manually forcing done.
+Failed verification moves work to `blocked`; incomplete evidence moves it to `waiting_input`. A deterministic failure records exact artifact or named-check errors under `metadata.last_verification.deterministic`; it cannot be overridden by a model's passed verdict. Check configured artifact-root visibility first, then missing files, symlinks, type or digest mismatches, byte/count limits, check cwd, timeout, output cap, and exit code. Correct evidence or scope rather than manually forcing done.
 
 A failed independent verification may authorize a correction only from the exact completion event and while the durable authorization root has remaining attempts. The correction uses a new local run, a new `attempt` idempotency key, and a new Hermes card. It does not unblock or overwrite the completed card. `hermes.max_execution_attempts` is the hard upper bound; once exhausted, operator review and a newly scoped authorization are required.
 

@@ -1,0 +1,44 @@
+services:
+  operator:
+    build:
+      context: .
+    command: ["--config", "/app/operator.toml", "run"]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    stop_grace_period: 360s
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      HERMES_OPERATOR_API_TOKEN: ${HERMES_OPERATOR_API_TOKEN:?set HERMES_OPERATOR_API_TOKEN}
+      HERMES_OPERATOR_BRIDGE_TOKEN: ${HERMES_OPERATOR_BRIDGE_TOKEN:-}
+      HERMES_KANBAN_CONTROL_TOKEN: ${HERMES_KANBAN_CONTROL_TOKEN:-}
+      HERMES_OPERATOR_BIND_HOST: 0.0.0.0
+    volumes:
+      - type: bind
+        source: ./operator.toml
+        target: /app/operator.toml
+        read_only: true
+      - type: volume
+        source: operator-data
+        target: /app/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=2).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+volumes:
+  operator-data:

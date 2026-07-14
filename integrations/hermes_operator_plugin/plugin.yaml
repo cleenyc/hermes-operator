@@ -1,0 +1,24 @@
+name: hermes-operator
+version: 1.3.0
+description: Task-scoped Hermes bridge to the autonomous operator control plane
+author: "@cleenyc"
+provides_tools:
+  - operator_status
+  - operator_next_work
+  - operator_open_questions
+  - operator_due_reminders
+  - operator_claim_attention
+  - operator_create_work
+  - operator_answer_question
+  - operator_authorize_work
+  - operator_update_work
+  - operator_ingest_inbound
+  - operator_diagnostics
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - post_llm_call
+  - on_session_start
+  - on_session_end
+  - subagent_start
+  - subagent_stop

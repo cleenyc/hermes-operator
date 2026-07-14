@@ -1,0 +1,38 @@
+[Unit]
+Description=Hermes Operator autonomous control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes-operator
+Group=hermes-operator
+WorkingDirectory=/opt/hermes-operator
+Environment=HOME=/var/lib/hermes-operator
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/hermes-operator/environment
+ExecStart=/opt/hermes-operator/.venv/bin/hermes-operator --config /etc/hermes-operator/operator.toml run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=360s
+StateDirectory=hermes-operator
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/hermes-operator
+
+[Install]
+WantedBy=multi-user.target

@@ -4,7 +4,7 @@
 
 Hermes Operator is a portable control plane placed beside Hermes Agent. It owns planning state and governance, calls a live model to reconcile that state, and uses Hermes Kanban as the execution boundary for authorized internal work.
 
-The implementation does not import Hermes internals and does not depend on a Hermes Python environment. Integration occurs through public `hermes kanban` CLI commands, the authenticated Kanban run-control endpoint used for termination, and an optional native HTTP bridge plugin. The Obsidian vault path is optional and can be supplied later.
+The implementation does not import Hermes internals and does not depend on a Hermes Python environment. Integration occurs through public `hermes kanban` and `hermes cron` CLI commands, the authenticated Kanban run-control endpoint used for termination, and a native HTTP bridge plugin. The Google account, private delivery target, and Obsidian vault path are deployment bindings and can be supplied later.
 
 ## Authority model
 
@@ -12,7 +12,7 @@ The implementation does not import Hermes internals and does not depend on a Her
 | --- | --- |
 | SQLite | Work intent, hierarchy, status, dependencies, questions, approvals, memory review, dispatch governance, run records, audit, and service leases |
 | Hermes Kanban | Execution progress and worker-produced evidence after an authorized card is created |
-| Obsidian | Rebuildable projection plus one bounded untrusted Inbox |
+| Obsidian | Rebuildable projection plus one bounded untrusted Inbox; Hermes' native skill owns optional vault-wide retrieval |
 | Inbound connector | Delivery provenance only, never operator authority |
 | Model | Proposed plan only, never direct capability |
 
@@ -21,7 +21,7 @@ SQLite is the only transactional source of truth. Hermes completion is evidence,
 ## Runtime flow
 
 ```text
-HTTP webhook, operator CLI/API, answer, or Hermes observation
+Google Cron, HTTP webhook, operator CLI/API, answer, or Hermes observation
                     |
                     v
              SQLite event inbox
@@ -90,12 +90,13 @@ The OpenAI-compatible transport accepts only an HTTP or HTTPS base path without 
 
 ## Atomic supervisor transaction
 
-The model returns one structured plan containing work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, the single worker profile, skills, and expected versions before the transaction can commit. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
+The model returns one structured plan containing an explicit disposition for every claimed event, work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, allowlisted worker profiles, skills, and expected versions before the transaction can commit. A disposition must be backed by the effect it claims, such as applied work, a created question, or a verification. `duplicate` must identify existing work. `non_actionable` and `quarantined` require an auditable reason. An empty plan cannot silently consume an event. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
 
 The normalized plan is canonicalized and hashed with SHA-256. Plan application then occurs inside one `BEGIN IMMEDIATE` SQLite transaction. Nested store calls share that connection. The same transaction:
 
 - Applies authorized work, link, question, memory, verification, and staged-action changes.
 - Writes exact dispatch authorization metadata that carries the pass ID and plan digest.
+- Writes one durable `event_dispositions` record for every claimed event.
 - Marks every still-owned event processed.
 - Writes `supervisor.pass:{pass_id}` with `finalized = true` and the same digest.
 - Writes the last-pass state and completion audit.
@@ -123,7 +124,9 @@ inbox, triage, planned, ready, running, waiting_input,
 blocked, review, done, cancelled, archived
 ```
 
-Links support `depends_on`, `blocks`, `related_to`, `duplicates`, and `derived_from`. SQLite prevents self-links and dependency cycles. A `depends_on` edge is satisfied only when the target is `done`.
+Links support `depends_on`, `blocks`, `related_to`, `duplicates`, and `derived_from`. SQLite prevents self-links and mixed dependency cycles. `affected --depends_on--> blocker` and `blocker --blocks--> affected` are execution-equivalent: affected work is eligible only when the blocker is `done`. Eligibility, run reservation and commit, and dependency reopen protection enforce both directions.
+
+The planner snapshot includes bounded relationship edges and recent completed work, rather than only active nodes and aggregate counts. A durable derived rollup for each parent summarizes direct children, all descendants, progress, status counts, overdue work, and health (`empty`, `on_track`, `active`, `at_risk`, `waiting_input`, `blocked`, or `complete`). Child creation, reparenting, due-date changes, and status changes refresh every affected ancestor. Rollups live outside `work_items`, so recalculation does not invalidate optimistic work versions or automatically declare a project complete. Parent status remains an explicit decision even while derived progress and health update automatically.
 
 ## Priority and next work
 
@@ -139,7 +142,9 @@ The supported transport is a local or wrapped public CLI plus an authenticated H
 create, show, list, comment, block, unblock, runs
 ```
 
-The adapter does not implement generic Hermes card update, profile discovery, or arbitrary remote API transport. It delegates a bounded goal through one authorized Kanban card assigned to the single attested `operator` profile. Every execution-contract lookup rechecks dependency satisfaction and the service leader fence before and after resolving canonical state, so a late dependency or lost lease fails closed. The native guard allows only one flat foreground `delegate_task` batch per canonical run within that live card contract: one goal or a batch of one to three goals. Before the tool handler runs, the bridge atomically consumes a durable SQLite claim keyed by canonical run ID and bound to the current task, contract digest, and child count. Duplicate or stale claims fail closed across worker and plugin restarts. The guard also blocks background children, nested orchestrator roles, native `kanban_create`, and `kanban_link`. The native plugin records child lifecycle observations back into the control plane.
+The adapter does not implement generic Hermes card update, profile discovery, or arbitrary remote API transport. It dispatches each bounded canonical WorkItem through one authorized Kanban card assigned to an effective allowlisted profile. Every execution-contract lookup rechecks dependency satisfaction and the service leader fence before and after resolving canonical state, so a late dependency or lost lease fails closed.
+
+Parallel execution comes from several independent canonical cards reserved up to `operator.max_parallel_work`. Current Hermes top-level `delegate_task` is background and non-durable, so its foreground completion cannot be bound to a canonical run. The plugin therefore blocks it and native Kanban fanout only when the hook identifies an Operator-managed card. Unmanaged interactive Hermes sessions retain native delegation and harness behavior. The plugin still records available lifecycle observations as evidence.
 
 Internal and active mode require `hermes.control_base_url` and the token resolved from `hermes.control_token_env`. When canonical work becomes terminal or authorization is invalid while a native run remains live, the adapter calls `/api/plugins/kanban/runs/{run_id}/terminate`, then blocks the card through the CLI. Failure leaves the local run fail closed rather than pretending compute stopped.
 
@@ -149,7 +154,7 @@ Before creating a card, the dispatcher verifies:
 - Work is `ready`, uses `execution_mode = "hermes"`, and has no active run.
 - Dependencies are done and acceptance criteria are present.
 - Governance explicitly authorizes execution.
-- Dispatch profile is the single configured and attested `operator` profile, and skill values match the configured allowlist.
+- Dispatch profile is in the effective configured allowlist, has a fresh exact-profile attestation, and skill values match the configured allowlist.
 - Durable authorization is not yet consumed for another run, `not_before` matches the work schedule, and its attempt budget is valid.
 - Exact work ID, profile, skills, goal mode, and contract digest match current work.
 - A supervisor authorization points to a finalized plan with the same plan digest, or a direct operator CLI authorization is present.
@@ -170,9 +175,9 @@ After Hermes creates or resolves the card, `commit_dispatch_reservation` atomica
 
 No profile-specific, project-specific, or model-provider-specific concurrency pools are implemented.
 
-## Single-profile worker policy attestation
+## Per-profile worker policy attestation
 
-The native plugin registers a local `pre_tool_call` default-deny guard before it initializes the HTTP bridge. It then sends a synchronous `policy.attested` envelope through the scoped bridge token. The API validates it and writes monotonic profile evidence directly to authenticated system state and audit. It does not place heartbeat attestations in the planner event queue or wake the autonomy loop. Internal and active mode require every configured profile field to resolve to the same `operator` identity. The fixed payload binds:
+The native plugin registers a local `pre_tool_call` guard before it initializes the HTTP bridge. It then sends a synchronous `policy.attested` envelope through the scoped bridge token. The API validates it and writes monotonic profile evidence directly to authenticated system state and audit. It does not place heartbeat attestations in the planner event queue or wake the autonomy loop. Each Hermes profile that can receive Operator work installs the plugin with its own `HERMES_OPERATOR_PROFILE` value. Dispatch requires current accepted evidence for the exact selected profile. The fixed payload binds:
 
 - Hermes profile
 - Plugin version
@@ -182,7 +187,7 @@ The native plugin registers a local `pre_tool_call` default-deny guard before it
 - `default_deny` mode
 - UTC attestation time
 
-The example core configuration accepts plugin `1.2.0`, policy `3.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation.
+The example core configuration accepts plugin `1.3.0`, policy `4.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
 
 The heartbeat is process-scoped because current Hermes exposes no plugin-unload hook. It uses a process-exit wake and bounded join. A refresh failure leaves the local guard and bridge installed, but core freshness expires and blocks subsequent reservations.
 
@@ -204,32 +209,36 @@ A completion event is bound to:
 - A completion evidence fingerprint stored in the work metadata
 - A completed local run for the same card
 
-The supervisor can mark review work done only when its verification lists every acceptance criterion exactly, every criterion has specific passing evidence, and confidence is at least `0.75`. Failed or inconclusive verification moves work to `blocked` or `waiting_input`.
+The supervisor can mark review work done only when its verification lists every acceptance criterion exactly, every criterion has specific passing evidence, and confidence is at least `0.75`. A separate deterministic gate inspects every native Hermes artifact declaration and every artifact or named check in the canonical protected `verification_contract`. It confines paths to configured roots, rejects traversal and symlinks, computes SHA-256 content identities under count and byte limits, and runs only deployment-approved fixed argv with bounded time, output, cwd, and environment. It is evaluated before planning and again after canonical run binding. An applicable deterministic failure overrides a model's passed verdict. Failed or inconclusive verification moves work to `blocked` or `waiting_input`.
 
-## Approval and outbound boundary
+## Approval and outbound integration
 
-External action proposals use a closed taxonomy and canonical exact-action digest. Approval grants are expiring and one use. The separately installed `hermes-outbound-broker` atomically validates and consumes the exact grant while claiming the action for execution.
+External action proposals use a closed taxonomy and canonical exact-action digest. Approval grants are expiring and one use. When deployed, the optional `hermes-outbound-broker` atomically validates and consumes the exact grant while claiming the action for execution.
 
-The service composition root does not create an `OutboundBroker`, does not register an outbound action connector, and exposes no outbound API or daemon command. Read-only inbound command readers can record evidence but cannot execute an approved action. The broker is a different executable with a different TOML file, process identity, environment allowlist, and network policy. It is disabled by default and requires a deliberate invocation containing the exact action and grant IDs.
+The service composition root does not create an `OutboundBroker`, does not register an outbound action connector, and exposes no outbound API or daemon command. Read-only inbound paths can record evidence but cannot execute an approved action. The broker is an optional different executable with a different TOML file and a deliberate invocation containing the exact action and grant IDs. Deployments that need a harder boundary can also give it a separate process identity, environment allowlist, and network policy.
 
 The broker selects only a deployment-owned fixed-argv connector. It sends bounded strict JSON containing the exact action and binding digests, requires bounded strict JSON success output, records claim and result audits, and rejects replay or any action, recipient, content, target, attribute, integration, or type mismatch. A crash after the one-shot claim is treated as an unknown outcome and cannot silently replay the external side effect.
 
-The native Hermes plugin guard blocks common external and destructive tools, but policy-name inspection is defense in depth. A hard boundary requires:
+The native Hermes plugin guard adds task-scoped defense for managed cards; it is not claimed as host-wide or end-to-end enforcement. Interactive and Cron mutations outside managed cards use Hermes-native confirmation. Optional hardening for a stricter deployment includes:
 
 - No admin API token or outbound connector credential in the Hermes worker.
 - Only the scoped bridge token in the plugin environment.
 - Operating-system, container, or network policy that denies the worker outbound access to mutation endpoints.
 - A separate broker identity and network zone for any enabled outbound connector.
 
-## Generic inbound observation
+## Native and generic inbound observation
 
 `POST /v1/events/{source}` accepts a normalized JSON envelope. A configured source uses HMAC-SHA256 over the exact body. Source and dedupe key are scoped together in SQLite, so independent connectors cannot collide.
 
-Email, calendar, meeting, and other provider SDKs are not bundled. Provider-specific readers run as separate read-only processes. They can deliver signed events to the generic endpoint or implement the fixed command contract. Command readers are polled in parallel before each supervisor pass, and their cursor advances atomically with accepted events.
+The installed Google intake contract runs under Hermes Cron, uses the bundled `google-workspace` skill and Hermes-managed account OAuth, and posts normalized Gmail, Calendar, and meeting revisions through the scoped bridge. Google content remains authenticated untrusted evidence. The job prompt is read-only and forbids sends, label changes, RSVPs, event edits, sharing, and other provider mutations.
+
+Generic signed endpoints and fixed command readers remain available for other providers or deployment-specific alternatives. Command readers are polled in parallel before each supervisor pass, and their cursor advances atomically with accepted events.
 
 ## Obsidian projection
 
 Vault binding is optional. `HERMES_OPERATOR_VAULT` overrides the configured path and enables projection. When no vault is configured, the rest of the system continues normally.
+
+Separately, the installed native briefing contract can use Hermes' bundled Obsidian skill and `OBSIDIAN_VAULT_PATH` for vault-wide retrieval. The Operator core does not duplicate that index.
 
 The projector writes:
 
@@ -246,11 +255,11 @@ The observation phase separately scans direct Markdown children of `<operator_ro
 The current release does not implement:
 
 - A transactional outbox or downstream event bus.
-- Provider-specific email, calendar, or meeting polling.
+- Provider-specific SDKs inside the Operator daemon. Google Workspace intake is implemented through Hermes-native Cron and skill integration.
 - Direct internal tool execution outside Hermes Kanban.
 - Generic Hermes card update calls.
 - Remote Hermes Kanban HTTP transport beyond authenticated native-run termination.
-- Automated Hermes profile or project discovery.
+- Automated Hermes profile or project discovery. Multiple explicitly configured and independently attested profiles are supported.
 - Profile, project, or model-provider concurrency quotas.
 - Cost or token budgets.
 - A daemon-hosted outbound broker or outbound API route.

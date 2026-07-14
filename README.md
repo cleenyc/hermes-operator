@@ -2,18 +2,18 @@
 
 Hermes Operator is a portable, event-driven autonomy control plane for Hermes Agent. It maintains durable goals, projects, tasks, reminders, dependencies, questions, runs, memory candidates, and exact-action approvals in SQLite. A live model pass reconciles new evidence with that state, while deterministic policy decides what may mutate and what may be dispatched to Hermes.
 
-It is installed independently from Hermes. The Hermes executable, model endpoint, API credentials, database, and optional Obsidian vault are deployment-time settings. The vault can be bound after the service is already operating.
-
-The daemon has no outbound connector and no outbound execution route. It may stage and approve an exact external action, but it cannot send, publish, deploy, purchase, delete, or otherwise execute that action. The package also installs `hermes-outbound-broker`, a disabled-by-default executable that must be deployed and invoked separately with connector credentials the daemon and Hermes worker never receive.
-
 Project scope: [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md)  
 Release history: [CHANGELOG.md](CHANGELOG.md)  
 Maintainer: [@cleenyc](https://github.com/cleenyc)
 
+It is installed independently from Hermes. The Hermes executable, model endpoint, API credentials, database, and optional Obsidian vault are deployment-time settings. The vault can be bound after the service is already operating.
+
+The daemon has no outbound connector and no outbound execution route. It may stage and approve an exact external action, but it cannot send, publish, deploy, purchase, delete, or otherwise execute that action. Interactive and Cron sessions outside Operator-managed cards retain Hermes-native behavior, including the native confirmation gate for identifiable mutations. The package also installs `hermes-outbound-broker` as an optional, disabled-by-default exact-action delivery path; it is not required for the autonomous control plane.
+
 ## Implemented control plane
 
 - Live `asyncio` loop woken by durable events, operator answers, Hermes observations, and recovery ticks.
-- SQLite canonical state with WAL, foreign keys, event leases, retries, dead-letter state, audit records, work hierarchy, dependency links, runs, questions, reviewed memory, and exact-action approvals.
+- SQLite canonical state with WAL, foreign keys, event leases, retries, dead-letter state, audit records, explicit work hierarchy, execution-effective `depends_on` and `blocks` links, derived rollups, runs, questions, reviewed memory, and exact-action approvals.
 - One active control-plane leader lease per database. A second service instance fails closed until the lease expires or is released.
 - A structured OpenAI-compatible or local-command planner contract.
 - One atomic SQLite transaction for each validated supervisor plan, event consumption, finalized plan digest, and audit result.
@@ -22,19 +22,19 @@ Maintainer: [@cleenyc](https://github.com/cleenyc)
 - Deterministic priority scoring across impact, urgency, alignment, dependency value, due date, age, effort, confidence, risk, state, and operator priority.
 - Hermes Kanban dispatch through public CLI commands plus an authenticated run-control endpoint for terminating native compute. The adapter uses `create`, `show`, `list`, `comment`, `block`, `unblock`, and `runs`.
 - Atomic run-slot reservations with one compute-active run per work item and a database-wide `max_parallel_work` cap. A blocked Hermes attempt is closed and releases compute capacity.
-- Finalized-plan, exact-contract, single-profile, skill, timing, attempt-budget, work-version, and fresh policy-attestation checks before dispatch.
-- Native Hermes plugin with read-only operator tools, bounded context injection, lifecycle observations, a default-deny pre-tool guard, and policy-attestation refresh.
-- One flat foreground `delegate_task` batch per canonical run, with one to three task-scoped children for bounded parallel compute. Native Kanban child creation, background delegation, and nested orchestrator roles are blocked.
-- Parallel command polling and signed generic webhooks for email, calendar, meeting, repository, and other inbound readers. Provider SDKs stay outside the core.
+- Finalized-plan, exact-contract, allowlisted-profile, skill, timing, attempt-budget, work-version, and fresh per-profile policy-attestation checks before dispatch.
+- Native Hermes plugin with scoped read and conversational-management tools, bounded context injection, lifecycle observations, a managed-card pre-tool guard, and policy-attestation refresh.
+- Parallel execution through multiple independent canonical Operator cards, atomically capped by `max_parallel_work`. Current top-level `delegate_task` is background and non-durable, so it is blocked on Operator-managed cards; unmanaged interactive Hermes sessions keep native delegation behavior.
+- Installed Hermes-native Cron contracts for Google Workspace intake, durable reminder and question delivery, and daily briefings. Signed webhooks and fixed-argv command readers remain optional extension paths.
 - Exact-action, expiring, one-use approval grants bound to action type, integration, recipients, target, attributes, and content digest.
-- Separate fixed-argv outbound broker with atomic grant consumption, minimal connector environments, strict bounded JSON, and replay-safe audit state.
-- Reviewed long-term memory and an optional, rebuildable Obsidian projection.
+- Optional separate fixed-argv outbound broker with atomic grant consumption, minimal connector environments, strict bounded JSON, and replay-safe audit state.
+- Reviewed long-term memory, an optional rebuildable Obsidian projection, and Hermes-native vault search through the bundled Obsidian skill.
 - CLI, local HTTP API, Docker, Compose, and systemd artifacts.
 
 ## How a live pass works
 
 ```text
-signed event or operator request
+native Google revision, signed event, or operator request
   -> durable SQLite event inbox
   -> live model plan over current canonical state
   -> schema, authority, version, and policy validation
@@ -84,7 +84,15 @@ export HERMES_OPERATOR_BRIDGE_TOKEN="replace-with-a-different-random-bridge-toke
 export HERMES_OPERATOR_PROFILE="operator"
 ```
 
-The admin and bridge tokens must be distinct. The bridge token can read next work, questions, and the exact live task contract; post Hermes observations and policy attestations; and atomically claim the one bounded delegation batch for that canonical run. It cannot inspect approvals, mutate operator work, answer questions, approve actions, or invoke the outbound broker.
+The admin and bridge tokens must be distinct. The bridge token is limited to the explicit Hermes routes: content-free runtime counters, next work, questions, attention, exact live task contracts, conversational work capture and version-fenced updates, exact answers and authorization supplied through Hermes, normalized Google intake, lifecycle observations, compatibility diagnostics, and policy attestations. The plugin requires Hermes-native confirmation for authority-bearing conversational mutations. The bridge cannot inspect or approve external-action grants, fetch the admin status graph, or invoke the outbound broker.
+
+After Google OAuth, Gateway, and a private delivery target are configured in Hermes, install the native loops:
+
+```bash
+hermes-operator --config operator.toml native-jobs plan
+hermes-operator --config operator.toml native-jobs install --dry-run
+hermes-operator --config operator.toml native-jobs install
+```
 
 ## First operations
 
@@ -165,22 +173,26 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.2.0"]
-allowed_policy_versions = ["3.0.0"]
-allowed_policy_digests = ["6b8b21ef6d4a7f7ee5d04c9cf8b4a2fe15e9ed434d42980c879fda150df21d2f"]
+allowed_plugin_versions = ["1.3.0"]
+allowed_policy_versions = ["4.0.0"]
+allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
 ```
 
-This release requires `profile`, `default_assignee`, `orchestrator_profile`, and every `allowed_profiles` entry to resolve to the single attested `operator` profile in `internal` and `active` modes. Parallel work happens inside an authorized card through one foreground, flat `delegate_task` batch of at most three children per canonical run. Before Hermes invokes that tool, the plugin atomically consumes a core-backed claim keyed to the canonical run ID. The durable claim survives plugin and worker restarts, so a second batch remains blocked even if the first tool invocation fails. Unmanaged Kanban child creation and nested orchestrator delegation are also blocked.
+`profile`, `default_assignee`, `orchestrator_profile`, and entries in `allowed_profiles` form the effective execution-profile allowlist. Each selected profile installs the plugin with its own `HERMES_OPERATOR_PROFILE` value and must produce a fresh accepted attestation before receiving work. This supports multiple attested profiles without adding profile-specific capacity pools.
+
+Parallel work comes from independent canonical WorkItems dispatched as separate Hermes cards up to `operator.max_parallel_work`. Current Hermes top-level `delegate_task` uses background, non-durable execution, so the plugin blocks it on Operator-managed cards because foreground completion semantics cannot be proven. The planner decomposes useful parallel work into canonical cards instead. This restriction is scoped to managed cards; unmanaged interactive Hermes sessions retain native delegation and harness policy.
 
 The plugin sends one synchronous attestation at registration, then starts one daemon heartbeat and shares the same refresh limiter with normal Hermes lifecycle hooks. The default refresh interval is 120 seconds; the core example accepts an attestation for 300 seconds. Dispatch fails closed when evidence is absent, stale, for another profile, or outside the configured plugin version, policy version, or policy digest allowlists. Internal and active execution also require `control_base_url` and the token named by `control_token_env`; the daemon uses that authenticated control endpoint to terminate native compute and then blocks the card. Never add the control token to `hermes.pass_env`.
 
 When a Hermes card blocks for missing context, reconciliation closes that run attempt and releases its compute slot. After the operator answers a linked question and the work is freshly authorized, the dispatcher reserves a new slot, comments the bounded answer context onto the same card, and unblocks it. A failed independent verification uses a new card and a new run attempt instead. Retries retain the original authorization root and cannot exceed `max_execution_attempts`.
 
-The plugin guard is defense in depth, not a complete security boundary. Contract-authorized local tests and builds can invoke arbitrary project-defined code. For a hard no-outbound guarantee, the autonomous Hermes worker must receive no admin token or outbound service credential and must run in an operating-system or container sandbox with scoped filesystem permissions and network egress denied to mail, messaging, calendar, publishing, financial, repository-write, and generic mutation endpoints. See [Hermes Integration](docs/HERMES_INTEGRATION.md) and [Threat Model](docs/THREAT_MODEL.md).
+The task-scoped plugin guard is defense in depth for Operator-managed cards, not an end-to-end enforcement claim for the Hermes harness. Contract-authorized local tests and builds can invoke project-defined code, and unmanaged interactive or Cron sessions follow Hermes-native policy. Credential separation, operating-system isolation, and network controls are optional deployment hardening when a stronger boundary is required. See [Hermes Integration](docs/HERMES_INTEGRATION.md) and [Threat Model](docs/THREAT_MODEL.md).
 
 ## Inbound surfaces
 
-Provider-specific readers remain outside the core. The autonomy loop can poll them as fixed command argv with an atomic durable cursor, or each reader can send a normalized event to:
+The ready-to-use Google intake loop is installed as a Hermes Cron job backed by the bundled `google-workspace` skill and Hermes-managed OAuth. It reads Gmail, Calendar, and meeting evidence and records normalized `google.gmail`, `google.calendar`, and `google.meeting` revisions through the native plugin. Provider content remains authenticated but untrusted.
+
+For other providers, the autonomy loop can poll a fixed command argv with an atomic durable cursor, or a reader can send a normalized event to:
 
 ```text
 POST /v1/events/{source}
@@ -211,6 +223,8 @@ hermes-operator --config operator.toml project --vault /absolute/path/to/vault
 
 Add `--create` only when intentionally creating a new vault. The projector writes a dashboard, work notes, and promoted memory below `operator_root`. The live observation phase reads only direct Markdown children of `<operator_root>/Inbox`, with strict count and byte bounds. Inbox notes are untrusted evidence and never execution authority.
 
+For vault-wide retrieval, set `OBSIDIAN_VAULT_PATH` in the Hermes profile. The native daily-briefing job uses Hermes' bundled Obsidian skill when vault context is useful; Operator does not build a second vault-wide index.
+
 ## Exact-action approval
 
 Review an action before approving:
@@ -222,7 +236,7 @@ hermes-operator --config operator.toml approval approve ACTION_ID
 
 Approval creates an expiring one-use grant. It does not execute the action. Any side-effect-relevant change produces a different digest and requires a new approval. There is no outbound execution route in the daemon.
 
-To execute an approved action, deploy the broker separately, copy and review its disabled example, configure one deployment-owned fixed-argv connector, then deliberately enable and invoke it:
+If an installation wants exact-action delivery outside Hermes-native confirmation, it may deploy the optional broker separately, copy and review its disabled example, configure one deployment-owned fixed-argv connector, then deliberately enable and invoke it:
 
 ```bash
 cp config/outbound.example.toml config/outbound.toml
@@ -231,7 +245,7 @@ hermes-outbound-broker --config config/outbound.toml execute ACTION_ID \
   --grant-id GRANT_ID
 ```
 
-The broker atomically verifies and consumes the exact grant while claiming the action. Its connector receives bounded JSON containing the approved action and binding digests, and must return a JSON object with `"ok": true`. A replay, expired or revoked grant, changed recipient, content, target, attributes, integration, or action type fails closed. Broker invocation is separate from approval and is the only installed path that can cross the external side-effect boundary.
+The broker atomically verifies and consumes the exact grant while claiming the action. Its connector receives bounded JSON containing the approved action and binding digests, and must return a JSON object with `"ok": true`. A replay, expired or revoked grant, changed recipient, content, target, attributes, integration, or action type fails closed. Broker invocation is separate from approval and remains an optional deployment path, not a requirement for autonomous triage, planning, reminders, briefings, or Hermes execution.
 
 ## Deployment and verification
 

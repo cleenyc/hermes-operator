@@ -1,0 +1,371 @@
+from __future__ import annotations
+
+import hashlib
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from hermes_operator.config import (  # noqa: E402
+    AppConfig,
+    HermesConfig,
+    LLMConfig,
+    ObsidianConfig,
+    OperatorConfig,
+    PolicyConfig,
+    ServerConfig,
+    VerificationCheckConfig,
+    VerificationConfig,
+)
+from hermes_operator.db import SQLiteStore  # noqa: E402
+from hermes_operator.llm import ScriptedLLM  # noqa: E402
+from hermes_operator.models import (  # noqa: E402
+    Event,
+    RunRecord,
+    TrustLevel,
+    WorkItem,
+    WorkStatus,
+)
+from hermes_operator.prioritization import PriorityEngine  # noqa: E402
+from hermes_operator.supervisor import Supervisor  # noqa: E402
+from hermes_operator.verifier import (  # noqa: E402
+    ArtifactVerifier,
+    validate_verification_contract,
+)
+
+
+class ArtifactVerifierTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+
+    def _verifier(self, **changes: object) -> ArtifactVerifier:
+        values: dict[str, object] = {"artifact_roots": {"workspace": self.root}}
+        values.update(changes)
+        return ArtifactVerifier(VerificationConfig(**values))
+
+    def test_no_contract_or_native_artifact_is_not_applicable(self) -> None:
+        outcome = self._verifier().verify(
+            work=WorkItem(title="Text-only result"),
+            completion={"raw": {}},
+        )
+
+        self.assertFalse(outcome.applicable)
+        self.assertTrue(outcome.passed)
+
+    def test_native_artifact_is_scoped_hashed_and_type_checked(self) -> None:
+        artifact = self.root / "result.txt"
+        artifact.write_text("verified output\n", encoding="utf-8")
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        outcome = self._verifier().verify(
+            work=WorkItem(title="Produce result"),
+            completion={
+                "raw": {
+                    "metadata": {
+                        "artifacts": [
+                            {
+                                "root": "workspace",
+                                "path": "result.txt",
+                                "type": "file",
+                                "sha256": digest,
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertTrue(outcome.applicable)
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.artifacts[0]["sha256"], digest)
+        self.assertEqual(outcome.artifacts[0]["path"], "result.txt")
+
+    def test_digest_mismatch_and_path_escape_fail_closed(self) -> None:
+        artifact = self.root / "result.txt"
+        artifact.write_text("changed", encoding="utf-8")
+        mismatch = self._verifier().verify(
+            work=WorkItem(title="Produce result"),
+            completion={
+                "artifacts": [
+                    {
+                        "root": "workspace",
+                        "path": "result.txt",
+                        "sha256": "0" * 64,
+                    }
+                ]
+            },
+        )
+        escape = self._verifier().verify(
+            work=WorkItem(title="Escape"),
+            completion={"artifacts": [{"root": "workspace", "path": "../x"}]},
+        )
+
+        self.assertFalse(mismatch.passed)
+        self.assertIn("digest mismatch", mismatch.errors[0])
+        self.assertFalse(escape.passed)
+        self.assertIn("parent traversal", escape.errors[0])
+
+    def test_symlink_and_oversize_artifacts_are_rejected(self) -> None:
+        outside = self.root.parent / f"{self.root.name}-outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        self.addCleanup(outside.unlink, missing_ok=True)
+        link = self.root / "link.txt"
+        link.symlink_to(outside)
+        linked = self._verifier().verify(
+            work=WorkItem(title="Link"),
+            completion={"artifacts": [{"root": "workspace", "path": "link.txt"}]},
+        )
+        large = self.root / "large.bin"
+        large.write_bytes(b"x" * 5)
+        oversized = self._verifier(max_artifact_bytes=4).verify(
+            work=WorkItem(title="Large"),
+            completion={"artifacts": [{"root": "workspace", "path": "large.bin"}]},
+        )
+
+        self.assertFalse(linked.passed)
+        self.assertTrue(any("escapes" in value or "symlink" in value for value in linked.errors))
+        self.assertFalse(oversized.passed)
+        self.assertIn("byte limit", oversized.errors[0])
+
+    def test_canonical_contract_runs_only_named_fixed_check(self) -> None:
+        check = VerificationCheckConfig(
+            name="unit",
+            command=[sys.executable, "-c", "print('ok')"],
+            cwd=self.root,
+            timeout_seconds=5,
+            max_output_bytes=1_000,
+        )
+        work = WorkItem(
+            title="Checked work",
+            metadata={"verification_contract": {"artifacts": [], "checks": ["unit"]}},
+        )
+
+        outcome = self._verifier(checks=[check]).verify(work=work, completion={})
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.checks[0]["name"], "unit")
+        self.assertEqual(outcome.checks[0]["return_code"], 0)
+
+    def test_failed_or_unknown_contract_check_fails_closed(self) -> None:
+        check = VerificationCheckConfig(
+            name="unit",
+            command=[sys.executable, "-c", "raise SystemExit(3)"],
+            cwd=self.root,
+            timeout_seconds=5,
+            max_output_bytes=1_000,
+        )
+        failed = self._verifier(checks=[check]).verify(
+            work=WorkItem(
+                title="Checked work",
+                metadata={
+                    "verification_contract": {"artifacts": [], "checks": ["unit"]}
+                },
+            ),
+            completion={},
+        )
+        unknown = self._verifier(checks=[check]).verify(
+            work=WorkItem(
+                title="Unknown check",
+                metadata={
+                    "verification_contract": {
+                        "artifacts": [],
+                        "checks": ["not-configured"],
+                    }
+                },
+            ),
+            completion={},
+        )
+
+        self.assertFalse(failed.passed)
+        self.assertEqual(failed.checks[0]["return_code"], 3)
+        self.assertFalse(unknown.passed)
+        self.assertIn("not configured", unknown.errors[0])
+
+    def test_pre_dispatch_contract_validation_rejects_worker_selected_checks(self) -> None:
+        config = VerificationConfig(artifact_roots={"workspace": self.root})
+        with self.assertRaisesRegex(ValueError, "unconfigured checks"):
+            validate_verification_contract(
+                {"artifacts": [], "checks": ["worker-choice"]},
+                config,
+            )
+        with self.assertRaisesRegex(ValueError, "root is unknown"):
+            validate_verification_contract(
+                {
+                    "artifacts": [
+                        {"root": "unknown", "path": "result.txt", "type": "file"}
+                    ],
+                    "checks": [],
+                },
+                config,
+            )
+
+    def test_directory_digest_is_stable_and_rejects_special_entries(self) -> None:
+        directory = self.root / "bundle"
+        directory.mkdir()
+        (directory / "a.txt").write_text("a", encoding="utf-8")
+        nested = directory / "nested"
+        nested.mkdir()
+        (nested / "b.txt").write_text("b", encoding="utf-8")
+        verifier = self._verifier()
+
+        first = verifier.verify(
+            work=WorkItem(title="Bundle"),
+            completion={
+                "artifacts": [
+                    {"root": "workspace", "path": "bundle", "type": "directory"}
+                ]
+            },
+        )
+        second = verifier.verify(
+            work=WorkItem(title="Bundle"),
+            completion={"artifacts": [{"root": "workspace", "path": "bundle"}]},
+        )
+
+        self.assertTrue(first.passed)
+        self.assertEqual(first.artifacts[0]["files"], 2)
+        self.assertEqual(
+            first.artifacts[0]["sha256"],
+            second.artifacts[0]["sha256"],
+        )
+
+
+class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.store = SQLiteStore(self.root / "operator.db")
+        self.store.initialize()
+        self.config = AppConfig(
+            config_path=self.root / "operator.toml",
+            operator=OperatorConfig(
+                instance_id="test-verifier",
+                database_path=self.root / "operator.db",
+                data_dir=self.root,
+                autonomy_mode="shadow",
+            ),
+            llm=LLMConfig(provider="command"),
+            hermes=HermesConfig(enabled=True),
+            obsidian=ObsidianConfig(),
+            server=ServerConfig(enabled=False),
+            policy=PolicyConfig(),
+            verification=VerificationConfig(
+                artifact_roots={"workspace": self.root}
+            ),
+        )
+
+    async def test_failed_artifact_gate_overrides_model_passed_verdict(self) -> None:
+        run = RunRecord(
+            work_item_id="placeholder",
+            runner="hermes-kanban",
+            external_run_id="task-artifact",
+            status="completed",
+            result={"updated_at": "artifact-evidence", "raw": {}},
+        )
+        item = WorkItem(
+            title="Produce required artifact",
+            status=WorkStatus.REVIEW,
+            hermes_task_id="task-artifact",
+            acceptance_criteria=["The artifact exists"],
+            metadata={
+                "verification_contract": {
+                    "artifacts": [
+                        {
+                            "root": "workspace",
+                            "path": "missing.txt",
+                            "type": "file",
+                        }
+                    ],
+                    "checks": [],
+                },
+                "hermes": {
+                    "completion_fingerprint": "artifact-evidence",
+                    "completion_run_id": run.id,
+                    "completion_attempt": 1,
+                },
+                "governance": {
+                    "source_trust": "operator",
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                },
+            },
+        )
+        run.work_item_id = item.id
+        self.store.create_work(item)
+        self.store.create_run(run)
+        event = Event(
+            source="hermes",
+            external_id="task-artifact",
+            event_type="execution.completed",
+            payload={
+                "work_id": item.id,
+                "hermes_task_id": "task-artifact",
+                "run_id": run.id,
+                "attempt": 1,
+                "evidence_fingerprint": "artifact-evidence",
+                "execution_evidence": run.result,
+            },
+            trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            provenance={"adapter": "hermes-kanban"},
+        )
+        self.store.enqueue_event(event)
+        events = self.store.claim_events("test-verifier", 1, 60)
+        PriorityEngine().rescore_store(self.store)
+        current = self.store.get_work(item.id)
+        plan = {
+            "summary": "Assessed completion",
+            "observations": [],
+            "event_dispositions": [
+                {
+                    "event_id": event.id,
+                    "disposition": "execution_reconciled",
+                    "reason": "Completion evidence was assessed",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [
+                {
+                    "work_id": item.id,
+                    "expected_version": current.version,
+                    "verdict": "passed",
+                    "confidence": 0.99,
+                    "summary": "Model considered the prose sufficient",
+                    "criteria_results": [
+                        {
+                            "criterion": "The artifact exists",
+                            "passed": True,
+                            "evidence": "Worker claimed an artifact",
+                        }
+                    ],
+                }
+            ],
+            "external_action_proposals": [],
+        }
+        supervisor = Supervisor(
+            config=self.config,
+            store=self.store,
+            llm=ScriptedLLM([plan]),
+            priority_engine=PriorityEngine(),
+        )
+
+        result = await supervisor.run_pass(trigger="event", events=events)
+
+        completed = self.store.get_work(item.id)
+        self.assertEqual(completed.status, WorkStatus.BLOCKED)
+        self.assertEqual(result.verified_work_ids, [])
+        verification = completed.metadata["last_verification"]
+        self.assertEqual(verification["requested_verdict"], "passed")
+        self.assertEqual(verification["verdict"], "failed")
+        self.assertFalse(verification["deterministic"]["passed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

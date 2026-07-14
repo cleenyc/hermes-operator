@@ -1,0 +1,1411 @@
+"""Task-scoped guard for Operator-managed Hermes work.
+
+Managed Kanban cards receive a strict execution contract and cannot perform external
+communication or publication. Interactive and Cron sessions remain native Hermes
+surfaces: recognizable external writes use Hermes' own approval directive. The
+optional exact-action broker is a separate deployment path, not a prerequisite for
+normal Hermes operation.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+import hashlib
+import os
+from pathlib import Path
+import re
+import shlex
+from typing import Any, Mapping, Sequence
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyDecision:
+    blocked: bool
+    category: str = ""
+    detail: str = ""
+
+
+ALLOW = PolicyDecision(False)
+
+AuthorizationLookup = Callable[[str], Mapping[str, Any]]
+DelegationClaim = Callable[[str, int], Mapping[str, Any]]
+
+
+class TaskScopedPolicyGuard:
+    """Bind the fail-closed policy to one authenticated control-plane client."""
+
+    def __init__(
+        self,
+        authorization_lookup: AuthorizationLookup | None = None,
+        delegation_claim: DelegationClaim | None = None,
+        *,
+        expected_profile: str = "",
+        delegation_mode: str = "unknown",
+    ) -> None:
+        self._authorization_lookup = authorization_lookup
+        self._delegation_claim = delegation_claim
+        self._expected_profile = expected_profile.strip()
+        self._delegation_mode = (
+            delegation_mode if delegation_mode in {"foreground", "background"} else "unknown"
+        )
+
+    @property
+    def expected_profile(self) -> str:
+        """Expose non-secret configured identity to compatibility diagnostics."""
+
+        return self._expected_profile
+
+    def __call__(
+        self,
+        tool_name: str = "",
+        args: dict | None = None,
+        task_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, str] | None:
+        name = _normalize_name(tool_name)
+        current_task_id, identity_error = _current_task_identity(task_id)
+        if identity_error:
+            return _blocked_response(PolicyDecision(True, "identity", identity_error))
+        if name in _HUMAN_CONFIRMATION_TOOLS:
+            if current_task_id:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "an autonomous worker cannot request user authority through a conversational control tool",
+                    )
+                )
+            return _human_confirmation(name, args)
+        if name in {"operator_create_work", "operator_ingest_inbound"} and current_task_id:
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "provider intake and conversational work capture are available only outside Operator-managed worker cards",
+                )
+            )
+        if name == "operator_update_work":
+            if current_task_id:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "an autonomous worker cannot mutate canonical work through the conversational update tool",
+                    )
+                )
+            return _work_update_confirmation(args)
+        if not current_task_id:
+            return _native_session_policy(name, args)
+        if name == "delegate_task":
+            return self._guard_delegation(args, task_id)
+        return guard_external_side_effects(
+            tool_name,
+            args,
+            task_id=task_id,
+            authorization_lookup=self._authorization_lookup,
+            expected_profile=self._expected_profile,
+            **kwargs,
+        )
+
+    def _guard_delegation(
+        self,
+        args: dict | None,
+        task_id: str,
+    ) -> dict[str, str] | None:
+        if self._delegation_mode != "foreground":
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "this Hermes host does not provide proven foreground delegation; "
+                    "use Operator-managed parallel work cards instead",
+                )
+            )
+        if args is not None and not isinstance(args, Mapping):
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "generic_mutation",
+                    "malformed tool arguments cannot be evaluated safely",
+                )
+            )
+        try:
+            current_task_id, identity_error = _current_task_identity(task_id)
+            if identity_error:
+                return _blocked_response(
+                    PolicyDecision(True, "identity", identity_error)
+                )
+            contract = _lookup_execution_contract(
+                self._authorization_lookup,
+                current_task_id,
+                self._expected_profile,
+                "delegate_task",
+            )
+            decision = evaluate_tool_call(
+                "delegate_task",
+                args or {},
+                current_task_id=current_task_id,
+                execution_contract=contract,
+            )
+            if decision.blocked:
+                return _blocked_response(decision)
+            if contract is None:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "parallel delegation requires a live task-scoped execution contract",
+                    )
+                )
+            requested_children = _delegated_child_count(args or {})
+            if self._delegation_claim is None:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "durable delegation claim service is unavailable",
+                    )
+                )
+            claim = self._delegation_claim(
+                current_task_id,
+                requested_children,
+            )
+            expected_claim_keys = {
+                "claimed",
+                "contract_digest",
+                "reason",
+                "requested_children",
+                "run_id",
+                "task_id",
+            }
+            if (
+                not isinstance(claim, Mapping)
+                or set(claim) != expected_claim_keys
+                or claim.get("claimed") is not True
+                or claim.get("task_id") != current_task_id
+                or claim.get("run_id") != contract.get("run_id")
+                or claim.get("contract_digest") != contract.get("contract_digest")
+                or claim.get("requested_children") != requested_children
+                or claim.get("reason") != "claimed"
+            ):
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "this canonical run cannot claim another delegation batch",
+                    )
+                )
+            return None
+        except Exception:
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "generic_mutation",
+                    "policy evaluation failed closed",
+                )
+            )
+
+POLICY_VERSION = "4.0.0"
+POLICY_MODE = "default_deny"
+
+_TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_CONTRACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+_KNOWN_INTERNAL_CAPABILITIES = {
+    "delegate_task",
+    "local_build",
+    "local_read",
+    "local_test",
+    "local_write",
+}
+
+
+def _policy_source_digest() -> str:
+    """Bind an attestation to the exact policy source loaded by this process."""
+
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+POLICY_DIGEST = _policy_source_digest()
+
+_READ_ACTIONS = {
+    "check",
+    "download",
+    "fetch",
+    "find",
+    "get",
+    "inspect",
+    "list",
+    "lookup",
+    "query",
+    "read",
+    "search",
+    "show",
+    "status",
+    "view",
+}
+
+_EXPLICITLY_ALLOWED_TOOLS = {
+    "clarify",
+    "operator_next_work",
+    "operator_open_questions",
+    "operator_create_work",
+    "operator_ingest_inbound",
+    "operator_update_work",
+    "operator_status",
+    "operator_diagnostics",
+    "operator_due_reminders",
+    "project_list",
+    "read_file",
+    "read_terminal",
+    "search_files",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "todo",
+    "video_analyze",
+    "vision_analyze",
+    "web_extract",
+    "web_search",
+    "x_search",
+}
+
+_HUMAN_CONFIRMATION_TOOLS = {
+    "operator_answer_question": "question_id",
+    "operator_authorize_work": "work_id",
+}
+
+_READ_ONLY_KANBAN_TOOLS = {
+    "kanban_list",
+    "kanban_show",
+}
+
+_CURRENT_TASK_KANBAN_TOOLS = {
+    "kanban_block",
+    "kanban_comment",
+    "kanban_complete",
+    "kanban_heartbeat",
+}
+
+_TASK_SCOPED_CAPABILITY_TOOLS = {
+    "patch": "local_write",
+    "write_file": "local_write",
+}
+
+_COMMUNICATION_OBJECTS = {
+    "chat",
+    "comment",
+    "dm",
+    "email",
+    "mail",
+    "message",
+    "notification",
+    "reply",
+    "sms",
+    "sticker",
+}
+_COMMUNICATION_VERBS = {
+    "add",
+    "create",
+    "deliver",
+    "forward",
+    "post",
+    "reply",
+    "send",
+    "write",
+}
+_CALENDAR_OBJECTS = {"calendar", "event", "meeting", "schedule"}
+_CALENDAR_VERBS = {
+    "accept",
+    "add",
+    "book",
+    "cancel",
+    "create",
+    "decline",
+    "delete",
+    "invite",
+    "join",
+    "move",
+    "remove",
+    "reschedule",
+    "respond",
+    "rsvp",
+    "schedule",
+    "update",
+}
+_FINANCIAL_OBJECTS = {
+    "billing",
+    "charge",
+    "checkout",
+    "deposit",
+    "financial",
+    "invoice",
+    "order",
+    "payment",
+    "purchase",
+    "refund",
+    "trade",
+    "transaction",
+    "transfer",
+    "withdrawal",
+}
+_FINANCIAL_VERBS = {
+    "buy",
+    "cancel",
+    "charge",
+    "create",
+    "execute",
+    "pay",
+    "place",
+    "purchase",
+    "refund",
+    "sell",
+    "submit",
+    "trade",
+    "transfer",
+    "update",
+    "withdraw",
+}
+_DESTRUCTIVE = {
+    "delete",
+    "destroy",
+    "drop",
+    "erase",
+    "kill",
+    "purge",
+    "remove",
+    "shred",
+    "terminate",
+    "truncate",
+    "wipe",
+}
+_PERMISSION_OBJECTS = {
+    "access",
+    "acl",
+    "admin",
+    "ban",
+    "iam",
+    "member",
+    "membership",
+    "permission",
+    "policy",
+    "role",
+    "security",
+    "timeout",
+}
+_PERMISSION_VERBS = {
+    "add",
+    "assign",
+    "ban",
+    "change",
+    "create",
+    "delete",
+    "edit",
+    "grant",
+    "invite",
+    "kick",
+    "remove",
+    "revoke",
+    "set",
+    "timeout",
+    "update",
+}
+_REPOSITORY_OBJECTS = {
+    "bitbucket",
+    "branch",
+    "code",
+    "commit",
+    "git",
+    "github",
+    "gitlab",
+    "pr",
+    "pull",
+    "repository",
+}
+_REPOSITORY_VERBS = {
+    "approve",
+    "close",
+    "comment",
+    "create",
+    "delete",
+    "fork",
+    "merge",
+    "publish",
+    "push",
+    "release",
+    "review",
+    "submit",
+    "update",
+}
+
+_HTTP_TOOLS = {
+    "api_call",
+    "api_request",
+    "http",
+    "http_request",
+    "rest_request",
+    "web_request",
+}
+_BROWSER_MUTATION_TOOLS = {
+    "browser_back",
+    "browser_cdp",
+    "browser_click",
+    "browser_dialog",
+    "browser_navigate",
+    "browser_press",
+    "browser_scroll",
+    "browser_type",
+}
+_BROWSER_READ_TOOLS = {
+    "browser_console",
+    "browser_get_images",
+    "browser_snapshot",
+    "browser_vision",
+}
+
+_SAFE_TERMINAL_PROGRAMS = {
+    "basename",
+    "cat",
+    "comm",
+    "cut",
+    "date",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "file",
+    "git",
+    "grep",
+    "head",
+    "jq",
+    "ls",
+    "pwd",
+    "rg",
+    "stat",
+    "tail",
+    "tree",
+    "uniq",
+    "wc",
+    "which",
+}
+
+_SHELL_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "communication",
+        re.compile(
+            r"(?i)(?:^|[;&|]\s*)(?:mail|mailx|mutt|sendmail|msmtp)\b|"
+            r"\bhermes\s+send\b|\b(?:slack|telegram|discord|twilio)\b.*\b(?:send|post)\b"
+        ),
+    ),
+    (
+        "code_change",
+        re.compile(
+            r"(?i)\bgit\s+(?:push|merge)\b|\bgh\s+pr\s+(?:create|merge|review|comment)\b|"
+            r"\bglab\s+mr\s+(?:create|merge|approve)\b|\bhub\s+pull-request\b"
+        ),
+    ),
+    (
+        "publication",
+        re.compile(
+            r"(?i)\b(?:npm|pnpm|cargo)\s+publish\b|\byarn\s+npm\s+publish\b|"
+            r"\btwine\s+upload\b|\bdocker\s+push\b|\bgh\s+release\s+create\b|"
+            r"\b(?:firebase|vercel|netlify|fly)\s+(?:deploy|publish)\b|"
+            r"\bhelm\s+(?:install|upgrade|uninstall)\b|"
+            r"\b(?:kubectl|oc)\s+(?:apply|create|delete|patch|replace|scale)\b|"
+            r"\b(?:terraform|tofu)\s+(?:apply|destroy|import)\b"
+        ),
+    ),
+    (
+        "generic_mutation",
+        re.compile(
+            r"(?i)\bcurl\b[^\n]*(?:--request(?:\s+|=)|-X\s*)(?:POST|PUT|PATCH|DELETE)\b|"
+            r"\bcurl\b[^\n]*(?:--data(?:-binary|-raw|-urlencode)?|-d|--form|-F|"
+            r"--form-string|--json|--upload-file|-T)(?:\s|=)|"
+            r"\bcurl\b[^\n]*(?:\s)-(?:d|F|T)\S+|"
+            r"\bwget\b[^\n]*(?:--post-data|--post-file|--body-data|--body-file|"
+            r"--method(?:\s+|=)(?:POST|PUT|PATCH|DELETE))|"
+            r"\bhttp(?:ie)?\s+(?:POST|PUT|PATCH|DELETE)\b|"
+            r"\bInvoke-(?:WebRequest|RestMethod)\b[^\n]*-Method\s+(?:Post|Put|Patch|Delete)\b"
+        ),
+    ),
+    (
+        "destructive",
+        re.compile(
+            r"(?i)(?:^|[;&|]\s*)(?:rm|rmdir|shred|unlink|wipefs|mkfs(?:\.\w+)?|dropdb)\b|"
+            r"\bfind\b[^\n]*(?:-delete|-exec|-execdir|-ok)\b|"
+            r"\bgit\s+(?:clean\b|reset\s+--hard\b|checkout\s+--\b|branch\s+-D\b)|"
+            r"\bdocker\s+(?:rm\b|system\s+prune\b)|"
+            r"\b(?:DROP\s+(?:TABLE|DATABASE)|TRUNCATE\s+TABLE|DELETE\s+FROM)\b"
+        ),
+    ),
+    (
+        "security",
+        re.compile(
+            r"(?i)(?:^|[;&|]\s*)(?:chmod|chown|chgrp|setfacl)\b|"
+            r"\baws\s+iam\b|\bgcloud\b[^\n]*\b(?:add-iam-policy-binding|set-iam-policy)\b|"
+            r"\b(?:kubectl|oc)\s+(?:create|delete|patch)\s+(?:role|rolebinding|clusterrole)\b"
+        ),
+    ),
+    (
+        "financial",
+        re.compile(
+            r"(?i)\b(?:stripe|paypal|coinbase)\b[^\n]*\b(?:create|pay|refund|transfer|buy|sell|withdraw)\b"
+        ),
+    ),
+)
+
+def guard_external_side_effects(
+    tool_name: str = "",
+    args: dict | None = None,
+    task_id: str = "",
+    *,
+    authorization_lookup: AuthorizationLookup | None = None,
+    expected_profile: str = "",
+    **kwargs: Any,
+) -> dict[str, str] | None:
+    """Return Hermes' documented veto shape for disallowed worker actions."""
+
+    del kwargs
+    if args is not None and not isinstance(args, Mapping):
+        decision = PolicyDecision(
+            True, "generic_mutation", "malformed tool arguments cannot be evaluated safely"
+        )
+    else:
+        try:
+            current_task_id, identity_error = _current_task_identity(task_id)
+            if identity_error:
+                decision = PolicyDecision(True, "identity", identity_error)
+            else:
+                required_capability = _required_capability(tool_name, args or {})
+                contract: Mapping[str, Any] | None = None
+                if required_capability:
+                    contract = _lookup_execution_contract(
+                        authorization_lookup,
+                        current_task_id,
+                        expected_profile,
+                        required_capability,
+                    )
+                decision = evaluate_tool_call(
+                    tool_name,
+                    args or {},
+                    current_task_id=current_task_id,
+                    execution_contract=contract,
+                )
+        except Exception:
+            # Hermes catches hook exceptions and would otherwise continue the tool call.
+            # Convert every policy failure into an explicit veto instead.
+            decision = PolicyDecision(
+                True, "generic_mutation", "policy evaluation failed closed"
+            )
+    return _blocked_response(decision)
+
+
+def _blocked_response(decision: PolicyDecision) -> dict[str, str] | None:
+    if not decision.blocked:
+        return None
+    return {
+        "action": "block",
+        "message": (
+            "Blocked by Hermes Operator policy "
+            f"({decision.category}): {decision.detail}. "
+            "An Operator-managed worker cannot perform this side effect. Return the "
+            "proposal to an interactive Hermes turn for the operator's native final "
+            "approval; tool arguments, prompts, and worker claims never grant approval."
+        ),
+    }
+
+
+def _native_session_policy(
+    tool_name: str, args: Mapping[str, Any] | None
+) -> dict[str, str] | None:
+    """Defer normal interactive and cron sessions to Hermes native policy.
+
+    The strict default-deny worker policy is intentionally task scoped. Outside an
+    Operator-managed Kanban card we add a native approval prompt only for identifiable
+    external writes and scheduler mutations, while leaving reads, Obsidian operations,
+    native delegation, and unknown host capabilities to Hermes itself.
+    """
+
+    if not tool_name:
+        return None
+    if args is not None and not isinstance(args, Mapping):
+        return None
+    safe_args: Mapping[str, Any] = args or {}
+    action = _action(safe_args)
+    tokens = set(_tokens(tool_name)) | set(_argument_operation_tokens(safe_args))
+
+    if tool_name == "cronjob":
+        if action in {"list", "show", "status"}:
+            return None
+        return _native_approval(
+            tool_name,
+            action or "mutate",
+            "Confirm this Hermes scheduler change",
+        )
+
+    # Reads from Google, mail, calendar, meetings, and other native skills should
+    # remain usable. Known writes receive the harness' own approval UI.
+    write_tokens = (
+        _COMMUNICATION_VERBS
+        | _CALENDAR_VERBS
+        | _REPOSITORY_VERBS
+        | _PERMISSION_VERBS
+        | _FINANCIAL_VERBS
+        | _DESTRUCTIVE
+        | {
+            "deploy",
+            "publish",
+            "share",
+            "submit",
+            "tweet",
+            "upload",
+        }
+    )
+    external_objects = (
+        _COMMUNICATION_OBJECTS
+        | _CALENDAR_OBJECTS
+        | _REPOSITORY_OBJECTS
+        | _PERMISSION_OBJECTS
+        | _FINANCIAL_OBJECTS
+        | {
+            "drive",
+            "form",
+            "google",
+            "gmail",
+            "meet",
+            "outlook",
+            "slack",
+            "zoom",
+        }
+    )
+    if tokens & write_tokens and tokens & external_objects:
+        return _native_approval(
+            tool_name,
+            action or "write",
+            "Confirm this external action in Hermes",
+        )
+    return None
+
+
+def _native_approval(
+    tool_name: str, operation: str, message: str
+) -> dict[str, str]:
+    safe_operation = _normalize_name(operation) or "action"
+    return {
+        "action": "approve",
+        "message": f"{message}: {tool_name} ({safe_operation})",
+        "rule_key": f"hermes_operator:{tool_name}:{safe_operation}",
+    }
+
+
+def evaluate_tool_call(
+    tool_name: str,
+    args: Mapping[str, Any],
+    *,
+    current_task_id: str = "",
+    execution_contract: Mapping[str, Any] | None = None,
+) -> PolicyDecision:
+    """Classify a direct Hermes tool invocation without trusting its arguments."""
+
+    name = _normalize_name(tool_name)
+    if not name:
+        return PolicyDecision(True, "generic_mutation", "unnamed tool call")
+
+    if name == "terminal":
+        return _terminal_policy(
+            args,
+            current_task_id=current_task_id,
+            execution_contract=execution_contract,
+        )
+    if name == "execute_code":
+        return _execute_code_policy(args)
+    if name == "delegate_task":
+        if not _contract_has_capability(
+            execution_contract, current_task_id, "delegate_task"
+        ):
+            return PolicyDecision(
+                True,
+                "authorization",
+                "parallel delegation requires a live task-scoped execution contract",
+            )
+        return _delegate_task_policy(args)
+    if name == "process":
+        action = _action(args)
+        if action in {"kill", "terminate", "write"} or not action:
+            return PolicyDecision(
+                True,
+                "destructive" if action in {"kill", "terminate"} else "generic_mutation",
+                "interactive or destructive process control",
+            )
+        return ALLOW if action in {"list", "log", "poll", "wait"} else PolicyDecision(
+            True, "generic_mutation", "unknown process action"
+        )
+
+    if name in _BROWSER_MUTATION_TOOLS:
+        return PolicyDecision(
+            True, "generic_mutation", "browser state or navigation is not worker-authorized"
+        )
+    if name in _BROWSER_READ_TOOLS:
+        return ALLOW
+    if name == "computer_use":
+        action = _action(args)
+        if action in {"screenshot", "list_apps"}:
+            return ALLOW
+        return PolicyDecision(
+            True, "generic_mutation", "interactive computer action can commit external state"
+        )
+
+    if name == "cronjob":
+        action = _action(args)
+        return ALLOW if action in {"list", "show", "status"} else PolicyDecision(
+            True, "generic_mutation", "scheduled-job mutation or execution"
+        )
+    if name == "ha_call_service":
+        return PolicyDecision(True, "generic_mutation", "smart-home state mutation")
+    if name in {"ha_get_state", "ha_list_entities", "ha_list_services"}:
+        return ALLOW
+
+    if name == "discord":
+        action = _action(args)
+        return ALLOW if action in {
+            "fetch_channel",
+            "fetch_messages",
+            "list_channels",
+            "search_members",
+        } else PolicyDecision(True, "communication", "Discord mutation or message")
+    if name == "discord_admin":
+        action = _action(args)
+        return ALLOW if action.startswith(("get_", "list_", "fetch_", "search_")) else PolicyDecision(
+            True, "security", "Discord administration or permission mutation"
+        )
+
+    if name in {"feishu_drive_add_comment", "feishu_drive_reply_comment"}:
+        return PolicyDecision(True, "communication", "external document comment")
+    if name in {
+        "feishu_doc_read",
+        "feishu_drive_list_comments",
+        "feishu_drive_list_comment_replies",
+    }:
+        return ALLOW
+    if name in {"yb_send_dm", "yb_send_sticker"}:
+        return PolicyDecision(True, "communication", "external chat message")
+    if name.startswith("yb_query_") or name == "yb_search_sticker":
+        return ALLOW
+
+    if name == "spotify_playback":
+        return PolicyDecision(True, "generic_mutation", "external playback control")
+    if name in {"spotify_search", "spotify_albums"}:
+        return ALLOW
+    if name in {"spotify_devices", "spotify_queue", "spotify_playlists", "spotify_library"}:
+        action = _action(args)
+        if action in _READ_ACTIONS or action.startswith(
+            ("get_", "list_", "search_", "check_", "fetch_")
+        ):
+            return ALLOW
+        return PolicyDecision(True, "generic_mutation", "Spotify account or playback mutation")
+
+    if name == "skill_manage":
+        return PolicyDecision(True, "generic_mutation", "skill mutation is not worker-authorized")
+
+    if name in _HTTP_TOOLS or name.endswith(("_http_request", "_api_request")):
+        return PolicyDecision(True, "generic_mutation", "raw HTTP is not worker-authorized")
+
+    if name in _READ_ONLY_KANBAN_TOOLS:
+        return ALLOW
+    if name in _CURRENT_TASK_KANBAN_TOOLS:
+        if not _contract_has_capability(execution_contract, current_task_id, ""):
+            return PolicyDecision(
+                True,
+                "authorization",
+                "Kanban lifecycle mutation requires a live task-scoped execution contract",
+            )
+        target_task_id, target_error = _kanban_target_task_id(args)
+        if target_error:
+            return PolicyDecision(True, "authorization", target_error)
+        if target_task_id and target_task_id != current_task_id:
+            return PolicyDecision(
+                True,
+                "authorization",
+                "Kanban lifecycle mutation may target only the current Hermes task",
+            )
+        if name == "kanban_complete":
+            artifact_error = _kanban_completion_artifact_error(args)
+            if artifact_error:
+                return PolicyDecision(True, "sharing", artifact_error)
+        return ALLOW
+    if name in {
+        "kanban_create",
+        "kanban_link",
+        "kanban_start",
+        "kanban_status",
+        "kanban_unblock",
+        "kanban_update",
+    }:
+        return PolicyDecision(
+            True,
+            "generic_mutation",
+            "durable Kanban creation, linking, unblocking, and foreign mutation are control-plane owned",
+        )
+
+    capability = _TASK_SCOPED_CAPABILITY_TOOLS.get(name)
+    if capability:
+        if _contract_has_capability(execution_contract, current_task_id, capability):
+            return ALLOW
+        return PolicyDecision(
+            True,
+            "authorization",
+            f"{name} requires the live {capability} task capability",
+        )
+
+    if name in _EXPLICITLY_ALLOWED_TOOLS:
+        return ALLOW
+
+    tokens = set(_tokens(name))
+    nested = set(_argument_operation_tokens(args))
+    combined = tokens | nested
+
+    if "push" in combined or "merge" in combined:
+        return PolicyDecision(True, "code_change", "code push or merge")
+    if _DESTRUCTIVE & combined:
+        return PolicyDecision(True, "destructive", "destructive operation")
+    if {"share", "upload"} & combined or (
+        "attachment" in combined and _COMMUNICATION_VERBS & combined
+    ):
+        return PolicyDecision(True, "sharing", "sharing or upload operation")
+    if "submit" in combined or ("form" in combined and "fill" in combined):
+        return PolicyDecision(True, "submission", "external submission")
+    if {"publish", "tweet"} & combined or (
+        "release" in combined and _REPOSITORY_VERBS & combined
+    ):
+        return PolicyDecision(True, "publication", "external publication")
+    if _COMMUNICATION_OBJECTS & combined and _COMMUNICATION_VERBS & combined:
+        return PolicyDecision(True, "communication", "external communication")
+    if _CALENDAR_OBJECTS & combined and _CALENDAR_VERBS & combined:
+        return PolicyDecision(True, "scheduling", "calendar or meeting mutation")
+    if _FINANCIAL_OBJECTS & combined and (
+        _FINANCIAL_VERBS & combined or not (_READ_ACTIONS & combined)
+    ):
+        return PolicyDecision(True, "financial", "financial transaction")
+    if _PERMISSION_OBJECTS & combined and _PERMISSION_VERBS & combined:
+        return PolicyDecision(True, "security", "account or permission mutation")
+    if _REPOSITORY_OBJECTS & combined and _REPOSITORY_VERBS & combined:
+        return PolicyDecision(True, "code_change", "remote repository mutation")
+    if {"api", "external"} & combined and {
+        "call",
+        "create",
+        "execute",
+        "mutate",
+        "set",
+        "update",
+        "write",
+    } & combined:
+        return PolicyDecision(True, "generic_mutation", "external API mutation")
+
+    if name.startswith("mcp_"):
+        return PolicyDecision(
+            True, "generic_mutation", "MCP capability is not explicitly reviewed"
+        )
+    return PolicyDecision(
+        True, "generic_mutation", "tool is not on the explicit worker allowlist"
+    )
+
+
+def _required_capability(tool_name: str, args: Mapping[str, Any]) -> str:
+    name = _normalize_name(tool_name)
+    if name == "delegate_task":
+        return "delegate_task"
+    if name in _CURRENT_TASK_KANBAN_TOOLS:
+        return "__live_task__"
+    if name in _TASK_SCOPED_CAPABILITY_TOOLS:
+        return _TASK_SCOPED_CAPABILITY_TOOLS[name]
+    if name == "terminal":
+        command = _first_string(args, ("command", "cmd", "script"))
+        return _internal_command_capability(command) if command else ""
+    return ""
+
+
+def _current_task_identity(hook_task_id: str) -> tuple[str, str]:
+    if hook_task_id not in (None, "") and not isinstance(hook_task_id, str):
+        return "", "pre_tool_call task_id must be a string"
+    hook_identity = str(hook_task_id or "").strip()
+    environment_identity = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    for source, value in (
+        ("pre_tool_call task_id", hook_identity),
+        ("HERMES_KANBAN_TASK", environment_identity),
+    ):
+        if value and not _TASK_ID_PATTERN.fullmatch(value):
+            return "", f"{source} is not a valid Hermes task identity"
+    if hook_identity and environment_identity and hook_identity != environment_identity:
+        return "", "pre_tool_call task_id does not match HERMES_KANBAN_TASK"
+    return hook_identity or environment_identity, ""
+
+
+def _lookup_execution_contract(
+    lookup: AuthorizationLookup | None,
+    task_id: str,
+    expected_profile: str,
+    required_capability: str,
+) -> Mapping[str, Any] | None:
+    if lookup is None or not task_id:
+        return None
+    try:
+        contract = lookup(task_id)
+    except Exception:
+        return None
+    if not isinstance(contract, Mapping):
+        return None
+    required_keys = {
+        "authorized",
+        "contract_digest",
+        "internal_capabilities",
+        "profile",
+        "run_id",
+        "task_id",
+        "work_id",
+    }
+    if set(contract) != required_keys:
+        return None
+    if contract.get("authorized") is not True or contract.get("task_id") != task_id:
+        return None
+    for key in ("profile", "run_id", "work_id"):
+        value = contract.get(key)
+        if not isinstance(value, str) or not value or len(value) > 128:
+            return None
+    if expected_profile and contract.get("profile") != expected_profile:
+        return None
+    digest = contract.get("contract_digest")
+    if not isinstance(digest, str) or not _CONTRACT_DIGEST_PATTERN.fullmatch(digest):
+        return None
+    capabilities = contract.get("internal_capabilities")
+    if (
+        not isinstance(capabilities, list)
+        or not capabilities
+        or len(capabilities) > len(_KNOWN_INTERNAL_CAPABILITIES)
+        or len(set(capabilities)) != len(capabilities)
+        or any(
+            not isinstance(value, str) or value not in _KNOWN_INTERNAL_CAPABILITIES
+            for value in capabilities
+        )
+    ):
+        return None
+    if (
+        required_capability != "__live_task__"
+        and required_capability not in capabilities
+    ):
+        return None
+    return contract
+
+
+def _contract_has_capability(
+    contract: Mapping[str, Any] | None,
+    current_task_id: str,
+    capability: str,
+) -> bool:
+    if (
+        not contract
+        or contract.get("authorized") is not True
+        or not current_task_id
+        or contract.get("task_id") != current_task_id
+    ):
+        return False
+    if not capability:
+        return True
+    capabilities = contract.get("internal_capabilities")
+    return isinstance(capabilities, list) and capability in capabilities
+
+
+def _kanban_target_task_id(args: Mapping[str, Any]) -> tuple[str, str]:
+    values: list[str] = []
+    for key in ("task_id", "task", "id"):
+        if key not in args:
+            continue
+        value = args.get(key)
+        if not isinstance(value, str) or not _TASK_ID_PATTERN.fullmatch(value.strip()):
+            return "", f"Kanban {key} is not a valid task identity"
+        values.append(value.strip())
+    if len(set(values)) > 1:
+        return "", "Kanban tool arguments contain conflicting task identities"
+    return (values[0] if values else ""), ""
+
+
+def _kanban_completion_artifact_error(args: Mapping[str, Any]) -> str:
+    """Reject Hermes fields that can turn completion into file delivery.
+
+    This check applies only after a live Operator execution contract has been
+    established, so it does not alter normal Hermes Kanban behavior outside cards
+    managed by this system.
+    """
+
+    artifacts = args.get("artifacts")
+    if artifacts not in (None, "", [], ()):
+        return "Operator-managed completion cannot attach or deliver artifact paths"
+    metadata = args.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return ""
+    for key in metadata:
+        normalized = _normalize_name(key)
+        if normalized in {"artifact", "artifacts", "attachment", "attachments"}:
+            return "Operator-managed completion metadata cannot attach or deliver files"
+    return ""
+
+
+def _human_confirmation(
+    tool_name: str, args: Mapping[str, Any] | None
+) -> dict[str, str]:
+    """Use Hermes' native human approval gate for irreversible intent changes."""
+
+    if not isinstance(args, Mapping):
+        return _blocked_response(
+            PolicyDecision(
+                True,
+                "authorization",
+                "malformed operator interaction arguments cannot be confirmed",
+            )
+        ) or {}
+    identity_key = _HUMAN_CONFIRMATION_TOOLS[tool_name]
+    identity = args.get(identity_key)
+    if (
+        not isinstance(identity, str)
+        or not identity.strip()
+        or len(identity.strip()) > 128
+        or not _TASK_ID_PATTERN.fullmatch(identity.strip())
+    ):
+        return _blocked_response(
+            PolicyDecision(
+                True,
+                "authorization",
+                f"{identity_key} must be one exact safe identifier",
+            )
+        ) or {}
+    label = "answer this Operator question" if tool_name == "operator_answer_question" else "authorize this exact Operator work item"
+    return {
+        "action": "approve",
+        "message": f"Confirm that you want Hermes to {label}: {identity.strip()}",
+        "rule_key": f"{tool_name}:{identity.strip()}",
+    }
+
+
+def _work_update_confirmation(
+    args: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    if not isinstance(args, Mapping):
+        return _blocked_response(
+            PolicyDecision(True, "authorization", "work update arguments are malformed")
+        )
+    work_id = args.get("work_id")
+    changes = args.get("changes")
+    if (
+        not isinstance(work_id, str)
+        or not _TASK_ID_PATTERN.fullmatch(work_id.strip())
+        or not isinstance(changes, Mapping)
+        or not changes
+    ):
+        return _blocked_response(
+            PolicyDecision(True, "authorization", "work update identity or changes are invalid")
+        )
+    status = _normalize_name(changes.get("status"))
+    sensitive = status in {"done", "cancelled", "archived"} or "parent_id" in changes
+    if not sensitive:
+        return None
+    fields = sorted(str(key) for key in changes)
+    return {
+        "action": "approve",
+        "message": (
+            "Confirm this terminal or hierarchy-changing Operator work update: "
+            f"{work_id.strip()} ({', '.join(fields)})"
+        ),
+        "rule_key": f"operator_update_work:{work_id.strip()}:{status or 'parent'}",
+    }
+
+
+def _delegate_task_policy(args: Mapping[str, Any]) -> PolicyDecision:
+    top_level_error = _delegation_entry_error(args)
+    if top_level_error:
+        return PolicyDecision(True, "generic_mutation", top_level_error)
+
+    tasks = args.get("tasks")
+    if tasks is None:
+        goal = args.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            return PolicyDecision(True, "generic_mutation", "delegate_task requires one goal")
+        return ALLOW
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 3:
+        return PolicyDecision(
+            True, "generic_mutation", "parallel delegation requires a batch of one to three tasks"
+        )
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            return PolicyDecision(
+                True, "generic_mutation", "every delegated task must be an object"
+            )
+        entry_error = _delegation_entry_error(task)
+        if entry_error:
+            return PolicyDecision(True, "generic_mutation", entry_error)
+        goal = task.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            return PolicyDecision(
+                True, "generic_mutation", "every delegated task requires a goal"
+            )
+    return ALLOW
+
+
+def _delegated_child_count(args: Mapping[str, Any]) -> int:
+    tasks = args.get("tasks")
+    return len(tasks) if isinstance(tasks, list) else 1
+
+
+def _delegation_entry_error(entry: Mapping[str, Any]) -> str:
+    if "background" in entry and entry.get("background") is not False:
+        return "all delegated tasks must run in the foreground"
+    if "role" in entry and not isinstance(entry.get("role"), str):
+        return "delegated roles must be strings"
+    if _normalize_name(entry.get("role")) == "orchestrator":
+        return "delegated orchestrator roles are not permitted"
+    return ""
+
+
+def _terminal_policy(
+    args: Mapping[str, Any],
+    *,
+    current_task_id: str = "",
+    execution_contract: Mapping[str, Any] | None = None,
+) -> PolicyDecision:
+    command = _first_string(args, ("command", "cmd", "script"))
+    if not command:
+        return PolicyDecision(True, "generic_mutation", "empty or unknown terminal command")
+    for category, pattern in _SHELL_RISK_PATTERNS:
+        if pattern.search(command):
+            return PolicyDecision(True, category, "terminal command can cause a prohibited side effect")
+    if _is_safe_terminal_command(command):
+        return ALLOW
+    capability = _internal_command_capability(command)
+    if capability and _contract_has_capability(
+        execution_contract,
+        current_task_id,
+        capability,
+    ):
+        return ALLOW
+    if capability:
+        return PolicyDecision(
+            True,
+            "authorization",
+            f"local command requires the live {capability} task capability",
+        )
+    return PolicyDecision(
+        True,
+        "generic_mutation",
+        "terminal command is outside the local read, test, and build allowlists",
+    )
+
+
+def _is_safe_terminal_command(command: str) -> bool:
+    segments = _command_segments(command)
+    return bool(segments) and all(_safe_command_segment(segment) for segment in segments)
+
+
+def _command_segments(command: str, *, allow_pipes: bool = True) -> list[list[str]]:
+    if any(fragment in command for fragment in ("$(", "`", "\n", "\r", "<(", ">(")):
+        return []
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    disallowed = {">", ">>", "<", "<<", "&", "||", ";"}
+    if not allow_pipes:
+        disallowed.add("|")
+    if not tokens or any(token in disallowed for token in tokens):
+        return []
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in {"&&", "|"}:
+            if not segments[-1]:
+                return []
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return segments if segments[-1] else []
+
+
+def _safe_command_segment(tokens: Sequence[str]) -> bool:
+    values = list(tokens)
+    if not values:
+        return False
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", values[0]):
+        return False
+    if "/" in values[0] or "\\" in values[0]:
+        return False
+    program = values[0].rsplit("/", 1)[-1].lower()
+    arguments = [value.lower() for value in values[1:]]
+    if program == "cd":
+        return len(arguments) == 1
+    if program not in _SAFE_TERMINAL_PROGRAMS:
+        return False
+    if any("http://" in value or "https://" in value for value in arguments):
+        return False
+    if program == "rg" and any(value.startswith("--pre") for value in arguments):
+        return False
+    if program == "git":
+        return _safe_git(arguments)
+    return True
+
+
+def _internal_command_capability(command: str) -> str:
+    segments = _command_segments(command, allow_pipes=False)
+    if not segments:
+        return ""
+    protected: set[str] = set()
+    for segment in segments:
+        if _safe_command_segment(segment):
+            continue
+        capability = _internal_command_segment_capability(segment)
+        if not capability:
+            return ""
+        protected.add(capability)
+    if len(protected) != 1:
+        return ""
+    return next(iter(protected))
+
+
+def _internal_command_segment_capability(tokens: Sequence[str]) -> str:
+    values = list(tokens)
+    if not values or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", values[0]):
+        return ""
+    if "/" in values[0] or "\\" in values[0]:
+        return ""
+    if any("http://" in value.lower() or "https://" in value.lower() for value in values):
+        return ""
+    program = values[0].lower()
+    arguments = [value.lower() for value in values[1:]]
+
+    if program in {"pytest", "py.test", "ctest", "mypy", "ruff"}:
+        return "local_test"
+    if program in {"python", "python3"}:
+        if len(arguments) >= 2 and arguments[0] == "-m":
+            if arguments[1] in {"pytest", "unittest"}:
+                return "local_test"
+            if arguments[1] == "build" and "--no-isolation" in arguments[2:]:
+                return "local_build"
+        return ""
+    if program in {"npm", "pnpm", "yarn"}:
+        action = _package_script_action(arguments)
+        if action.startswith(("test", "check", "lint")):
+            return "local_test"
+        if action.startswith("build"):
+            return "local_build"
+        return ""
+    if program == "cargo":
+        if "--offline" not in arguments:
+            return ""
+        actions = [value for value in arguments if not value.startswith("-")]
+        if not actions:
+            return ""
+        if actions[0] == "test":
+            return "local_test"
+        if actions[0] in {"build", "check"}:
+            return "local_build"
+        return ""
+    if program == "dotnet":
+        if "--no-restore" not in arguments or not arguments:
+            return ""
+        if arguments[0] == "test":
+            return "local_test"
+        if arguments[0] == "build":
+            return "local_build"
+        return ""
+    if program in {"make", "ninja"}:
+        targets = [value for value in arguments if not value.startswith("-")]
+        if not targets:
+            return ""
+        if all(value in {"test", "tests", "check", "lint"} for value in targets):
+            return "local_test"
+        if all(value in {"build", "all"} for value in targets):
+            return "local_build"
+        return ""
+    if program == "tsc":
+        return "local_test" if "--noemit" in arguments else "local_build"
+    return ""
+
+
+def _package_script_action(arguments: Sequence[str]) -> str:
+    if not arguments:
+        return ""
+    if arguments[0] in {"test", "build"}:
+        return arguments[0]
+    if len(arguments) >= 2 and arguments[0] == "run":
+        return arguments[1]
+    return ""
+
+
+def _safe_git(arguments: Sequence[str]) -> bool:
+    if not arguments:
+        return False
+    if any(value in {"--ext-diff", "--textconv"} for value in arguments):
+        return False
+    subcommand = arguments[0]
+    return subcommand in {
+        "blame",
+        "describe",
+        "diff",
+        "log",
+        "ls-files",
+        "rev-parse",
+        "show",
+        "status",
+    }
+
+
+def _execute_code_policy(args: Mapping[str, Any]) -> PolicyDecision:
+    del args
+    return PolicyDecision(
+        True,
+        "generic_mutation",
+        "arbitrary code execution is not available to autonomous workers",
+    )
+
+
+def _normalize_name(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _tokens(value: str) -> tuple[str, ...]:
+    return tuple(part for part in _normalize_name(value).split("_") if part)
+
+
+def _first_string(args: Mapping[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _action(args: Mapping[str, Any]) -> str:
+    return _normalize_name(
+        _first_string(args, ("action", "operation", "command_name", "mode"))
+    )
+
+
+def _argument_operation_tokens(args: Mapping[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("action", "operation", "method", "tool", "tool_name", "command_name"):
+        value = args.get(key)
+        if isinstance(value, str):
+            values.extend(_tokens(value))
+    return tuple(values)
+
+
+__all__ = [
+    "POLICY_DIGEST",
+    "POLICY_MODE",
+    "POLICY_VERSION",
+    "PolicyDecision",
+    "TaskScopedPolicyGuard",
+    "evaluate_tool_call",
+    "guard_external_side_effects",
+]
