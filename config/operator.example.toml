@@ -1,0 +1,106 @@
+[operator]
+instance_id = "personal-operator"
+database_path = "data/operator.db"
+data_dir = "data"
+timezone = "America/New_York"
+autonomy_mode = "shadow" # shadow | internal | active
+tick_seconds = 30
+reconciliation_seconds = 300
+max_events_per_pass = 25
+max_parallel_work = 4
+# Maximum dispatch authorizations one validated model pass may issue.
+max_authorizations_per_pass = 40
+# Must exceed llm.timeout_seconds by more than 30 seconds.
+event_lease_seconds = 300
+event_max_attempts = 5
+
+[llm]
+provider = "openai_compatible" # openai_compatible | command
+model = "configure-at-deployment"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 180
+temperature = 0.1
+max_output_tokens = 8000
+command = []
+# Local command planners receive a minimal environment plus only these names.
+# Never pass the operator admin, bridge, approval, or unrelated outbound secrets.
+pass_env = []
+
+[hermes]
+enabled = false
+binary = "hermes"
+profile = "operator"
+board = "default"
+# This release uses one attested profile. Keep all profile fields identical.
+default_assignee = "operator"
+orchestrator_profile = "operator"
+command_timeout_seconds = 120
+goal_mode = false
+default_skills = []
+# Parallel compute is bounded task-scoped delegate_task within this profile.
+# Native Kanban child creation and unmanaged profile fan-out are not authorized.
+allowed_profiles = ["operator"]
+allowed_skills = []
+# Only explicitly named environment variables are added to the safe Hermes child env.
+# Never pass admin, bridge, approval, run-control, or outbound credentials.
+pass_env = []
+dispatch_authorization_ttl_seconds = 86400
+max_execution_attempts = 3
+# Required with enabled = true in internal or active mode. This is the
+# authenticated Hermes Kanban run-control API used to terminate native compute.
+control_base_url = ""
+control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
+control_timeout_seconds = 10
+require_policy_attestation = true
+# The native plugin heartbeat defaults to 120 seconds. Keep this core TTL above it.
+policy_attestation_ttl_seconds = 300
+allowed_plugin_versions = ["1.2.0"]
+allowed_policy_versions = ["3.0.0"]
+# Exact SHA-256 of integrations/hermes_operator_plugin/policy.py in this release.
+# Recompute, review, and update this allowlist whenever that policy source changes.
+allowed_policy_digests = ["6b8b21ef6d4a7f7ee5d04c9cf8b4a2fe15e9ed434d42980c879fda150df21d2f"]
+
+[obsidian]
+enabled = false
+vault_path = ""
+discover = true
+operator_root = "Hermes Operator"
+write_mode = "projection"
+
+[server]
+enabled = true
+host = "${HERMES_OPERATOR_BIND_HOST:-127.0.0.1}"
+port = 8787
+api_token_env = "HERMES_OPERATOR_API_TOKEN"
+# Scoped native-plugin credential. It must differ from the admin token.
+bridge_token_env = "HERMES_OPERATOR_BRIDGE_TOKEN"
+max_body_bytes = 1048576
+allow_unsigned_webhooks = false
+
+[server.webhook_secrets]
+# gmail = "${GMAIL_WEBHOOK_SECRET}"
+# calendar = "${CALENDAR_WEBHOOK_SECRET}"
+
+[policy]
+external_actions_require_approval = true
+external_action_mode = "stage_only" # disabled | stage_only | approved
+approval_ttl_seconds = 3600
+# Never pass this or any outbound connector secret to Hermes.
+approval_secret_env = "HERMES_OPERATOR_APPROVAL_SECRET"
+# Declarative in this release. Trust comes from the authenticated ingress path.
+trusted_event_sources = ["operator", "system"]
+# Reserved in this release. Memory still requires operator promotion.
+allow_memory_auto_promotion = false
+max_llm_priority_adjustment = 10.0
+
+# Optional read-only command poller. Duplicate this table per inbound surface.
+# [[inbound_connectors]]
+# name = "mail-reader"
+# source = "mail"
+# command = ["/opt/hermes-connectors/mail-reader"]
+# enabled = true
+# interval_seconds = 60
+# timeout_seconds = 60
+# pass_env = ["MAIL_READ_TOKEN"]
+# max_output_bytes = 4194304
