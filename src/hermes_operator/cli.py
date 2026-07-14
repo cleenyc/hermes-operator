@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from .authority import execution_scope_digest
+from .authority import execution_scope_digest, execution_scope_document
 from .config import load_config
 from .dispatcher import dispatch_contract_digest
 from .inbound import normalize_operator_event
@@ -78,9 +78,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.4.0"]
-allowed_policy_versions = ["5.0.0"]
-allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
+allowed_plugin_versions = ["1.5.0"]
+allowed_policy_versions = ["6.0.0"]
+allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
 
 [obsidian]
 enabled = false
@@ -252,21 +252,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work_reminder.add_argument("--until")
     work_reminder.add_argument("--expected-version", type=int, required=True)
+    work_scope = work_commands.add_parser(
+        "authorization-scope",
+        help="Preview the exact execution scope that a dispatch will authorize",
+    )
+    work_scope.add_argument("work_id")
+    work_scope.add_argument("--profile")
+    work_scope.add_argument("--skill", action="append", default=[])
+    work_scope.add_argument("--goal-mode", action="store_true")
+    work_verification = work_commands.add_parser(
+        "verification-contract",
+        help="Set or clear verifier scope before a fresh authorization preview",
+    )
+    work_verification.add_argument("work_id")
+    verification_change = work_verification.add_mutually_exclusive_group(
+        required=True
+    )
+    verification_change.add_argument("--set", type=Path, dest="contract_file")
+    verification_change.add_argument("--clear", action="store_true")
+    work_verification.add_argument("--expected-version", type=int, required=True)
     work_dispatch = work_commands.add_parser("dispatch")
     work_dispatch.add_argument("work_id")
     work_dispatch.add_argument("--profile")
     work_dispatch.add_argument("--skill", action="append", default=[])
     work_dispatch.add_argument("--goal-mode", action="store_true")
-    verification_contract = work_dispatch.add_mutually_exclusive_group()
-    verification_contract.add_argument(
-        "--verification-contract",
-        type=Path,
-        help="JSON file containing canonical artifacts and named checks",
+    work_dispatch.add_argument("--expected-version", type=int, required=True)
+    work_dispatch.add_argument(
+        "--expected-scope-revision", type=int, required=True
     )
-    verification_contract.add_argument(
-        "--clear-verification-contract",
-        action="store_true",
-    )
+    work_dispatch.add_argument("--expected-scope-digest", required=True)
     work_link = work_commands.add_parser("link")
     work_link.add_argument("from_id")
     work_link.add_argument("to_id")
@@ -445,6 +459,48 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
         item.priority_rationale = score.rationale
         service.store.create_work(item, actor="operator-cli")
         _emit(item.to_dict())
+    elif arguments.work_command == "authorization-scope":
+        item = service.store.get_work(arguments.work_id)
+        profile = (
+            arguments.profile
+            or item.assignee
+            or service.config.hermes.default_assignee
+        )
+        digest = execution_scope_digest(
+            item,
+            profile=profile,
+            skills=list(arguments.skill),
+            default_skills=service.config.hermes.default_skills,
+            goal_mode=arguments.goal_mode,
+        )
+        _emit(
+            {
+                "work_id": item.id,
+                "work_version": item.version,
+                "status": item.status.value,
+                "authorizable": item.status
+                not in {
+                    WorkStatus.DONE,
+                    WorkStatus.CANCELLED,
+                    WorkStatus.ARCHIVED,
+                },
+                "authorization_scope_revision": (
+                    item.authorization_scope_revision
+                ),
+                "authorization_scope_digest": digest,
+                "profile": profile,
+                "skills": list(arguments.skill),
+                "default_skills": list(service.config.hermes.default_skills),
+                "goal_mode": arguments.goal_mode,
+                "scope": execution_scope_document(
+                    item,
+                    profile=profile,
+                    skills=list(arguments.skill),
+                    default_skills=service.config.hermes.default_skills,
+                    goal_mode=arguments.goal_mode,
+                ),
+            }
+        )
     elif arguments.work_command == "reminder":
         updated = service.store.resolve_reminder(
             arguments.work_id,
@@ -452,6 +508,32 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
             expected_version=arguments.expected_version,
             until=arguments.until,
             actor="operator-cli",
+        )
+        _emit(updated.to_dict())
+    elif arguments.work_command == "verification-contract":
+        item = service.store.get_work(arguments.work_id)
+        metadata = dict(item.metadata)
+        if arguments.clear:
+            metadata.pop("verification_contract", None)
+        else:
+            raw_contract = arguments.contract_file.read_bytes()
+            if len(raw_contract) > 256_000:
+                raise ValueError("Verification contract is too large")
+            try:
+                contract_value = json.loads(raw_contract.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "Verification contract must be UTF-8 JSON"
+                ) from error
+            metadata["verification_contract"] = validate_verification_contract(
+                contract_value,
+                service.config.verification,
+            )
+        updated = service.store.update_work(
+            item.id,
+            {"metadata": metadata},
+            actor="operator-cli",
+            expected_version=arguments.expected_version,
         )
         _emit(updated.to_dict())
     elif arguments.work_command == "link":
@@ -473,6 +555,14 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
         )
     elif arguments.work_command == "dispatch":
         item = service.store.get_work(arguments.work_id)
+        if item.status in {
+            WorkStatus.DONE,
+            WorkStatus.CANCELLED,
+            WorkStatus.ARCHIVED,
+        }:
+            raise ValueError(
+                f"Terminal work cannot be dispatched: {item.status.value}"
+            )
         if not item.acceptance_criteria:
             raise ValueError("Work needs acceptance criteria before dispatch")
         profile = arguments.profile or item.assignee or service.config.hermes.default_assignee
@@ -493,27 +583,33 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
         unknown_skills = set(arguments.skill) - allowed_skills
         if unknown_skills:
             raise ValueError(f"Hermes skills are not allowed: {sorted(unknown_skills)}")
-        contract_metadata = dict(item.metadata)
-        if arguments.verification_contract is not None:
-            raw_contract = arguments.verification_contract.read_bytes()
-            if len(raw_contract) > 256_000:
-                raise ValueError("Verification contract is too large")
-            try:
-                contract_value = json.loads(raw_contract.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError("Verification contract must be UTF-8 JSON") from error
-            contract_metadata["verification_contract"] = validate_verification_contract(
-                contract_value,
-                service.config.verification,
-            )
-        elif arguments.clear_verification_contract:
-            contract_metadata.pop("verification_contract", None)
-        if contract_metadata.get("verification_contract") != item.metadata.get(
-            "verification_contract"
+        if item.version != arguments.expected_version:
+            raise ValueError("Work item changed after its scope was displayed")
+        if (
+            item.authorization_scope_revision
+            != arguments.expected_scope_revision
         ):
+            raise ValueError(
+                "Work authorization scope changed after it was displayed"
+            )
+        displayed_digest = execution_scope_digest(
+            item,
+            profile=profile,
+            skills=list(arguments.skill),
+            default_skills=service.config.hermes.default_skills,
+            goal_mode=arguments.goal_mode,
+        )
+        if displayed_digest != arguments.expected_scope_digest:
+            raise ValueError(
+                "Dispatch shape does not match the displayed authorization scope"
+            )
+        if item.assignee != profile:
+            # Executor assignment is itself an authorization-scope transition.
+            # Apply it first so any prior authority is revoked and the fresh
+            # dispatch authorization below is bound to the advanced revision.
             item = service.store.update_work(
                 item.id,
-                {"metadata": contract_metadata},
+                {"assignee": profile},
                 actor="operator-cli",
                 expected_version=item.version,
             )

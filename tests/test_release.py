@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import hermes_operator  # noqa: E402
+from hermes_operator.api import _handler_for  # noqa: E402
 
 
 class ReleaseConsistencyTests(unittest.TestCase):
@@ -33,6 +34,10 @@ class ReleaseConsistencyTests(unittest.TestCase):
         policy_digest = hashlib.sha256(policy_path.read_bytes()).hexdigest()
 
         self.assertEqual(core_project["version"], hermes_operator.__version__)
+        self.assertEqual(
+            _handler_for(object()).server_version,
+            f"HermesOperator/{hermes_operator.__version__}",
+        )
         plugin_version = re.search(
             r'^PLUGIN_VERSION = "([^"]+)"$', plugin_source, re.MULTILINE
         )
@@ -65,8 +70,18 @@ class ReleaseConsistencyTests(unittest.TestCase):
         spec.loader.exec_module(module)
 
         self.assertEqual(module.VERSION, hermes_operator.__version__)
+        self.assertEqual(module.PLUGIN_VERSION, "1.5.0")
+        self.assertEqual(
+            set(module.EXPECTED_WHEELS),
+            {
+                "hermes_operator-0.4.0-py3-none-any.whl",
+                "hermes_operator_plugin-1.5.0-py3-none-any.whl",
+            },
+        )
         required = {
             "README.md",
+            "AUTHORS.md",
+            "CHANGELOG.md",
             "LICENSE",
             "Makefile",
             "pyproject.toml",
@@ -92,6 +107,10 @@ class ReleaseConsistencyTests(unittest.TestCase):
             path.relative_to(ROOT).as_posix() for path in module._files()
         }
         self.assertTrue(required <= bundled, sorted(required - bundled))
+        bundled_wheels = {
+            Path(path).name for path in bundled if Path(path).suffix == ".whl"
+        }
+        self.assertTrue(bundled_wheels <= set(module.EXPECTED_WHEELS))
 
 
 if __name__ == "__main__":

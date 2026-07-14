@@ -104,6 +104,77 @@ class CLITests(unittest.TestCase):
         store = SQLiteStore(load_config(self.config_path).operator.database_path)
         self.assertFalse(store.dependencies_satisfied(str(task["id"])))
 
+    def test_dispatch_requires_fresh_scope_after_verification_contract_change(self) -> None:
+        self.invoke("init")
+        _, created = self.invoke(
+            "work",
+            "add",
+            "Build the bounded artifact",
+            "--status",
+            "ready",
+            "--criterion",
+            "The artifact is verified",
+        )
+        status, displayed = self.invoke(
+            "work",
+            "authorization-scope",
+            str(created["id"]),
+        )
+        self.assertEqual(status, 0)
+
+        contract_path = self.root / "verification.json"
+        contract_path.write_text(
+            json.dumps({"artifacts": [], "checks": []}),
+            encoding="utf-8",
+        )
+        status, changed = self.invoke(
+            "work",
+            "verification-contract",
+            str(created["id"]),
+            "--set",
+            str(contract_path),
+            "--expected-version",
+            str(created["version"]),
+        )
+        self.assertEqual(status, 0)
+        self.assertGreater(
+            changed["authorization_scope_revision"],
+            displayed["authorization_scope_revision"],
+        )
+
+        stale_status, _ = self.invoke(
+            "work",
+            "dispatch",
+            str(created["id"]),
+            "--expected-version",
+            str(displayed["work_version"]),
+            "--expected-scope-revision",
+            str(displayed["authorization_scope_revision"]),
+            "--expected-scope-digest",
+            str(displayed["authorization_scope_digest"]),
+        )
+        self.assertEqual(stale_status, 1)
+
+        status, fresh = self.invoke(
+            "work",
+            "authorization-scope",
+            str(created["id"]),
+        )
+        self.assertEqual(status, 0)
+        status, dispatched = self.invoke(
+            "work",
+            "dispatch",
+            str(created["id"]),
+            "--expected-version",
+            str(fresh["work_version"]),
+            "--expected-scope-revision",
+            str(fresh["authorization_scope_revision"]),
+            "--expected-scope-digest",
+            str(fresh["authorization_scope_digest"]),
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(dispatched["metadata"]["governance"]["execution_authorized"])
+
     def test_recurring_reminder_can_be_created_and_completed_from_cli(self) -> None:
         self.invoke("init")
         status, created = self.invoke(

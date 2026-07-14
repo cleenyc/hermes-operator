@@ -113,9 +113,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.4.0"]
-allowed_policy_versions = ["5.0.0"]
-allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
+allowed_plugin_versions = ["1.5.0"]
+allowed_policy_versions = ["6.0.0"]
+allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
 ```
 
 | Field | Implemented meaning |
@@ -239,7 +239,12 @@ A canonical work item may carry protected metadata like this:
 
 The contract is included in the exact dispatch digest and rendered into the Hermes task. Model-authored work updates cannot replace it. Checks are selected only by this canonical contract, never by worker completion output. After the dispatcher records immutable completion evidence, the supervisor validates the exact event, card, run, attempt, and evidence fingerprint, then runs the verifier once outside every SQLite write transaction. The report is bound to the work version, canonical execution scope, run result, verification inputs, and observed artifact digests, and is cached by that completion binding. Only fast binding and report-digest validation occurs in the final state transaction. An applicable failure overrides a model's `passed` verdict and leaves the work blocked for correction. Text-only work with no contract and no native artifact declarations remains unaffected.
 
-Attach or replace a contract during explicit operator dispatch with `hermes-operator work dispatch WORK_ID --verification-contract contract.json`. The CLI validates the bounded schema, artifact-root names, and configured check names before issuing authorization. Use `--clear-verification-contract` to deliberately remove an existing contract before a fresh dispatch.
+Set a verifier contract as a separate scope-bearing mutation with
+`hermes-operator work verification-contract WORK_ID --set contract.json --expected-version VERSION`.
+Use `--clear` to deliberately remove it. The CLI validates the bounded schema,
+artifact-root names, and configured check names. Then run `work
+authorization-scope`, review its result, and pass all three returned fences to
+`work dispatch`. Dispatch cannot change the verifier contract after preview.
 
 The verifier establishes existence, path scope, type, content identity, and the exit status of deployment-owned checks. It does not prove that an arbitrary artifact is semantically correct. Run configured checks under a restricted identity because test and build scripts are executable project code.
 

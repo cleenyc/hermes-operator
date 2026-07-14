@@ -1,8 +1,9 @@
-"""Best-effort Hermes host diagnostics with no host mutation.
+"""Hermes host diagnostics with no host mutation.
 
 The plugin deliberately observes the installed harness instead of patching it or
-reordering other plugins.  Unknown or changed internals are reported as ``unknown``;
-policy code treats unknown delegation semantics as non-durable and fails closed.
+reordering other plugins. Unknown or changed managed-execution semantics are reported
+as ``unknown`` and keep the bridge in policy-only mode. Optional capabilities such as
+delegation can still degrade independently.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import hashlib
 from importlib import import_module, metadata
 import inspect
 import json
+import re
 from typing import Any, Mapping
 
 
@@ -27,6 +29,7 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
     configured_profile = str(getattr(guard, "expected_profile", "") or "")
     delegate_mode = detect_delegate_mode()
     hook_semantics = _pre_tool_semantics()
+    worker_identity_semantics = _managed_worker_identity_semantics()
     hook_position, hook_count = _guard_position(ctx, guard)
     artifacts = _kanban_completion_artifacts()
 
@@ -43,7 +46,7 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
         )
     if artifacts is not False:
         warnings.append(
-            "Hermes completion may transport artifacts; Operator-managed completions reject artifact fields"
+            "Hermes completion may transport artifacts; Operator-managed completions reject artifact fields and promotable local paths"
         )
     if hook_semantics == "first_valid" and hook_position != 1:
         warnings.append(
@@ -51,9 +54,13 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
         )
     elif hook_semantics == "unknown":
         warnings.append("pre_tool_call directive resolution semantics could not be identified")
+    if worker_identity_semantics != "dispatcher_environment":
+        warnings.append(
+            "dispatcher ownership of HERMES_KANBAN_TASK could not be positively verified"
+        )
 
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "hermes_version": hermes_version,
         "supported_hermes_version": SUPPORTED_HERMES_VERSION,
         "supported_hermes_tag": SUPPORTED_HERMES_TAG,
@@ -75,8 +82,9 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
             else "blocked_non_durable"
         ),
         "kanban_completion_artifacts": artifacts,
-        "operator_artifact_policy": "reject_artifact_fields_and_workspace_paths",
+        "operator_artifact_policy": "reject_artifact_fields_and_promotable_local_paths",
         "pre_tool_directive_semantics": hook_semantics,
+        "managed_worker_identity_semantics": worker_identity_semantics,
         "guard_hook_position": hook_position,
         "guard_hook_count": hook_count,
         "warnings": warnings[:12],
@@ -89,22 +97,35 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
 
 
 def bridge_activation_blockers(report: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return known host incompatibilities that make bridge attestation unsafe.
+    """Return unverified or incompatible host semantics that make activation unsafe.
 
-    Unknown host internals remain visible diagnostics rather than speculative
-    blockers.  Known profile mismatches and known first-valid hook resolution are
-    different: attesting in either case would claim protection that this process has
-    positively observed it does not provide.
+    Managed autonomy requires positive evidence for the profile, hook directive
+    resolution, hook position, and dispatcher-controlled worker identity. The
+    installed version remains diagnostic rather than an exact-version lock: a newer
+    or vendor-patched Hermes build may activate when it exposes the same semantics.
     """
 
     blockers: list[str] = []
-    if report.get("configured_profile_match") is False:
+    profile_match = report.get("configured_profile_match")
+    if profile_match is False:
         blockers.append("active_profile_mismatch")
-    if (
-        report.get("pre_tool_directive_semantics") == "first_valid"
-        and report.get("guard_hook_position") != 1
-    ):
-        blockers.append("operator_guard_not_first")
+    elif profile_match is not True:
+        blockers.append("active_profile_unverified")
+
+    hook_semantics = report.get("pre_tool_directive_semantics")
+    if hook_semantics == "first_valid":
+        if report.get("guard_hook_position") != 1:
+            blockers.append("operator_guard_not_first")
+    elif hook_semantics == "unknown" or not isinstance(hook_semantics, str):
+        blockers.append("pre_tool_directive_semantics_unverified")
+    else:
+        blockers.append("pre_tool_directive_semantics_unsupported")
+
+    worker_identity = report.get("managed_worker_identity_semantics")
+    if worker_identity == "unknown" or not isinstance(worker_identity, str):
+        blockers.append("managed_worker_identity_unverified")
+    elif worker_identity != "dispatcher_environment":
+        blockers.append("managed_worker_identity_unsupported")
     return tuple(blockers)
 
 
@@ -166,6 +187,39 @@ def _pre_tool_semantics() -> str:
     if "for result in hook_results" in source and "return _PreToolCallDirective" in source:
         return "first_valid"
     return "unknown"
+
+
+def _managed_worker_identity_semantics() -> str:
+    """Verify that the native dispatcher owns the managed-card environment marker.
+
+    The quiet CLI creates a turn UUID independently, so the hook ``task_id`` cannot
+    identify the Kanban card. The stable identity is safe only when the native
+    dispatcher places ``task.id`` in ``HERMES_KANBAN_TASK`` and passes that environment
+    to the quiet worker subprocess. Source inspection is deliberately semantic and
+    version-independent; an exact package version alone is not sufficient evidence.
+    """
+
+    try:
+        module = import_module("hermes_cli.kanban_db")
+        callback = getattr(module, "_default_spawn")
+        source = inspect.getsource(callback)
+    except Exception:
+        return "unknown"
+    has_environment_identity = bool(
+        re.search(
+            r"(?:env|environment)\s*\[\s*['\"]HERMES_KANBAN_TASK['\"]\s*\]"
+            r"\s*=\s*task\.id\b",
+            source,
+        )
+    )
+    has_quiet_worker = bool(
+        re.search(r"['\"]chat['\"]", source)
+        and re.search(r"['\"]-q['\"]", source)
+    )
+    passes_environment = bool(re.search(r"\benv\s*=\s*env\b", source))
+    if has_environment_identity and has_quiet_worker and passes_environment:
+        return "dispatcher_environment"
+    return "unsupported"
 
 
 def _kanban_completion_artifacts() -> bool | None:

@@ -66,6 +66,9 @@ class NativeAutomationTests(unittest.TestCase):
         self.assertIn("operator_next_work", briefing.prompt)
         self.assertIn("operator_claim_attention", reminders.prompt)
         self.assertIn("operator_status", reminders.prompt)
+        self.assertIn("operator_resolve_reminder", reminders.prompt)
+        self.assertNotIn("use operator_update_work", reminders.prompt)
+        self.assertIn("never changes due_at", reminders.prompt)
         self.assertTrue(reminders.continuable)
 
     def test_explicit_install_is_idempotent_by_managed_job_name(self) -> None:

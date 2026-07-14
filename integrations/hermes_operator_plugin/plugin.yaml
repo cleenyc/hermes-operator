@@ -1,5 +1,5 @@
 name: hermes-operator
-version: 1.4.0
+version: 1.5.0
 description: Task-scoped Hermes bridge to the autonomous operator control plane
 author: "@cleenyc"
 provides_tools:
@@ -7,9 +7,11 @@ provides_tools:
   - operator_next_work
   - operator_open_questions
   - operator_due_reminders
+  - operator_resolve_reminder
   - operator_claim_attention
   - operator_create_work
   - operator_answer_question
+  - operator_authorization_scope
   - operator_authorize_work
   - operator_update_work
   - operator_ingest_inbound

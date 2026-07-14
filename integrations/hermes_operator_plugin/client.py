@@ -191,17 +191,129 @@ class OperatorClient:
             raise OperatorUnavailable("operator returned an invalid question result")
         return data
 
+    def authorization_scope(
+        self,
+        work_id: str,
+        *,
+        profile: str | None = None,
+        skills: list[str] | None = None,
+        goal_mode: bool | None = None,
+    ) -> Any:
+        """Read the exact current scope fence for one proposed execution shape."""
+
+        work_id = _required_identity(work_id, "work_id")
+        query: list[tuple[str, str]] = []
+        normalized_profile: str | None = None
+        normalized_skills: list[str] | None = None
+        if profile is not None:
+            normalized_profile = _bounded_text(
+                profile, "profile", 128, required=True
+            ).strip()
+            query.append(("profile", normalized_profile))
+        if skills is not None:
+            if (
+                not isinstance(skills, list)
+                or len(skills) > 64
+                or len(set(skills)) != len(skills)
+                or any(
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or len(value) > 128
+                    for value in skills
+                )
+            ):
+                raise ValueError("skills must be unique nonempty bounded strings")
+            normalized_skills = [value.strip() for value in skills]
+            query.extend(("skill", value) for value in normalized_skills)
+        if goal_mode is not None:
+            if not isinstance(goal_mode, bool):
+                raise ValueError("goal_mode must be a boolean")
+            query.append(("goal_mode", "true" if goal_mode else "false"))
+        path = (
+            f"/v1/hermes/work/{parse.quote(work_id, safe='')}/authorization-scope"
+        )
+        if query:
+            path = f"{path}?{parse.urlencode(query)}"
+        data = self._request("GET", path).data
+        expected_keys = {
+            "authorization_scope_digest",
+            "authorization_scope_revision",
+            "authorizable",
+            "default_skills",
+            "goal_mode",
+            "profile",
+            "scope",
+            "skills",
+            "status",
+            "work_id",
+            "work_version",
+        }
+        scope_keys = {
+            "acceptance_criteria",
+            "description",
+            "due_at",
+            "effective_skills",
+            "goal_mode",
+            "kind",
+            "parent_id",
+            "profile",
+            "recurrence_rule",
+            "scheduled_at",
+            "schema",
+            "scope_revision",
+            "title",
+            "verification_contract",
+            "work_id",
+        }
+        scope = data.get("scope") if isinstance(data, Mapping) else None
+        if (
+            not isinstance(data, Mapping)
+            or set(data) != expected_keys
+            or data.get("work_id") != work_id
+            or not isinstance(data.get("work_version"), int)
+            or isinstance(data.get("work_version"), bool)
+            or data["work_version"] < 1
+            or not isinstance(data.get("status"), str)
+            or not data["status"]
+            or not isinstance(data.get("authorizable"), bool)
+            or not isinstance(data.get("authorization_scope_revision"), int)
+            or isinstance(data.get("authorization_scope_revision"), bool)
+            or data["authorization_scope_revision"] < 1
+            or not isinstance(data.get("authorization_scope_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", data["authorization_scope_digest"])
+            or not isinstance(data.get("profile"), str)
+            or not data["profile"]
+            or not _valid_skill_list(data.get("skills"))
+            or not _valid_skill_list(data.get("default_skills"))
+            or not isinstance(data.get("goal_mode"), bool)
+            or not isinstance(scope, Mapping)
+            or set(scope) != scope_keys
+            or scope.get("work_id") != work_id
+            or scope.get("scope_revision") != data["authorization_scope_revision"]
+            or scope.get("profile") != data["profile"]
+            or scope.get("effective_skills")
+            != sorted(set([*data["default_skills"], *data["skills"]]))
+            or scope.get("goal_mode") != data["goal_mode"]
+            or (normalized_profile is not None and data["profile"] != normalized_profile)
+            or (normalized_skills is not None and data["skills"] != normalized_skills)
+            or (goal_mode is not None and data["goal_mode"] is not goal_mode)
+        ):
+            raise OperatorUnavailable("operator returned an invalid authorization scope")
+        return data
+
     def authorize_work(
         self,
         work_id: str,
         expected_version: int,
+        expected_scope_revision: int,
+        expected_scope_digest: str,
         reason: str = "",
         *,
         profile: str | None = None,
         skills: list[str] | None = None,
         goal_mode: bool | None = None,
     ) -> Any:
-        """Authorize one exact work version and execution shape after approval."""
+        """Authorize one exact version, graph scope, and execution shape."""
 
         work_id = _required_identity(work_id, "work_id")
         if (
@@ -210,8 +322,22 @@ class OperatorClient:
             or expected_version < 1
         ):
             raise ValueError("expected_version must be a positive integer")
+        if (
+            not isinstance(expected_scope_revision, int)
+            or isinstance(expected_scope_revision, bool)
+            or expected_scope_revision < 1
+        ):
+            raise ValueError("expected_scope_revision must be a positive integer")
+        if not isinstance(expected_scope_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_scope_digest
+        ):
+            raise ValueError("expected_scope_digest must be a lowercase SHA-256 hex value")
         reason = _bounded_text(reason, "reason", 2_000)
-        body: dict[str, Any] = {"expected_version": expected_version}
+        body: dict[str, Any] = {
+            "expected_version": expected_version,
+            "expected_scope_revision": expected_scope_revision,
+            "expected_scope_digest": expected_scope_digest,
+        }
         if reason.strip():
             body["reason"] = reason
         if profile is not None:
@@ -247,6 +373,8 @@ class OperatorClient:
             or set(data) != expected_keys
             or data.get("work_id") != work_id
             or data.get("work_version") != expected_version
+            or data.get("authorization_scope_revision") != expected_scope_revision
+            or data.get("authorization_scope_digest") != expected_scope_digest
             or not isinstance(data.get("authorization_scope_revision"), int)
             or isinstance(data.get("authorization_scope_revision"), bool)
             or data["authorization_scope_revision"] < 1
@@ -606,6 +734,85 @@ class OperatorClient:
             )
         return response
 
+    def revoke_policy(self, payload: Mapping[str, Any]) -> Any:
+        """Best-effort negative policy evidence for an incompatible local host.
+
+        This uses a separate fixed event contract so a failed compatibility check can
+        never be mistaken for a positive attestation. The control plane can invalidate
+        an older fresh attestation immediately instead of waiting for its TTL.
+        """
+
+        required = {
+            "profile",
+            "plugin_version",
+            "policy_version",
+            "policy_digest",
+            "guard_active",
+            "policy_mode",
+            "attested_at",
+            "reason",
+        }
+        if set(payload) != required:
+            raise ValueError("policy revocation payload does not match the fixed contract")
+        if payload.get("guard_active") is not False:
+            raise ValueError("policy revocation requires an inactive bridge")
+        if payload.get("policy_mode") != "default_deny":
+            raise ValueError("policy revocation requires default-deny mode")
+        for key in required - {"guard_active"}:
+            if not isinstance(payload.get(key), str) or not payload[key].strip():
+                raise ValueError(f"policy revocation field {key} must be a non-empty string")
+        if payload["profile"] != self.config.profile:
+            raise ValueError("policy revocation profile does not match bridge configuration")
+        if not re.fullmatch(r"[0-9a-f]{64}", payload["policy_digest"]):
+            raise ValueError("policy revocation digest must be a lowercase SHA-256 hex value")
+        if len(payload["reason"]) > 512:
+            raise ValueError("policy revocation reason exceeds 512 characters")
+        try:
+            attested_at = datetime.fromisoformat(payload["attested_at"])
+        except ValueError as exc:
+            raise ValueError("policy revocation timestamp must be ISO 8601") from exc
+        if attested_at.tzinfo is None or attested_at.utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("policy revocation timestamp must include a UTC offset")
+
+        identity = json.dumps(
+            [
+                "revoked",
+                payload["profile"],
+                payload["plugin_version"],
+                payload["policy_version"],
+                payload["policy_digest"],
+                payload["attested_at"],
+                payload["reason"],
+            ],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        event_id = f"hermes-policy:{hashlib.sha256(identity).hexdigest()}"
+        body = {
+            "source": "hermes_plugin",
+            "event_type": "policy.revoked",
+            "external_id": event_id,
+            "dedupe_key": event_id,
+            "occurred_at": payload["attested_at"],
+            "payload": dict(payload),
+            "provenance": {
+                "origin": "hermes_plugin",
+                "trust": "authenticated_untrusted",
+            },
+        }
+        response = self._request("POST", "/v1/events/hermes", body).data
+        if (
+            not isinstance(response, Mapping)
+            or not isinstance(response.get("event_id"), str)
+            or not response["event_id"].strip()
+            or not isinstance(response.get("created"), bool)
+            or response.get("trust_level") != "authenticated_untrusted"
+        ):
+            raise OperatorUnavailable(
+                "operator did not acknowledge the authenticated policy revocation"
+            )
+        return response
+
     def _request(self, method: str, path: str, body: Any = None) -> Response:
         endpoint = path.split("?", 1)[0]
         allowed = {
@@ -621,6 +828,12 @@ class OperatorClient:
             ("POST", "/v1/events/hermes"),
         }
         normalized_method = method.upper()
+        bridge_scope_read = bool(
+            normalized_method == "GET"
+            and re.fullmatch(
+                r"/v1/hermes/work/[^/]+/authorization-scope", endpoint
+            )
+        )
         bridge_mutation = bool(
             normalized_method == "POST"
             and (
@@ -630,7 +843,11 @@ class OperatorClient:
                 or re.fullmatch(r"/v1/hermes/work/[^/]+/reminder", endpoint)
             )
         )
-        if (normalized_method, endpoint) not in allowed and not bridge_mutation:
+        if (
+            (normalized_method, endpoint) not in allowed
+            and not bridge_scope_read
+            and not bridge_mutation
+        ):
             raise ValueError("plugin request is outside its read and observation contract")
         if "#" in path:
             raise ValueError("fragments are not permitted in API paths")
@@ -638,7 +855,7 @@ class OperatorClient:
         encoded = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "hermes-operator-plugin/1.4.0",
+            "User-Agent": "hermes-operator-plugin/1.5.0",
         }
         if body is not None:
             encoded = json.dumps(
@@ -724,6 +941,17 @@ def _bounded_text(
     if len(normalized) > maximum:
         raise ValueError(f"{name} must be at most {maximum} characters")
     return normalized
+
+
+def _valid_skill_list(value: Any) -> bool:
+    return bool(
+        isinstance(value, list)
+        and len(value) <= 64
+        and all(
+            isinstance(item, str) and item.strip() and len(item) <= 128
+            for item in value
+        )
+    ) or value == []
 
 
 def _required_identity(value: Any, name: str) -> str:

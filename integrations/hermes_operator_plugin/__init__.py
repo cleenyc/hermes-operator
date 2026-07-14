@@ -31,7 +31,7 @@ from . import schemas, tools
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.5.0"
 
 _active_refresher: PolicyAttestationRefresher | None = None
 _active_refresher_lock = Lock()
@@ -109,17 +109,23 @@ def _command(raw_args: str) -> str:
             _client(),
             {"question_id": tail[0], "answer": " ".join(tail[1:])},
         )
-    if command == "authorize" and len(tail) >= 2:
+    if command in {"scope", "authorization-scope"} and len(tail) == 1:
+        return tools.authorization_scope(_client(), {"work_id": tail[0]})
+    if command == "authorize" and len(tail) >= 4:
         try:
             version = int(tail[1])
+            scope_revision = int(tail[2])
         except ValueError:
             version = 0
+            scope_revision = 0
         return tools.authorize_work(
             _client(),
             {
                 "work_id": tail[0],
                 "expected_version": version,
-                "reason": " ".join(tail[2:]),
+                "expected_scope_revision": scope_revision,
+                "expected_scope_digest": tail[3],
+                "reason": " ".join(tail[4:]),
             },
         )
     if command == "done" and len(tail) == 2:
@@ -155,7 +161,9 @@ def _command(raw_args: str) -> str:
             "error": (
                 "Usage: /operator status|next|questions|reminders|diagnostics|"
                 "add <title>|remind <ISO-time> <title>|answer <question-id> <answer>|"
-                "authorize <work-id> <version> [reason]|done <work-id> <version>|"
+                "scope <work-id>|"
+                "authorize <work-id> <version> <scope-revision> <scope-digest> [reason]|"
+                "done <work-id> <version>|"
                 "snooze <work-id> <version> <ISO-time>"
             ),
         }
@@ -178,6 +186,32 @@ def _policy_attestation(profile: str) -> dict[str, Any]:
         "policy_mode": POLICY_MODE,
         "attested_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _policy_revocation(profile: str, reason: str) -> dict[str, Any]:
+    return {
+        "profile": profile,
+        "plugin_version": PLUGIN_VERSION,
+        "policy_version": POLICY_VERSION,
+        "policy_digest": POLICY_DIGEST,
+        "guard_active": False,
+        "policy_mode": POLICY_MODE,
+        "attested_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason[:512],
+    }
+
+
+def _revoke_policy_best_effort(client: OperatorClient, reason: str) -> None:
+    """Publish negative state without making host startup depend on transport."""
+
+    try:
+        client.revoke_policy(_policy_revocation(client.config.profile, reason))
+    except Exception as exc:
+        logger.warning(
+            "Could not publish Hermes operator policy revocation (%s): %s",
+            reason,
+            exc,
+        )
 
 
 def register(ctx: Any) -> None:
@@ -210,11 +244,13 @@ def register(ctx: Any) -> None:
         return
     activation_blockers = bridge_activation_blockers(_diagnostics)
     if activation_blockers:
+        reason = "host_incompatible:" + ",".join(activation_blockers)
         logger.error(
             "Hermes operator compatibility gate refused bridge activation; "
             "pre_tool_call policy remains active in policy-only mode: %s",
             ", ".join(activation_blockers),
         )
+        _revoke_policy_best_effort(client, reason)
         return
 
     try:
@@ -224,6 +260,7 @@ def register(ctx: Any) -> None:
             "Hermes operator policy attestation failed; bridge remains disabled: %s",
             exc,
         )
+        _revoke_policy_best_effort(client, "policy_attestation_failed")
         return
 
 
@@ -253,6 +290,7 @@ def register(ctx: Any) -> None:
             "Hermes policy heartbeat failed to start; bridge remains disabled: %s",
             exc,
         )
+        _revoke_policy_best_effort(client, "policy_heartbeat_unavailable")
         return
 
     guard.activate_bridge(client.execution_contract, client.claim_delegation)
@@ -286,6 +324,15 @@ def register(ctx: Any) -> None:
         description="Read reminders that are due for native Hermes delivery.",
     )
     ctx.register_tool(
+        name="operator_resolve_reminder",
+        toolset="hermes_operator",
+        schema=schemas.OPERATOR_RESOLVE_REMINDER,
+        handler=lambda args, **kwargs: tools.resolve_reminder(client, args, **kwargs),
+        description=(
+            "Snooze, acknowledge, or complete one reminder without moving its due-time anchor."
+        ),
+    )
+    ctx.register_tool(
         name="operator_claim_attention",
         toolset="hermes_operator",
         schema=schemas.OPERATOR_CLAIM_ATTENTION,
@@ -305,6 +352,17 @@ def register(ctx: Any) -> None:
         schema=schemas.OPERATOR_ANSWER_QUESTION,
         handler=lambda args, **kwargs: tools.answer_question(client, args, **kwargs),
         description="Answer one exact Operator question with native human approval.",
+    )
+    ctx.register_tool(
+        name="operator_authorization_scope",
+        toolset="hermes_operator",
+        schema=schemas.OPERATOR_AUTHORIZATION_SCOPE,
+        handler=lambda args, **kwargs: tools.authorization_scope(
+            client, args, **kwargs
+        ),
+        description=(
+            "Read the current dependency-fenced scope before requesting authorization."
+        ),
     )
     ctx.register_tool(
         name="operator_authorize_work",

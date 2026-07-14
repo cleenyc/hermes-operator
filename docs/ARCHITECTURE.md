@@ -107,11 +107,11 @@ The dispatcher treats supervisor-issued authorization as inert unless the matchi
 
 ## Version-fenced mutations
 
-Every model-requested update of existing work carries `expected_version`. Existing endpoints of a dependency link carry their expected versions. Blocking questions, verification, and dispatch also carry version fences. Interactive authorization first atomically fences the exact displayed work version, then stores a dedicated authorization scope revision and SHA-256 digest. The digest binds title, description, criteria, parent hierarchy, schedule, recurrence, verifier contract, profile, effective skills, and goal mode.
+Every model-requested update of existing work carries `expected_version`. Existing endpoints of a dependency link carry their expected versions. Blocking questions, verification, and dispatch also carry version fences. Interactive authorization first reads a bounded scope preview, then must echo its exact work version, scope revision, SHA-256 digest, and executor shape. The digest binds title, description, criteria, parent hierarchy, schedule, recurrence, verifier contract, profile, effective skills, and goal mode.
 
 SQLite increments `work_items.version` on material mutation. A mismatch raises a state conflict and rolls back the entire supervisor plan. Model output therefore cannot silently overwrite operator or dispatcher changes made after the snapshot.
 
-Priority rescoring and runtime lifecycle changes do not invalidate an otherwise identical approval. Scope-bearing field changes increment `authorization_scope_revision`, revoke execution governance, and remove pending dispatch authorization. New `depends_on` and `blocks` edges do the same for both endpoints without perturbing their ordinary scheduler versions. Before every authorized update and dispatch, the supervisor rechecks the persisted scope revision and digest. It also rechecks the exact profile, effective skill set, and goal mode before dispatch. A stale authorization or stale question binding cannot mutate work; it creates a durable operator follow-up instead.
+Priority rescoring and nonterminal runtime lifecycle changes do not invalidate an otherwise identical approval. Scope-bearing field changes, executor reassignment, explicit Hermes execution disable, authority quarantine, and run resolution increment `authorization_scope_revision`, revoke execution governance, and remove pending dispatch authorization. New `depends_on` and `blocks` edges increment both ordinary work versions and both scope revisions. Entering or leaving terminal work also starts a new scope generation and revokes authority; terminal scope cannot be edited without reopening in the same mutation. Reopening detaches the old Hermes card and clears runtime completion evidence before the item can be freshly authorized. Before every authorized update and dispatch, the supervisor rechecks the persisted scope revision and digest. It also rechecks the exact profile, effective skill set, and goal mode before dispatch. A stale authorization, duplicate authorization presented during a live canonical run, or stale question binding cannot mutate work; it creates a durable operator follow-up or an audited rejection instead.
 
 Queued dispatch reservations add a stronger contract-field fence. Dependency semantics are stricter: SQLite rejects new `depends_on` or `blocks` edges while either endpoint has a compute-active or uncertain canonical run in `queued`, `running`, `cancel_requested`, `lost`, or `legacy_conflict`. It also prevents a completed dependency from reopening while dependent work has one of those runs.
 
@@ -173,7 +173,7 @@ The dispatch contract digest binds the work ID, kind, title, description, parent
 - Current work version, ready state, Hermes execution mode, and dependency readiness.
 - Exact contract digest and, when enabled, the digest of the policy-attestation state used at reservation time.
 
-After Hermes creates or resolves the card, `commit_dispatch_reservation` atomically links the card, rechecks the work version and dependencies, changes the run to `running`, consumes the exact authorization for that run and card, and changes work to `running`. Queued reservations are not aged out automatically because a lost create response can leave real remote compute. Recovery either rediscovers the idempotently created card or requires explicit operator resolution.
+After Hermes creates or resolves the card, `commit_dispatch_reservation` atomically links the card, rechecks the work version, dependencies, and exact policy-state digest captured by the reservation, changes the run to `running`, consumes the exact authorization for that run and card, and changes work to `running`. A policy revocation committed during remote creation therefore prevents the local running transition. Queued reservations are not aged out automatically because a lost create response can leave real remote compute. Recovery either rediscovers the idempotently created card with the same immutable execution-contract snapshot or requires explicit operator resolution.
 
 No profile-specific, project-specific, or model-provider-specific concurrency pools are implemented.
 
@@ -189,9 +189,15 @@ The native plugin registers a local `pre_tool_call` guard before it initializes 
 - `default_deny` mode
 - UTC attestation time
 
-The example core configuration accepts plugin `1.4.0`, policy `5.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
+The example core configuration accepts plugin `1.5.0`, policy `6.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
 
 The heartbeat is process-scoped because current Hermes exposes no plugin-unload hook. It uses a process-exit wake and bounded join. A refresh failure leaves the local guard and bridge installed, but core freshness expires and blocks subsequent reservations.
+
+If a compatibility check proves the required guard semantics unavailable, the
+plugin sends an authenticated `policy.revoked` observation. The core replaces
+that profile's cached attestation with `guard_active: false` immediately, so
+dispatch fails closed without waiting for the attestation TTL. Only a strictly
+newer valid attestation can restore the profile.
 
 Attestation proves possession of the bridge credential and reports plugin state. It is not hardware-backed evidence and is not a substitute for process isolation.
 
@@ -199,7 +205,7 @@ Attestation proves possession of the bridge credential and reports plugin state.
 
 The dispatcher maps observed Hermes status into running, blocked, review, or lost local state. It does not mark work `done` merely because Hermes reports completion.
 
-When Hermes reports blocked, the current run attempt becomes terminal `blocked` and releases global compute capacity. The canonical work remains blocked. Once a linked operator question is answered and the exact work is freshly authorized, the dispatcher reserves a new attempt and capacity slot, posts bounded answer context to the same card, and calls `unblock`. If the unblock response is lost, the queued reservation and same card identity support idempotent recovery.
+When Hermes reports blocked, the current run attempt becomes terminal `blocked` and releases global compute capacity. The lifecycle edge is accepted only when its card, run, attempt, and status match the latest canonical run. Once a linked operator question is answered and the exact work is freshly authorized, the dispatcher reserves a new attempt and capacity slot. It reuses and unblocks the card only when the prior immutable execution contract exactly matches the current scope; only answers with current bindings enter the resume comment. A scope change starts a new card instead. If the unblock response is lost, the queued reservation and same card identity support idempotent recovery.
 
 Completion closes the run, moves canonical work to `review`, and queues a distinct evidence event. A failed independent verification can authorize a correction only while the durable authorization root has remaining attempts. That correction receives a new run ID, new attempt number, new idempotency key, and new Hermes card. This prevents failed evidence from being overwritten on the completed card and makes each verification retry independently auditable.
 

@@ -2,6 +2,61 @@
 
 All notable project changes are recorded in this file.
 
+## [0.4.0] - 2026-07-14
+
+### Added
+
+- Added an exact authorization-scope preview and three-part version, scope-revision,
+  and scope-digest fence across the bridge API, native plugin, slash command, and CLI.
+- Added immutable per-run execution contracts that survive completion and bind evidence
+  to the dispatched work scope, profile, run, card, and attempt.
+- Added authenticated `policy.revoked` evidence so a failed host compatibility check
+  invalidates cached managed-execution attestation immediately.
+- Added deterministic blocked-card questions and durable completion-evidence review paths.
+
+### Fixed
+
+- Bound managed policy and lifecycle correlation to the dispatcher-owned
+  `HERMES_KANBAN_TASK` identity while allowing Hermes quiet turns to keep their native UUIDs.
+- Revoked execution authority on terminal transitions and reopen, rejected authorization of
+  terminal work, detached prior cards on reopen, and prevented pre-terminal events from
+  reviving cancelled or archived work.
+- Advanced both work versions and authorization scope revisions when dependency edges change,
+  preventing stale graph confirmation from authorizing a newer dependency view.
+- Preserved the immutable dispatch contract through run completion and rejected old, malformed,
+  recovered-without-contract, or differently scoped completion evidence with durable follow-up.
+- Rejected absolute, home-relative, Windows, alias, symlink, outside-workspace, and `MEDIA:`
+  completion paths before Hermes can promote local files into Gateway attachments.
+- Repaired the blocked worker question, answer, fresh authorization, and same-card resume loop.
+- Bound blocked and completion lifecycle evidence to the latest canonical card, run, attempt, and
+  scope generation; malformed evidence creates a separate review without mutating claimed work.
+- Linearized live execution-contract decisions, revalidated policy state when committing a remote
+  card, and preserved immutable execution contracts through queued-run recovery.
+- Prevented stale or duplicate authorization from replacing live-run authority, advanced scope
+  generations on executor changes, explicit execution disable, quarantine, and run resolution,
+  and required terminal scope edits to reopen work first.
+- Limited same-card unblock to an unchanged immutable execution contract; changed scope starts a
+  new card, and only answers whose stored binding matches the current scope enter resume context.
+- Required a successfully staged durable intent before recording an external-action proposal
+  disposition, and expanded actionable intake detection to documented body and action-item shapes.
+- Registered the schedule-anchor-safe reminder lifecycle tool and corrected Cron and skill guidance
+  so snoozing never changes `due_at`.
+
+### Changed
+
+- Managed activation now requires positive evidence for active-profile, hook-order, directive,
+  and dispatcher identity semantics; Hermes version differences remain diagnostic rather than a
+  brittle exact-version lock.
+- Removed background `delegate_task` from managed execution capabilities and worker guidance;
+  durable parallel canonical cards remain the supported orchestration mechanism.
+- Moved verifier-contract mutation to its own CLI command so dispatch cannot change scope after
+  the operator reviews its authorization digest.
+- Existing in-flight runs without an immutable execution contract now fail closed into durable
+  operator review instead of being migrated as trusted completion evidence.
+- CI now runs the complete core and source-only plugin checks in addition to required pinned-host
+  and advisory current-host compatibility lanes.
+- Updated the core to `0.4.0`, the native plugin to `1.5.0`, and the policy contract to `6.0.0`.
+
 ## [0.3.0] - 2026-07-14
 
 ### Added

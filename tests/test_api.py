@@ -8,7 +8,7 @@ import socket
 import sys
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from hermes_operator.models import (  # noqa: E402
     UserQuestion,
     WorkItem,
     WorkKind,
+    WorkRelation,
     WorkStatus,
 )
 
@@ -347,6 +348,20 @@ class APITests(unittest.TestCase):
         item = self.store.get_work(work_id)
         self.assertIn("hermes-work-updated", self.wakes)
 
+        status, preview = self.request(
+            "GET",
+            f"/v1/hermes/work/{work_id}/authorization-scope",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(preview["authorizable"])
+        self.assertEqual(preview["work_version"], item.version)
+        self.assertEqual(
+            preview["authorization_scope_revision"],
+            item.authorization_scope_revision,
+        )
+        self.assertEqual(preview["scope"]["title"], item.title)
+
         question = UserQuestion(
             question="Which launch is in scope?",
             blocking_work_ids=[work_id],
@@ -366,6 +381,12 @@ class APITests(unittest.TestCase):
             f"/v1/hermes/work/{work_id}/authorize",
             document={
                 "expected_version": item.version,
+                "expected_scope_revision": preview[
+                    "authorization_scope_revision"
+                ],
+                "expected_scope_digest": preview[
+                    "authorization_scope_digest"
+                ],
                 "reason": "The operator approved internal execution",
             },
             headers=self.bridge_headers(),
@@ -403,6 +424,12 @@ class APITests(unittest.TestCase):
     def test_bridge_authorization_rejects_a_revision_changed_before_capture(self) -> None:
         item = WorkItem(title="Displayed revision")
         self.store.create_work(item)
+        status, preview = self.request(
+            "GET",
+            f"/v1/hermes/work/{item.id}/authorization-scope",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
         self.store.update_work(
             item.id,
             {"description": "Changed after it was displayed"},
@@ -413,7 +440,15 @@ class APITests(unittest.TestCase):
         status, document = self.request(
             "POST",
             f"/v1/hermes/work/{item.id}/authorize",
-            document={"expected_version": item.version},
+            document={
+                "expected_version": item.version,
+                "expected_scope_revision": preview[
+                    "authorization_scope_revision"
+                ],
+                "expected_scope_digest": preview[
+                    "authorization_scope_digest"
+                ],
+            },
             headers=self.bridge_headers(),
         )
 
@@ -425,6 +460,111 @@ class APITests(unittest.TestCase):
                 "WHERE event_type = 'operator.work_authorized'"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_bridge_authorization_requires_echo_of_exact_preview_shape(self) -> None:
+        item = WorkItem(title="Preview exact executor scope")
+        self.store.create_work(item)
+        status, preview = self.request(
+            "GET",
+            f"/v1/hermes/work/{item.id}/authorization-scope"
+            "?profile=operator&skill=kanban-orchestrator&goal_mode=false",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(preview["profile"], "operator")
+        self.assertEqual(preview["skills"], ["kanban-orchestrator"])
+
+        status, document = self.request(
+            "POST",
+            f"/v1/hermes/work/{item.id}/authorize",
+            document={
+                "expected_version": preview["work_version"],
+                "expected_scope_revision": preview[
+                    "authorization_scope_revision"
+                ],
+                "expected_scope_digest": preview[
+                    "authorization_scope_digest"
+                ],
+                "profile": "different-profile",
+                "skills": ["kanban-orchestrator"],
+                "goal_mode": False,
+            },
+            headers=self.bridge_headers(),
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(document["error"]["code"], "state_conflict")
+
+    def test_bridge_preview_becomes_stale_when_dependency_graph_changes(self) -> None:
+        item = WorkItem(title="Displayed graph")
+        dependency = WorkItem(title="New prerequisite")
+        self.store.create_work(item)
+        self.store.create_work(dependency)
+        status, preview = self.request(
+            "GET",
+            f"/v1/hermes/work/{item.id}/authorization-scope",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+
+        self.store.add_work_link(
+            item.id,
+            dependency.id,
+            WorkRelation.DEPENDS_ON,
+            expected_from_version=item.version,
+            expected_to_version=dependency.version,
+        )
+        changed = self.store.get_work(item.id)
+        self.assertEqual(changed.version, item.version + 1)
+        self.assertEqual(
+            changed.authorization_scope_revision,
+            item.authorization_scope_revision + 1,
+        )
+
+        status, document = self.request(
+            "POST",
+            f"/v1/hermes/work/{item.id}/authorize",
+            document={
+                "expected_version": preview["work_version"],
+                "expected_scope_revision": preview[
+                    "authorization_scope_revision"
+                ],
+                "expected_scope_digest": preview[
+                    "authorization_scope_digest"
+                ],
+            },
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(document["error"]["code"], "state_conflict")
+
+    def test_bridge_cannot_authorize_terminal_work(self) -> None:
+        item = WorkItem(title="Cancelled work", status=WorkStatus.CANCELLED)
+        self.store.create_work(item)
+        status, preview = self.request(
+            "GET",
+            f"/v1/hermes/work/{item.id}/authorization-scope",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(preview["authorizable"])
+
+        status, document = self.request(
+            "POST",
+            f"/v1/hermes/work/{item.id}/authorize",
+            document={
+                "expected_version": preview["work_version"],
+                "expected_scope_revision": preview[
+                    "authorization_scope_revision"
+                ],
+                "expected_scope_digest": preview[
+                    "authorization_scope_digest"
+                ],
+            },
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(document["error"]["code"], "state_conflict")
 
     def test_bridge_google_skill_ingress_is_revision_deduplicated_untrusted_evidence(self) -> None:
         envelope = {
@@ -698,6 +838,133 @@ class APITests(unittest.TestCase):
             "POST",
             "/v1/events/hermes",
             document=envelope,
+            headers=self.operator_headers(),
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(
+            document["error"]["code"], "policy_attestation_auth_required"
+        )
+
+    def test_bridge_policy_revocation_immediately_replaces_cached_attestation(self) -> None:
+        attested_at = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()
+        attestation_payload = {
+            "profile": "executor",
+            "plugin_version": "1.1.0",
+            "policy_version": "2.0.0",
+            "policy_digest": "a" * 64,
+            "guard_active": True,
+            "policy_mode": "default_deny",
+            "attested_at": attested_at,
+        }
+        attestation_identity = json.dumps(
+            [
+                attestation_payload["profile"],
+                attestation_payload["plugin_version"],
+                attestation_payload["policy_version"],
+                attestation_payload["policy_digest"],
+                attestation_payload["attested_at"],
+            ],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        attestation_id = (
+            "hermes-policy:"
+            f"{hashlib.sha256(attestation_identity).hexdigest()}"
+        )
+        attestation = {
+            "source": "hermes_plugin",
+            "event_type": "policy.attested",
+            "external_id": attestation_id,
+            "dedupe_key": attestation_id,
+            "occurred_at": attested_at,
+            "payload": attestation_payload,
+            "provenance": {
+                "origin": "hermes_plugin",
+                "trust": "authenticated_untrusted",
+            },
+        }
+        status, _ = self.request(
+            "POST",
+            "/v1/events/hermes",
+            document=attestation,
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 202)
+
+        revoked_at = datetime.now(UTC).isoformat()
+        reason = "required host hook semantics are unavailable"
+        revocation_payload = {
+            **attestation_payload,
+            "guard_active": False,
+            "attested_at": revoked_at,
+            "reason": reason,
+        }
+        revocation_identity = json.dumps(
+            [
+                "revoked",
+                revocation_payload["profile"],
+                revocation_payload["plugin_version"],
+                revocation_payload["policy_version"],
+                revocation_payload["policy_digest"],
+                revocation_payload["attested_at"],
+                revocation_payload["reason"],
+            ],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        revocation_id = (
+            "hermes-policy:"
+            f"{hashlib.sha256(revocation_identity).hexdigest()}"
+        )
+        revocation = {
+            "source": "hermes_plugin",
+            "event_type": "policy.revoked",
+            "external_id": revocation_id,
+            "dedupe_key": revocation_id,
+            "occurred_at": revoked_at,
+            "payload": revocation_payload,
+            "provenance": {
+                "origin": "hermes_plugin",
+                "trust": "authenticated_untrusted",
+            },
+        }
+
+        status, document = self.request(
+            "POST",
+            "/v1/events/hermes",
+            document=revocation,
+            headers=self.bridge_headers(),
+        )
+
+        self.assertEqual(status, 202)
+        self.assertTrue(document["created"])
+        state = self.store.get_state("hermes.policy_attestation:executor")
+        self.assertFalse(state["guard_active"])
+        self.assertTrue(state["revoked"])
+        self.assertEqual(state["reason"], reason)
+        self.assertEqual(state["event_id"], revocation_id)
+
+        status, stale = self.request(
+            "POST",
+            "/v1/events/hermes",
+            document=attestation,
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(stale["created"])
+        self.assertTrue(
+            self.store.get_state("hermes.policy_attestation:executor")[
+                "revoked"
+            ]
+        )
+        with self.store.connection() as connection:
+            queued = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        self.assertEqual(queued, 0)
+
+        status, document = self.request(
+            "POST",
+            "/v1/events/hermes",
+            document=revocation,
             headers=self.operator_headers(),
         )
         self.assertEqual(status, 401)

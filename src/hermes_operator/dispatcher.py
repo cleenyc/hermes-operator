@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping
 
 from .adapters.base import HermesAdapter, HermesTask
+from .authority import binding_matches_work, execution_scope_digest
 from .config import AppConfig
 from .db import LeaseFenceLost, NotFound, SQLiteStore, StateConflict
 from .models import (
@@ -156,56 +157,60 @@ class HermesDispatcher:
     def execution_contract(self, task_id: str) -> dict[str, Any]:
         """Return the narrow live authorization used by the native worker guard."""
 
-        self.leadership_guard()
-        item = self.store.find_work_by_hermes_id(task_id)
-        if item is None:
-            return {"authorized": False, "task_id": task_id}
-        authorized, reason = self._dispatch_authorized(
-            item,
-            ongoing_external_run_id=task_id,
-        )
-        authorization = item.metadata.get("dispatch_authorization", {})
-        run_id = (
-            str(authorization.get("consumed_run_id", ""))
-            if isinstance(authorization, Mapping)
-            else ""
-        )
-        run = None
-        if run_id:
-            try:
-                run = self.store.get_run(run_id)
-            except NotFound:
-                run = None
-        live = bool(
-            authorized
-            and item.status == WorkStatus.RUNNING
-            and run
-            and run.get("work_item_id") == item.id
-            and run.get("external_run_id") == task_id
-            and run.get("status") == "running"
-        )
-        if not live:
+        # This is a live capability decision, so every canonical read used to
+        # make it must share one linearization point.  BEGIN IMMEDIATE prevents
+        # cancellation, revocation, dependency, run, or policy mutations from
+        # committing between the first work lookup and the returned decision.
+        with self.store.transaction():
+            self.leadership_guard()
+            item = self.store.find_work_by_hermes_id(task_id)
+            if item is None:
+                return {"authorized": False, "task_id": task_id}
+            authorized, reason = self._dispatch_authorized(
+                item,
+                ongoing_external_run_id=task_id,
+            )
+            authorization = item.metadata.get("dispatch_authorization", {})
+            run_id = (
+                str(authorization.get("consumed_run_id", ""))
+                if isinstance(authorization, Mapping)
+                else ""
+            )
+            run = None
+            if run_id:
+                try:
+                    run = self.store.get_run(run_id)
+                except NotFound:
+                    run = None
+            live = bool(
+                authorized
+                and item.status == WorkStatus.RUNNING
+                and run
+                and run.get("work_item_id") == item.id
+                and run.get("external_run_id") == task_id
+                and run.get("status") == "running"
+            )
+            if not live:
+                return {
+                    "authorized": False,
+                    "task_id": task_id,
+                    "reason": reason if not authorized else "canonical_run_not_active",
+                }
+            self.leadership_guard()
             return {
-                "authorized": False,
+                "authorized": True,
                 "task_id": task_id,
-                "reason": reason if not authorized else "canonical_run_not_active",
+                "work_id": item.id,
+                "profile": str(item.assignee or ""),
+                "contract_digest": str(authorization.get("contract_digest", "")),
+                "run_id": run_id,
+                "internal_capabilities": [
+                    "local_read",
+                    "local_write",
+                    "local_test",
+                    "local_build",
+                ],
             }
-        self.leadership_guard()
-        return {
-            "authorized": True,
-            "task_id": task_id,
-            "work_id": item.id,
-            "profile": str(item.assignee or ""),
-            "contract_digest": str(authorization.get("contract_digest", "")),
-            "run_id": run_id,
-            "internal_capabilities": [
-                "delegate_task",
-                "local_read",
-                "local_write",
-                "local_test",
-                "local_build",
-            ],
-        }
 
     def claim_delegation_batch(
         self,
@@ -634,6 +639,10 @@ class HermesDispatcher:
                     continue
                 task = self.adapter.show_task(str(external_id))
                 metadata = self._hermes_metadata(item, task, phase="recovered")
+                execution_contract = self._execution_contract_snapshot(
+                    item,
+                    reservation=reservation,
+                )
                 with self.store.transaction():
                     self.leadership_guard()
                     self.store.commit_dispatch_reservation(
@@ -643,7 +652,11 @@ class HermesDispatcher:
                         contract_digest=str(current_digest),
                         external_run_id=task.id,
                         metadata=metadata,
-                        result={"dispatch": self._task_payload(task), "recovered": True},
+                        result={
+                            "dispatch": self._task_payload(task),
+                            "execution_contract": execution_contract,
+                            "recovered": True,
+                        },
                         actor=self.actor,
                     )
                 report.reconciled_work_ids.append(item.id)
@@ -878,11 +891,23 @@ class HermesDispatcher:
             self.leadership_guard()
             attempt = int(run.get("attempt", 1))
             previous = self._previous_run(item.id, before_attempt=attempt)
+            run_result = run.get("result", {})
+            run_result = run_result if isinstance(run_result, Mapping) else {}
+            reservation = run_result.get("reservation", {})
+            reservation = reservation if isinstance(reservation, Mapping) else {}
+            execution_contract = self._execution_contract_snapshot(
+                item,
+                reservation=reservation,
+            )
             can_resume = bool(
                 item.hermes_task_id
                 and previous
                 and previous.get("status") == "blocked"
                 and previous.get("external_run_id") == item.hermes_task_id
+                and self._resume_contract_matches(
+                    previous,
+                    execution_contract,
+                )
             )
             if can_resume:
                 existing = self.adapter.show_task(str(item.hermes_task_id))
@@ -929,7 +954,6 @@ class HermesDispatcher:
                 )
 
             metadata = self._hermes_metadata(item, task, phase="dispatched")
-            reservation = run.get("result", {}).get("reservation", {})
             with self.store.transaction():
                 self.leadership_guard()
                 self.store.commit_dispatch_reservation(
@@ -939,7 +963,10 @@ class HermesDispatcher:
                     contract_digest=str(reservation.get("contract_digest", "")),
                     external_run_id=task.id,
                     metadata=metadata,
-                    result={"dispatch": self._task_payload(task)},
+                    result={
+                        "dispatch": self._task_payload(task),
+                        "execution_contract": execution_contract,
+                    },
                     actor=self.actor,
                 )
         except Exception as error:
@@ -1168,6 +1195,7 @@ class HermesDispatcher:
                 "hermes_task_id": task.id,
                 "run_id": completed_run["id"],
                 "attempt": completed_run["attempt"],
+                **self._completion_contract_payload(completed_run),
                 "requires_independent_verification": True,
                 "acceptance_criteria": item.acceptance_criteria,
                 "execution_evidence": payload,
@@ -1197,7 +1225,9 @@ class HermesDispatcher:
             if active and active.get("status") == "cancel_requested"
             else "blocked"
         )
-        self._finish_active_run(item.id, task.id, run_status, payload)
+        completed_run = self._finish_active_run(
+            item.id, task.id, run_status, payload
+        )
         if item.status in TERMINAL_WORK_STATUSES or item.status == WorkStatus.WAITING_INPUT:
             return False, None
 
@@ -1224,6 +1254,8 @@ class HermesDispatcher:
             payload={
                 "work_id": item.id,
                 "hermes_task_id": task.id,
+                "run_id": completed_run["id"],
+                "attempt": completed_run["attempt"],
                 "execution_evidence": payload,
             },
             provenance={"adapter": "hermes-kanban", "hermes_task_id": task.id},
@@ -1265,7 +1297,7 @@ class HermesDispatcher:
         return True, event_id
 
     def _record_active(self, item: WorkItem, task: HermesTask) -> bool:
-        self._ensure_active_run(item.id, task)
+        self._ensure_active_run(item, task)
         if item.status in TERMINAL_WORK_STATUSES or item.status in {
             WorkStatus.REVIEW,
             WorkStatus.BLOCKED,
@@ -1284,8 +1316,8 @@ class HermesDispatcher:
             )
         return changed
 
-    def _ensure_active_run(self, work_id: str, task: HermesTask) -> None:
-        active = self._active_run(work_id)
+    def _ensure_active_run(self, item: WorkItem, task: HermesTask) -> None:
+        active = self._active_run(item.id)
         if active:
             status = (
                 "cancel_requested"
@@ -1303,12 +1335,17 @@ class HermesDispatcher:
             return
         self.store.create_run(
             RunRecord(
-                work_item_id=work_id,
+                work_item_id=item.id,
                 runner="hermes-kanban",
                 external_run_id=task.id,
                 status="running",
-                attempt=self._next_attempt(work_id),
-                result={"recovered_from_reconciliation": True},
+                attempt=self._next_attempt(item.id),
+                result={
+                    "recovered_from_reconciliation": True,
+                    "execution_contract": self._unavailable_execution_contract(
+                        "active_run_recovered_without_reservation"
+                    ),
+                },
                 started_at=utc_now(),
                 heartbeat_at=utc_now(),
             ),
@@ -1325,12 +1362,14 @@ class HermesDispatcher:
         payload = self._task_payload(task)
         active = self._active_run(work_id)
         if active:
+            stored_result = dict(active.get("result", {}))
+            stored_result["latest_observation"] = payload
             self.store.update_run(
                 str(active["id"]),
                 actor=self.actor,
                 external_run_id=task.id,
                 status=status,
-                result=payload,
+                result=stored_result,
                 error=None,
                 heartbeat_at=utc_now(),
                 finished_at=None,
@@ -1343,7 +1382,12 @@ class HermesDispatcher:
                 external_run_id=task.id,
                 status=status,
                 attempt=self._next_attempt(work_id),
-                result=payload,
+                result={
+                    "latest_observation": payload,
+                    "execution_contract": self._unavailable_execution_contract(
+                        "active_run_created_from_remote_observation"
+                    ),
+                },
                 started_at=utc_now(),
                 heartbeat_at=utc_now(),
             ),
@@ -1359,12 +1403,17 @@ class HermesDispatcher:
     ) -> dict[str, Any]:
         active = self._active_run(work_id)
         if active:
+            stored_result = dict(active.get("result", {}))
+            observation_key = (
+                "completion" if status == "completed" else "terminal_observation"
+            )
+            stored_result[observation_key] = dict(result)
             self.store.update_run(
                 str(active["id"]),
                 actor=self.actor,
                 external_run_id=external_run_id,
                 status=status,
-                result=result,
+                result=stored_result,
                 error=None,
                 heartbeat_at=utc_now(),
                 finished_at=utc_now(),
@@ -1373,13 +1422,21 @@ class HermesDispatcher:
         latest = self._latest_run(work_id)
         if latest and latest["status"] == status and latest["external_run_id"] == external_run_id:
             return latest
+        observation_key = (
+            "completion" if status == "completed" else "terminal_observation"
+        )
         created = RunRecord(
                 work_item_id=work_id,
                 runner="hermes-kanban",
                 external_run_id=external_run_id,
                 status=status,
                 attempt=self._next_attempt(work_id),
-                result=result,
+                result={
+                    observation_key: dict(result),
+                    "execution_contract": self._unavailable_execution_contract(
+                        "terminal_run_recovered_without_reservation"
+                    ),
+                },
                 finished_at=utc_now(),
             )
         self.store.create_run(created, actor=self.actor)
@@ -1424,12 +1481,66 @@ class HermesDispatcher:
         value["result"] = json.loads(value.pop("result_json") or "{}")
         return value
 
+    @staticmethod
+    def _resume_contract_matches(
+        previous_run: Mapping[str, Any],
+        current_contract: Mapping[str, Any],
+    ) -> bool:
+        """Require an exact immutable execution generation before card reuse."""
+
+        result = previous_run.get("result", {})
+        if not isinstance(result, Mapping):
+            return False
+        previous_contract = result.get("execution_contract", {})
+        if not isinstance(previous_contract, Mapping):
+            return False
+        if previous_contract.get("contract_unavailable") is True:
+            return False
+        digests = (
+            previous_contract.get("dispatch_contract_digest"),
+            previous_contract.get("execution_scope_digest"),
+        )
+        if not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in digests
+        ):
+            return False
+        scope_revision = previous_contract.get("scope_revision")
+        if (
+            isinstance(scope_revision, bool)
+            or not isinstance(scope_revision, int)
+            or scope_revision < 1
+        ):
+            return False
+        comparable_fields = (
+            "schema",
+            "dispatch_contract_digest",
+            "execution_scope_digest",
+            "scope_revision",
+            "profile",
+            "skills",
+            "default_skills",
+            "goal_mode",
+        )
+        return all(
+            previous_contract.get(field) == current_contract.get(field)
+            for field in comparable_fields
+        )
+
     def _resume_comment(self, item: WorkItem, run_id: str, marker: str) -> str:
         answers = [
             value
             for value in self.store.list_questions(status="answered", limit=1000)
-            if item.id in value.get("blocking_work_ids", [])
-            and value.get("answer")
+            if value.get("answer")
+            and isinstance(value.get("blocking_work_bindings"), Mapping)
+            and isinstance(
+                value["blocking_work_bindings"].get(item.id),
+                Mapping,
+            )
+            and binding_matches_work(
+                value["blocking_work_bindings"][item.id],
+                item,
+            )
         ][-5:]
         lines = [
             marker,
@@ -1487,17 +1598,17 @@ class HermesDispatcher:
         if bool(request.get("goal_mode", self.config.hermes.goal_mode)):
             sections.append(
                 "Hermes orchestration guidance:\n"
-                "- Treat this as a goal that may be decomposed into bounded subtasks.\n"
-                "- Run independent subtasks with Hermes subagents in parallel when useful.\n"
-                "- Keep every child inside this work item's scope and acceptance criteria.\n"
-                "- Consolidate child evidence and blockers back into this Kanban task."
+                "- Treat this as one bounded goal and complete its acceptance criteria directly.\n"
+                "- Do not start background subagents or create child Kanban work.\n"
+                "- If additional parallel work is needed, report a bounded recommendation "
+                "to the Operator control plane."
             )
         else:
             sections.append(
                 "Hermes execution guidance:\n"
-                "- Use Hermes subagents in parallel only for clearly independent subtasks.\n"
-                "- Keep delegation inside this work item's scope and acceptance criteria.\n"
-                "- Consolidate child evidence and blockers back into this Kanban task."
+                "- Complete this card directly within its scope and acceptance criteria.\n"
+                "- Do not start background subagents or create child Kanban work.\n"
+                "- Report blockers and any recommended follow-up work on this card."
             )
         requested_skills = request.get("skills", [])
         if not isinstance(requested_skills, list):
@@ -1523,6 +1634,87 @@ class HermesDispatcher:
                 )[:6_000]
             )
         return "\n\n".join(sections)
+
+    def _execution_contract_snapshot(
+        self,
+        item: WorkItem,
+        *,
+        reservation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Capture the immutable scope a canonical run was allowed to execute."""
+
+        authorization = item.metadata.get("dispatch_authorization", {})
+        request = item.metadata.get("dispatch_request", {})
+        authorization = authorization if isinstance(authorization, Mapping) else {}
+        request = request if isinstance(request, Mapping) else {}
+        raw_skills = authorization.get("skills", request.get("skills", []))
+        skills = (
+            [str(value) for value in raw_skills]
+            if isinstance(raw_skills, list)
+            and all(isinstance(value, str) for value in raw_skills)
+            else []
+        )
+        profile = str(
+            authorization.get("profile")
+            or request.get("profile")
+            or item.assignee
+            or self.config.hermes.default_assignee
+            or ""
+        )
+        goal_mode = request.get("goal_mode", self.config.hermes.goal_mode)
+        if not isinstance(goal_mode, bool):
+            goal_mode = self.config.hermes.goal_mode
+        contract_digest = str(
+            reservation.get("contract_digest")
+            or authorization.get("contract_digest")
+            or ""
+        )
+        scope_digest = execution_scope_digest(
+            item,
+            profile=profile,
+            skills=skills,
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=goal_mode,
+        )
+        return {
+            "schema": "hermes-operator.run-execution-contract.v1",
+            "dispatch_contract_digest": contract_digest,
+            "execution_scope_digest": scope_digest,
+            "scope_revision": item.authorization_scope_revision,
+            "work_version": int(reservation.get("work_version", item.version)),
+            "profile": profile,
+            "skills": skills,
+            "default_skills": list(self.config.hermes.default_skills),
+            "goal_mode": goal_mode,
+            "captured_at": utc_now(),
+        }
+
+    @staticmethod
+    def _unavailable_execution_contract(reason: str) -> dict[str, Any]:
+        return {
+            "schema": "hermes-operator.run-execution-contract.v1",
+            "contract_unavailable": True,
+            "reason": reason,
+            "captured_at": utc_now(),
+        }
+
+    @staticmethod
+    def _completion_contract_payload(run: Mapping[str, Any]) -> dict[str, Any]:
+        result = run.get("result", {})
+        contract = (
+            result.get("execution_contract", {})
+            if isinstance(result, Mapping)
+            else {}
+        )
+        if not isinstance(contract, Mapping):
+            contract = {}
+        return {
+            "dispatch_contract_digest": contract.get("dispatch_contract_digest"),
+            "execution_scope_digest": contract.get("execution_scope_digest"),
+            "scope_revision": contract.get("scope_revision"),
+            "work_version": contract.get("work_version"),
+            "profile": contract.get("profile"),
+        }
 
     def _dispatch_metadata(
         self,

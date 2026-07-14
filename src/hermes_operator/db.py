@@ -1367,6 +1367,19 @@ class SQLiteStore:
         item.recurrence_rule = normalize_recurrence_rule(item.recurrence_rule)
         self._validate_reminder_lifecycle(item)
         self._validated_criteria(item.acceptance_criteria)
+        if item.status in TERMINAL_WORK_STATUSES:
+            metadata = dict(item.metadata)
+            governance = dict(metadata.get("governance", {}))
+            governance["execution_authorized"] = False
+            metadata["governance"] = governance
+            metadata.pop("dispatch_authorization", None)
+            metadata.pop("dispatch_request", None)
+            metadata["authorization_invalidated"] = {
+                "reason": "terminal_work_created",
+                "from_work_version": item.version,
+                "invalidated_at": utc_now(),
+            }
+            item.metadata = metadata
         self._validated_metadata(item.metadata)
         with self.connection() as connection:
             connection.execute(
@@ -1600,7 +1613,20 @@ class SQLiteStore:
         actor: str = "supervisor",
         expected_version: int | None = None,
         allow_transition_override: bool = False,
+        invalidate_authority: bool = False,
+        authority_invalidation_reason: str = "explicit_authority_invalidation",
     ) -> WorkItem:
+        if not isinstance(invalidate_authority, bool):
+            raise TypeError("invalidate_authority must be a boolean")
+        if not isinstance(authority_invalidation_reason, str):
+            raise TypeError("authority_invalidation_reason must be a string")
+        clean_invalidation_reason = authority_invalidation_reason.strip()
+        if invalidate_authority and (
+            not clean_invalidation_reason or len(clean_invalidation_reason) > 500
+        ):
+            raise ValueError(
+                "Authority invalidation reason must be nonempty and at most 500 characters"
+            )
         allowed = {
             "title",
             "description",
@@ -1635,6 +1661,20 @@ class SQLiteStore:
             raise ValueError(f"Unsupported work fields: {sorted(unknown)}")
         current = self.get_work(work_id)
         normalized = dict(changes)
+        requested_status = current.status
+        if "status" in normalized:
+            requested_status = WorkStatus(normalized["status"])
+            if not allow_transition_override and requested_status != current.status:
+                if requested_status not in ALLOWED_WORK_TRANSITIONS[current.status]:
+                    raise StateConflict(
+                        f"Cannot transition {current.status.value} "
+                        f"to {requested_status.value}"
+                    )
+            normalized["status"] = requested_status.value
+            if requested_status == WorkStatus.DONE and "completed_at" not in normalized:
+                normalized["completed_at"] = utc_now()
+            elif requested_status != WorkStatus.DONE and current.status == WorkStatus.DONE:
+                normalized.setdefault("completed_at", None)
         scope_fields = {
             "title",
             "description",
@@ -1644,52 +1684,22 @@ class SQLiteStore:
             "recurrence_rule",
             "acceptance_criteria",
         }
-        scope_changed = any(
+        content_scope_changed = any(
             field in normalized
             and normalized[field] != getattr(current, field)
             for field in scope_fields
         )
         if "metadata" in normalized and isinstance(normalized["metadata"], dict):
-            scope_changed = scope_changed or (
+            content_scope_changed = content_scope_changed or (
                 normalized["metadata"].get("verification_contract")
                 != current.metadata.get("verification_contract")
             )
-        if scope_changed:
-            scoped_metadata = dict(
-                normalized.get("metadata", current.metadata)
-                if isinstance(normalized.get("metadata", current.metadata), dict)
-                else current.metadata
-            )
-            governance = dict(scoped_metadata.get("governance", {}))
-            governance["execution_authorized"] = False
-            scoped_metadata["governance"] = governance
-            scoped_metadata.pop("dispatch_authorization", None)
-            scoped_metadata.pop("dispatch_request", None)
-            scoped_metadata["authorization_invalidated"] = {
-                "reason": "execution_scope_changed",
-                "from_work_version": current.version,
-                "invalidated_at": utc_now(),
-            }
-            normalized["metadata"] = scoped_metadata
         acknowledged_recurring = False
-        if "status" in normalized:
-            target = WorkStatus(normalized["status"])
-            if not allow_transition_override and target != current.status:
-                if target not in ALLOWED_WORK_TRANSITIONS[current.status]:
-                    raise StateConflict(f"Cannot transition {current.status.value} to {target.value}")
-            normalized["status"] = target.value
-            if target == WorkStatus.DONE and "completed_at" not in normalized:
-                normalized["completed_at"] = utc_now()
-            elif target != WorkStatus.DONE and current.status == WorkStatus.DONE:
-                normalized.setdefault("completed_at", None)
         if "execution_mode" in normalized:
             normalized["execution_mode"] = ExecutionMode(normalized["execution_mode"]).value
         if "acceptance_criteria" in normalized:
             criteria = self._validated_criteria(normalized.pop("acceptance_criteria"))
             normalized["acceptance_criteria_json"] = self._json(criteria)
-        if "metadata" in normalized:
-            metadata = self._validated_metadata(normalized.pop("metadata"))
-            normalized["metadata_json"] = self._json(metadata)
         if "recurrence_rule" in normalized:
             normalized["recurrence_rule"] = normalize_recurrence_rule(
                 normalized["recurrence_rule"]
@@ -1762,6 +1772,139 @@ class SQLiteStore:
                 value = float(normalized[factor])
                 if not math.isfinite(value) or not 0 <= value <= 1:
                     raise ValueError(f"{factor} must be between 0 and 1")
+
+        effective_status = WorkStatus(
+            normalized.get("status", current.status.value)
+        )
+        content_scope_changed = content_scope_changed or any(
+            field in normalized
+            and normalized[field] != getattr(current, field)
+            for field in scope_fields
+            if field in {"title", "description", "parent_id", "due_at", "scheduled_at", "recurrence_rule"}
+        )
+        lifecycle_scope_changed = bool(
+            effective_status != current.status
+            and (
+                effective_status in TERMINAL_WORK_STATUSES
+                or current.status in TERMINAL_WORK_STATUSES
+            )
+        )
+        reopening = bool(
+            current.status in TERMINAL_WORK_STATUSES
+            and effective_status not in TERMINAL_WORK_STATUSES
+        )
+        entering_terminal = bool(
+            effective_status in TERMINAL_WORK_STATUSES
+            and effective_status != current.status
+        )
+        assignee_scope_changed = bool(
+            "assignee" in normalized
+            and normalized["assignee"] != current.assignee
+        )
+        execution_disabled = bool(
+            current.execution_mode == ExecutionMode.HERMES
+            and normalized.get("execution_mode") == ExecutionMode.NONE.value
+        )
+        execution_mode_changed = bool(
+            "execution_mode" in normalized
+            and normalized["execution_mode"] != current.execution_mode.value
+        )
+        requested_terminal_scope_edit = bool(
+            content_scope_changed
+            or assignee_scope_changed
+            or execution_mode_changed
+        )
+        if (
+            current.status in TERMINAL_WORK_STATUSES
+            and not reopening
+            and requested_terminal_scope_edit
+        ):
+            raise StateConflict(
+                "Terminal work scope can change only while reopening the work item"
+            )
+        scope_changed = bool(
+            content_scope_changed
+            or lifecycle_scope_changed
+            or assignee_scope_changed
+            or execution_disabled
+            or invalidate_authority
+        )
+
+        if reopening:
+            requested_metadata = normalized.get("metadata", current.metadata)
+            requested_governance = (
+                requested_metadata.get("governance", {})
+                if isinstance(requested_metadata, dict)
+                else {}
+            )
+            if (
+                normalized.get("execution_mode") == ExecutionMode.HERMES.value
+                or normalized.get("hermes_task_id") is not None
+                or (
+                    isinstance(requested_metadata, dict)
+                    and (
+                        "dispatch_authorization" in requested_metadata
+                        or "dispatch_request" in requested_metadata
+                    )
+                )
+                or (
+                    isinstance(requested_governance, dict)
+                    and requested_governance.get("execution_authorized") is True
+                )
+            ):
+                raise StateConflict(
+                    "Reopened terminal work must be reauthorized in a later mutation"
+                )
+            # A reopened item is a new execution generation.  Preserve durable
+            # run/audit history, but detach the prior remote card and discard
+            # runtime evidence so it cannot be mistaken for the new attempt.
+            normalized["execution_mode"] = ExecutionMode.NONE.value
+            normalized["hermes_task_id"] = None
+
+        if scope_changed or effective_status in TERMINAL_WORK_STATUSES:
+            scoped_metadata = dict(
+                normalized.get("metadata", current.metadata)
+                if isinstance(normalized.get("metadata", current.metadata), dict)
+                else current.metadata
+            )
+            governance = dict(scoped_metadata.get("governance", {}))
+            governance["execution_authorized"] = False
+            scoped_metadata["governance"] = governance
+            scoped_metadata.pop("dispatch_authorization", None)
+            scoped_metadata.pop("dispatch_request", None)
+            if reopening:
+                for runtime_key in (
+                    "hermes",
+                    "last_verification",
+                    "execution_lost",
+                    "execution_quarantine",
+                    "orphaned_dispatch",
+                ):
+                    scoped_metadata.pop(runtime_key, None)
+            invalidation_reason = (
+                "terminal_work_reopened"
+                if reopening
+                else "terminal_status_changed"
+                if entering_terminal or lifecycle_scope_changed
+                else clean_invalidation_reason
+                if invalidate_authority
+                else "execution_assignee_changed"
+                if assignee_scope_changed
+                else "execution_disabled"
+                if execution_disabled
+                else "execution_scope_changed"
+            )
+            scoped_metadata["authorization_invalidated"] = {
+                "reason": invalidation_reason,
+                "from_work_version": current.version,
+                "from_scope_revision": current.authorization_scope_revision,
+                "invalidated_at": utc_now(),
+            }
+            normalized["metadata"] = scoped_metadata
+
+        if "metadata" in normalized:
+            metadata = self._validated_metadata(normalized.pop("metadata"))
+            normalized["metadata_json"] = self._json(metadata)
         normalized["updated_at"] = utc_now()
         assignments = ", ".join(f"{field} = ?" for field in normalized)
         if scope_changed:
@@ -1799,7 +1942,7 @@ class SQLiteStore:
                 "SELECT id FROM runs WHERE work_item_id = ? AND status = 'queued' LIMIT 1",
                 (work_id,),
             ).fetchone()
-            if queued is not None and changes:
+            if queued is not None and (changes or invalidate_authority):
                 raise StateConflict(
                     f"Work item has an active dispatch reservation: {work_id}"
                 )
@@ -1857,8 +2000,9 @@ class SQLiteStore:
                     entity_type="work",
                     entity_id=work_id,
                     data={
-                        "reason": "execution_scope_changed",
+                        "reason": invalidation_reason,
                         "from_version": current.version,
+                        "from_scope_revision": current.authorization_scope_revision,
                     },
                     connection=connection,
                 )
@@ -2264,18 +2408,25 @@ class SQLiteStore:
                         "from_work_version": int(affected["version"]),
                         "invalidated_at": utc_now(),
                     }
-                    connection.execute(
+                    cursor = connection.execute(
                         "UPDATE work_items SET metadata_json = ?, updated_at = ?, "
+                        "version = version + 1, "
                         "authorization_scope_revision = "
                         "authorization_scope_revision + 1 "
-                        "WHERE id = ? AND authorization_scope_revision = ?",
+                        "WHERE id = ? AND version = ? "
+                        "AND authorization_scope_revision = ?",
                         (
                             self._json(metadata),
                             utc_now(),
                             affected_id,
+                            int(affected["version"]),
                             int(affected["authorization_scope_revision"]),
                         ),
                     )
+                    if cursor.rowcount != 1:
+                        raise StateConflict(
+                            f"Work item changed concurrently: {affected_id}"
+                        )
                     self.audit(
                         actor,
                         "work.authorization_invalidated",
@@ -2343,6 +2494,8 @@ class SQLiteStore:
         work_id: str,
         *,
         expected_version: int,
+        expected_scope_revision: int,
+        expected_scope_digest: str,
         profile: str,
         skills: Sequence[str],
         default_skills: Sequence[str],
@@ -2358,12 +2511,24 @@ class SQLiteStore:
         and durable capture.
         """
 
-        if (
-            isinstance(expected_version, bool)
-            or not isinstance(expected_version, int)
-            or expected_version < 1
+        for name, value in (
+            ("expected_version", expected_version),
+            ("expected_scope_revision", expected_scope_revision),
         ):
-            raise ValueError("expected_version must be a positive integer")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(expected_scope_digest, str)
+            or len(expected_scope_digest) != 64
+            or any(character not in "0123456789abcdef" for character in expected_scope_digest)
+        ):
+            raise ValueError(
+                "expected_scope_digest must be lowercase SHA-256 hex"
+            )
         normalized_profile = str(profile).strip()
         if not normalized_profile:
             raise ValueError("profile must be a nonempty string")
@@ -2373,8 +2538,17 @@ class SQLiteStore:
             raise ValueError("skills must contain nonempty strings")
         with self.transaction():
             item = self.get_work(work_id)
+            if item.status in TERMINAL_WORK_STATUSES:
+                raise StateConflict(
+                    f"Terminal work cannot be authorized: {work_id} "
+                    f"({item.status.value})"
+                )
             if item.version != expected_version:
                 raise StateConflict(f"Work item changed concurrently: {work_id}")
+            if item.authorization_scope_revision != expected_scope_revision:
+                raise StateConflict(
+                    f"Work authorization scope changed concurrently: {work_id}"
+                )
             binding = execution_scope_binding(
                 item,
                 profile=normalized_profile,
@@ -2382,6 +2556,10 @@ class SQLiteStore:
                 default_skills=normalized_defaults,
                 goal_mode=goal_mode,
             )
+            if binding["scope_digest"] != expected_scope_digest:
+                raise StateConflict(
+                    f"Work authorization scope does not match the displayed digest: {work_id}"
+                )
             authorization_id = f"hermes-authorize:{new_id('auth')}"
             event = Event(
                 source="operator",
@@ -2834,6 +3012,37 @@ class SQLiteStore:
                 or reservation.get("contract_digest") != contract_digest
             ):
                 raise StateConflict("Dispatch reservation contract does not match")
+            required_state_key = reservation.get("required_state_key")
+            required_state_digest = reservation.get("required_state_digest")
+            if required_state_key is None:
+                if required_state_digest is not None:
+                    raise StateConflict(
+                        "Dispatch reservation policy state binding is malformed"
+                    )
+            else:
+                if (
+                    not isinstance(required_state_key, str)
+                    or not required_state_key.strip()
+                    or not isinstance(required_state_digest, str)
+                    or len(required_state_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in required_state_digest
+                    )
+                ):
+                    raise StateConflict(
+                        "Dispatch reservation policy state binding is malformed"
+                    )
+                required_state = connection.execute(
+                    "SELECT value_json FROM system_state WHERE key = ?",
+                    (required_state_key,),
+                ).fetchone()
+                if required_state is None or hashlib.sha256(
+                    str(required_state["value_json"]).encode("utf-8")
+                ).hexdigest() != required_state_digest:
+                    raise StateConflict(
+                        "Dispatch reservation policy state changed after reservation"
+                    )
             work = connection.execute(
                 "SELECT version, status, execution_mode, hermes_task_id, "
                 "scheduled_at, parent_id "
@@ -3061,9 +3270,11 @@ class SQLiteStore:
                 (work_id, run_id),
             ).fetchone()
             work_reset = False
+            work = None
             if remaining is None:
                 work = connection.execute(
-                    "SELECT status, completed_at, metadata_json, parent_id "
+                    "SELECT status, completed_at, metadata_json, parent_id, "
+                    "version, authorization_scope_revision "
                     "FROM work_items WHERE id = ?",
                     (work_id,),
                 ).fetchone()
@@ -3082,6 +3293,14 @@ class SQLiteStore:
                     governance["execution_revoked_by"] = actor
                     governance["execution_revocation_reason"] = clean_reason
                     metadata["governance"] = governance
+                    metadata["authorization_invalidated"] = {
+                        "reason": "run_resolved_by_operator",
+                        "from_work_version": int(work["version"]),
+                        "from_scope_revision": int(
+                            work["authorization_scope_revision"]
+                        ),
+                        "invalidated_at": now,
+                    }
                     metadata["run_resolution"] = {
                         "run_id": run_id,
                         "prior_status": expected_status,
@@ -3100,10 +3319,11 @@ class SQLiteStore:
                         if current_status in TERMINAL_WORK_STATUSES
                         else None
                     )
-                    connection.execute(
+                    work_cursor = connection.execute(
                         "UPDATE work_items SET status = ?, execution_mode = ?, "
                         "hermes_task_id = NULL, metadata_json = ?, completed_at = ?, updated_at = ?, "
-                        "version = version + 1 WHERE id = ?",
+                        "version = version + 1, authorization_scope_revision = "
+                        "authorization_scope_revision + 1 WHERE id = ?",
                         (
                             reset_status.value,
                             ExecutionMode.NONE.value,
@@ -3113,6 +3333,10 @@ class SQLiteStore:
                             work_id,
                         ),
                     )
+                    if work_cursor.rowcount != 1:
+                        raise StateConflict(
+                            "Work changed while resolving execution tracking"
+                        )
                     work_reset = True
                     self._refresh_rollup_chain(
                         connection, [work["parent_id"]]
@@ -3127,6 +3351,11 @@ class SQLiteStore:
                     "prior_status": expected_status,
                     "reason": clean_reason,
                     "work_reset": work_reset,
+                    "authority_scope_advanced_from": (
+                        int(work["authorization_scope_revision"])
+                        if work_reset and work is not None
+                        else None
+                    ),
                 },
                 connection=connection,
             )
@@ -3366,6 +3595,88 @@ class SQLiteStore:
                     "plugin_version": value.get("plugin_version"),
                     "policy_version": value.get("policy_version"),
                     "policy_digest": value.get("policy_digest"),
+                },
+                connection=connection,
+            )
+            return True
+
+    def record_policy_revocation(
+        self,
+        profile: str,
+        revocation_id: str,
+        value: dict[str, Any],
+        *,
+        actor: str = "hermes-bridge",
+    ) -> bool:
+        """Immediately replace cached attestation evidence with a denial state."""
+
+        if not profile or not revocation_id:
+            raise ValueError("Policy revocation profile and identity are required")
+        incoming_at = datetime.fromisoformat(
+            str(value["attested_at"]).replace("Z", "+00:00")
+        )
+        if incoming_at.tzinfo is None:
+            raise ValueError("Policy revocation timestamp must include a timezone")
+        key = f"hermes.policy_attestation:{profile}"
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT value_json FROM system_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+            existing = json.loads(row["value_json"]) if row else None
+            if isinstance(existing, dict):
+                existing_id = str(existing.get("event_id", ""))
+                try:
+                    existing_at = datetime.fromisoformat(
+                        str(existing.get("attested_at", "")).replace(
+                            "Z", "+00:00"
+                        )
+                    )
+                except ValueError:
+                    existing_at = None
+                if existing_id == revocation_id or (
+                    existing_at is not None
+                    and existing_at.tzinfo is not None
+                    and incoming_at <= existing_at
+                ):
+                    self.audit(
+                        actor,
+                        "policy_attestation.revocation_ignored_replay",
+                        entity_type="hermes_profile",
+                        entity_id=profile,
+                        data={"revocation_id": revocation_id},
+                        connection=connection,
+                    )
+                    return False
+            stored = {
+                **value,
+                "guard_active": False,
+                "revoked": True,
+                "event_id": revocation_id,
+                "received_at": utc_now(),
+                "authenticated_ingress": True,
+            }
+            connection.execute(
+                """
+                INSERT INTO system_state(key, value_json, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (key, self._json(stored), utc_now()),
+            )
+            self.audit(
+                actor,
+                "policy_attestation.revoked",
+                entity_type="hermes_profile",
+                entity_id=profile,
+                data={
+                    "revocation_id": revocation_id,
+                    "plugin_version": value.get("plugin_version"),
+                    "policy_version": value.get("policy_version"),
+                    "policy_digest": value.get("policy_digest"),
+                    "reason": value.get("reason"),
                 },
                 connection=connection,
             )

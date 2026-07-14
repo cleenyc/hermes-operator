@@ -486,8 +486,10 @@ def _correlation(kwargs: Mapping[str, Any]) -> dict[str, str]:
     for key in ("turn_id", "api_request_id", "task_id", "telemetry_schema_version"):
         if kwargs.get(key) not in (None, ""):
             result[key] = str(kwargs[key])[:500]
-    if "task_id" not in result:
-        environment_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", environment_task_id):
-            result["task_id"] = environment_task_id
+    # Quiet Kanban workers receive a new turn UUID as the hook task_id. The native
+    # dispatcher marker identifies the durable card and must win for lifecycle
+    # correlation, just as it does in the policy guard.
+    environment_task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", environment_task_id):
+        result["task_id"] = environment_task_id
     return result

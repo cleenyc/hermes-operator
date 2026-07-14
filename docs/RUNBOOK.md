@@ -336,7 +336,11 @@ Review and correct the work before retrying. A generic status update cannot reus
 ```bash
 hermes-operator --config operator.toml work show WORK_ID
 hermes-operator --config operator.toml work update WORK_ID --description "Corrected bounded scope"
-hermes-operator --config operator.toml work dispatch WORK_ID --profile operator
+hermes-operator --config operator.toml work authorization-scope WORK_ID --profile operator
+hermes-operator --config operator.toml work dispatch WORK_ID --profile operator \
+  --expected-version VERSION \
+  --expected-scope-revision SCOPE_REVISION \
+  --expected-scope-digest SCOPE_DIGEST
 ```
 
 ## Blocked card resume
@@ -351,7 +355,7 @@ For missing operator context:
 4. Confirm the work receives a fresh exact authorization and becomes ready.
 5. Run or wake reconciliation.
 
-The dispatcher reserves a new slot, posts a bounded resume comment containing answered context, and calls `unblock` on the same Hermes card. The historical attempt remains `blocked`; the new attempt becomes `running`. If capacity is full, the card stays blocked until a slot is available. A lost unblock response is recovered against the same queued attempt and card.
+The dispatcher reserves a new slot and compares the prior immutable run contract with the newly authorized scope. When they match exactly, it posts only currently bound answered context and calls `unblock` on the same Hermes card. If scope, verifier, executor, skills, goal mode, or dispatch digest changed, it creates a new card instead of resuming stale instructions. The historical attempt remains `blocked`; the new attempt becomes `running`. If capacity is full, execution waits until a slot is available. A lost unblock response is recovered against the same queued attempt and card.
 
 Do not ask the worker to call `kanban_unblock`. The native guard reserves unblock ownership for the control plane.
 

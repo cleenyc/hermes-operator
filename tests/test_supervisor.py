@@ -142,6 +142,43 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "capabilities": capabilities,
         }
 
+    def _run_execution_contract(
+        self,
+        item: WorkItem,
+        *,
+        profile: str | None = None,
+        skills: list[str] | None = None,
+        goal_mode: bool = False,
+        work_version: int | None = None,
+    ) -> dict[str, object]:
+        profile = profile or item.assignee or self.config.hermes.default_assignee
+        skills = skills or []
+        binding = execution_scope_binding(
+            item,
+            profile=profile,
+            skills=skills,
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=goal_mode,
+        )
+        return {
+            "schema": "hermes-operator.run-execution-contract.v1",
+            "dispatch_contract_digest": dispatch_contract_digest(
+                item,
+                profile=profile,
+                skills=skills,
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=goal_mode,
+            ),
+            "execution_scope_digest": binding["scope_digest"],
+            "scope_revision": item.authorization_scope_revision,
+            "work_version": work_version or item.version,
+            "profile": profile,
+            "skills": skills,
+            "default_skills": list(self.config.hermes.default_skills),
+            "goal_mode": goal_mode,
+            "captured_at": "2026-07-13T00:00:00Z",
+        }
+
     def test_numeric_planning_factors_must_be_finite(self) -> None:
         for value in (math.nan, math.inf, -math.inf):
             with self.subTest(value=value):
@@ -288,6 +325,268 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             actor="test",
         )
         self.assertEqual(attention["questions"][0]["id"], question["id"])
+
+    async def test_body_text_and_nested_action_items_are_durable_task_signals(self) -> None:
+        body_event_id, _ = self.store.enqueue_event(
+            Event(
+                source="gmail",
+                event_type="email.received",
+                payload={"body_text": "Please include the revised forecast by Friday."},
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        body_plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": body_event_id,
+                    "disposition": "non_actionable",
+                    "reason": "No action detected",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(PlanValidationError, "Task-like event"):
+            await self._supervisor([body_plan]).run_pass(trigger="event")
+        body_events = self.store.claim_events("body-review", 10, 60)
+        await self._supervisor(
+            [
+                empty_plan(
+                    event_dispositions=quarantined_disposition(
+                        body_event_id, "The email contains a requested deliverable"
+                    )
+                )
+            ]
+        ).run_pass(trigger="event", events=body_events)
+
+        nested_events = self._claim(
+            Event(
+                source="calendar",
+                event_type="meeting.processed",
+                payload={
+                    "meeting": {
+                        "notes": {
+                            "action_items": [
+                                {"owner": "operator", "text": "Review forecast"}
+                            ]
+                        }
+                    }
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        nested_id = str(nested_events[0]["id"])
+        nested_plan = empty_plan(
+            event_dispositions=quarantined_disposition(
+                nested_id, "Action-item ownership needs review"
+            )
+        )
+        result = await self._supervisor([nested_plan]).run_pass(
+            trigger="event", events=nested_events
+        )
+        self.assertEqual(len(result.created_work_ids), 1)
+        self.assertEqual(len(result.question_ids), 1)
+
+    async def test_blocked_execution_creates_canonical_question_and_answer_reauthorizes(self) -> None:
+        item = WorkItem(
+            title="Finish the bounded implementation",
+            status=WorkStatus.BLOCKED,
+            execution_mode=ExecutionMode.HERMES,
+            assignee="executor",
+            hermes_task_id="task-blocked",
+            acceptance_criteria=["The named test passes"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                },
+                "dispatch_request": {
+                    "profile": "executor",
+                    "skills": [],
+                    "goal_mode": False,
+                },
+            },
+        )
+        blocked_scope_revision = item.authorization_scope_revision
+        self.store.create_work(item)
+        self.store.create_run(
+            RunRecord(
+                id="run-blocked",
+                work_item_id=item.id,
+                runner="hermes-kanban",
+                external_run_id="task-blocked",
+                status="blocked",
+                attempt=1,
+                result={"execution_evidence": {"reason": "Which schema?"}},
+            )
+        )
+        events = self._claim(
+            Event(
+                source="hermes",
+                external_id="task-blocked",
+                event_type="execution.blocked",
+                payload={
+                    "work_id": item.id,
+                    "hermes_task_id": "task-blocked",
+                    "run_id": "run-blocked",
+                    "attempt": 1,
+                    "execution_evidence": {"reason": "Which schema?"},
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+                provenance={"adapter": "hermes-kanban"},
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "question_requested",
+                    "reason": "The canonical worker needs operator context",
+                }
+            ]
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(len(result.question_ids), 1)
+        question = self.store.get_question(result.question_ids[0])
+        self.assertEqual(question["blocking_work_ids"], [item.id])
+        waiting = self.store.get_work(item.id)
+        self.assertEqual(waiting.status, WorkStatus.WAITING_INPUT)
+        self.assertFalse(
+            question["blocking_work_bindings"][item.id]["execution_authorized"]
+        )
+        self.assertFalse(waiting.metadata["governance"]["execution_authorized"])
+        self.assertNotIn("dispatch_authorization", waiting.metadata)
+        self.assertGreater(
+            waiting.authorization_scope_revision,
+            blocked_scope_revision,
+        )
+
+        self.store.answer_question(question["id"], "Use the 2026 schema")
+        answer_events = self.store.claim_events("answer", 10, 60)
+        answer_event_id = str(answer_events[0]["id"])
+        answer_plan = empty_plan(
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": waiting.version,
+                    "source_event_id": answer_event_id,
+                    "profile": "executor",
+                    "skills": [],
+                    "goal_mode": False,
+                    "reason": "Operator supplied the missing schema",
+                }
+            ],
+        )
+        answered = await self._supervisor([answer_plan]).run_pass(
+            trigger="event", events=answer_events
+        )
+        still_waiting = self.store.get_work(item.id)
+        self.assertEqual(answered.dispatch_work_ids, [])
+        self.assertEqual(still_waiting.status, WorkStatus.WAITING_INPUT)
+
+        authorization_payload = self._authority_payload(
+            still_waiting,
+            ["update", "dispatch"],
+            profile="executor",
+        )
+        authorization_events = self._claim(
+            Event(
+                source="operator",
+                event_type="operator.work_authorized",
+                payload=authorization_payload,
+                trust_level=TrustLevel.OPERATOR,
+            )
+        )
+        authorization_event_id = str(authorization_events[0]["id"])
+        authorization_plan = empty_plan(
+            work_operations=[
+                {
+                    "op": "update",
+                    "work_id": item.id,
+                    "expected_version": still_waiting.version,
+                    "source_event_id": authorization_event_id,
+                    "changes": {
+                        "status": "ready",
+                        "execution_mode": "hermes",
+                        "assignee": "executor",
+                    },
+                }
+            ],
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": still_waiting.version,
+                    "source_event_id": authorization_event_id,
+                    "profile": "executor",
+                    "skills": [],
+                    "goal_mode": False,
+                    "reason": "Fresh exact authorization after operator answer",
+                }
+            ],
+        )
+        resumed = await self._supervisor([authorization_plan]).run_pass(
+            trigger="event", events=authorization_events
+        )
+        ready = self.store.get_work(item.id)
+        self.assertEqual(resumed.dispatch_work_ids, [item.id])
+        self.assertEqual(ready.status, WorkStatus.READY)
+        self.assertEqual(ready.hermes_task_id, "task-blocked")
+        self.assertNotIn("consumed_at", ready.metadata["dispatch_authorization"])
+
+    async def test_forged_blocked_event_cannot_mutate_claimed_work(self) -> None:
+        victim = WorkItem(
+            title="Unrelated blocked work",
+            status=WorkStatus.BLOCKED,
+            execution_mode=ExecutionMode.HERMES,
+            assignee="executor",
+            hermes_task_id="task-victim",
+            acceptance_criteria=["The actual blocker is resolved"],
+        )
+        self.store.create_work(victim)
+        events = self._claim(
+            Event(
+                source="hermes",
+                external_id="task-victim",
+                event_type="execution.blocked",
+                payload={
+                    "work_id": victim.id,
+                    "hermes_task_id": "task-victim",
+                    "run_id": "fabricated-run",
+                    "attempt": 99,
+                    "execution_evidence": {"reason": "Fabricated blocker"},
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+                provenance={"adapter": "hermes-kanban"},
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "question_requested",
+                    "reason": "Preserve malformed lifecycle evidence for review",
+                }
+            ]
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        current = self.store.get_work(victim.id)
+        self.assertEqual(current.status, WorkStatus.BLOCKED)
+        self.assertNotIn("blocked_lifecycle", current.metadata)
+        disposition = result.event_dispositions[0]
+        self.assertNotIn(victim.id, disposition["related_work_ids"])
+        self.assertEqual(len(disposition["related_work_ids"]), 1)
+        review = self.store.get_work(disposition["related_work_ids"][0])
+        self.assertEqual(review.execution_mode, ExecutionMode.NONE)
+        self.assertEqual(review.status, WorkStatus.WAITING_INPUT)
 
     def test_model_context_has_per_field_and_aggregate_bounds(self) -> None:
         supervisor = self._supervisor([])
@@ -1350,6 +1649,111 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             authorized.metadata["dispatch_authorization"]["expires_at"]
         )
 
+    async def test_duplicate_authorization_cannot_replace_live_run_authority(self) -> None:
+        item = WorkItem(
+            title="Already executing exact scope",
+            status=WorkStatus.RUNNING,
+            execution_mode=ExecutionMode.HERMES,
+            assignee="researcher",
+            hermes_task_id="task-live",
+            acceptance_criteria=["The live result is verified"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                }
+            },
+        )
+        self.store.create_work(item)
+        PriorityEngine().rescore_store(self.store)
+        item = self.store.get_work(item.id)
+        run = RunRecord(
+            work_item_id=item.id,
+            runner="hermes-kanban",
+            external_run_id="task-live",
+            status="running",
+            result={"execution_contract": self._run_execution_contract(item)},
+        )
+        metadata = dict(item.metadata)
+        metadata["dispatch_request"] = {
+            "profile": "researcher",
+            "skills": ["kanban-orchestrator"],
+            "goal_mode": False,
+        }
+        metadata["dispatch_authorization"] = {
+            "work_id": item.id,
+            "profile": "researcher",
+            "skills": ["kanban-orchestrator"],
+            "contract_digest": dispatch_contract_digest(
+                item,
+                profile="researcher",
+                skills=["kanban-orchestrator"],
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=False,
+            ),
+            "lifetime": "until_consumed_or_contract_change",
+            "consumed_at": "2026-07-14T00:00:00Z",
+            "consumed_run_id": run.id,
+            "consumed_external_run_id": "task-live",
+        }
+        item = self.store.update_work(
+            item.id,
+            {"metadata": metadata},
+            expected_version=item.version,
+            actor="dispatcher:test",
+        )
+        self.store.create_run(run)
+        original_authorization = dict(item.metadata["dispatch_authorization"])
+        events = self._claim(
+            Event(
+                source="operator",
+                event_type="operator.work_authorized",
+                payload=self._authority_payload(
+                    item,
+                    ["dispatch"],
+                    profile="researcher",
+                    skills=["kanban-orchestrator"],
+                ),
+                trust_level=TrustLevel.OPERATOR,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": item.version,
+                    "source_event_id": event_id,
+                    "profile": "researcher",
+                    "skills": ["kanban-orchestrator"],
+                    "goal_mode": False,
+                    "reason": "Duplicate authorization captured before launch",
+                }
+            ],
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "duplicate",
+                    "reason": "The exact work already has a live canonical run",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        current = self.store.get_work(item.id)
+        self.assertEqual(result.dispatch_work_ids, [])
+        self.assertEqual(
+            current.metadata["dispatch_authorization"],
+            original_authorization,
+        )
+        self.assertEqual(current.status, WorkStatus.RUNNING)
+
     async def test_authorization_survives_priority_only_version_change(self) -> None:
         item = WorkItem(
             title="Priority can move without changing scope",
@@ -1364,9 +1768,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.store.create_work(item)
+        binding = execution_scope_binding(
+            item,
+            profile="researcher",
+            skills=["kanban-orchestrator"],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+        )
         captured = self.store.enqueue_work_authorization(
             item.id,
             expected_version=item.version,
+            expected_scope_revision=item.authorization_scope_revision,
+            expected_scope_digest=str(binding["scope_digest"]),
             profile="researcher",
             skills=["kanban-orchestrator"],
             default_skills=self.config.hermes.default_skills,
@@ -1425,9 +1838,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.store.create_work(item)
+        binding = execution_scope_binding(
+            item,
+            profile="researcher",
+            skills=["kanban-orchestrator"],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+        )
         self.store.enqueue_work_authorization(
             item.id,
             expected_version=item.version,
+            expected_scope_revision=item.authorization_scope_revision,
+            expected_scope_digest=str(binding["scope_digest"]),
             profile="researcher",
             skills=["kanban-orchestrator"],
             default_skills=self.config.hermes.default_skills,
@@ -1729,6 +2151,87 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PlanValidationError, "source_event_id"):
             await supervisor.run_pass(trigger="event", events=events)
 
+    async def test_external_action_disposition_requires_a_staged_intent_id(self) -> None:
+        event_id, _ = self.store.enqueue_event(
+            Event(
+                source="operator",
+                event_type="draft.requested",
+                payload={"text": "Prepare an update"},
+                trust_level=TrustLevel.OPERATOR,
+            )
+        )
+        proposal = {
+            "action_type": "email.send",
+            "integration": "mail",
+            "target": {"recipients": ["person@example.com"]},
+            "content": "Exact draft",
+            "reason": "Requested update",
+            "source_event_id": event_id,
+            "risk": "low",
+        }
+        plan = empty_plan(
+            external_action_proposals=[proposal],
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "external_action_proposed",
+                    "reason": "A draft was proposed",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            PlanValidationError, "no staged durable intent"
+        ):
+            await self._supervisor([plan], stager=None).run_pass(trigger="event")
+
+        with self.store.connection() as connection:
+            state = connection.execute(
+                "SELECT state FROM events WHERE id = ?", (event_id,)
+            ).fetchone()[0]
+        self.assertEqual(state, "pending")
+
+    async def test_authenticated_policy_revocation_invalidates_cached_attestation(self) -> None:
+        self.store.set_state(
+            "hermes.policy_attestation:executor",
+            {
+                "profile": "executor",
+                "guard_active": True,
+                "policy_mode": "default_deny",
+                "authenticated_ingress": True,
+            },
+        )
+        events = self._claim(
+            Event(
+                source="hermes",
+                external_id="revocation-1",
+                event_type="policy.revoked",
+                payload={
+                    "profile": "executor",
+                    "guard_active": False,
+                    "reason": "host compatibility check failed",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+                provenance={"ingress": "webhook", "authenticated": True},
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "non_actionable",
+                    "reason": "The revocation was applied deterministically",
+                }
+            ]
+        )
+
+        await self._supervisor([plan]).run_pass(trigger="event", events=events)
+
+        state = self.store.get_state("hermes.policy_attestation:executor")
+        self.assertFalse(state["guard_active"])
+        self.assertEqual(state["event_id"], "revocation-1")
+
     async def test_untrusted_event_cannot_force_terminal_transition(self) -> None:
         item = WorkItem(
             title="Needs verification",
@@ -1765,17 +2268,160 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.updated_work_ids, [])
         self.assertEqual(self.store.get_work(item.id).status, WorkStatus.REVIEW)
 
+    async def test_edited_scope_rejects_old_completion_and_creates_followup(self) -> None:
+        item = WorkItem(
+            title="Original execution scope",
+            status=WorkStatus.REVIEW,
+            execution_mode=ExecutionMode.HERMES,
+            assignee="executor",
+            hermes_task_id="task-stale-completion",
+            acceptance_criteria=["The original criterion passes"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                },
+            },
+        )
+        execution_contract = self._run_execution_contract(item)
+        run = RunRecord(
+            work_item_id=item.id,
+            runner="hermes-kanban",
+            external_run_id="task-stale-completion",
+            status="completed",
+            result={
+                "execution_contract": execution_contract,
+                "completion": {"updated_at": "stale-evidence"},
+            },
+        )
+        item.metadata["hermes"] = {
+            "completion_fingerprint": "stale-evidence",
+            "completion_run_id": run.id,
+            "completion_attempt": 1,
+        }
+        self.store.create_work(item)
+        self.store.create_run(run)
+        changed = self.store.update_work(
+            item.id,
+            {
+                "title": "Materially edited execution scope",
+                "acceptance_criteria": ["A new unrelated criterion passes"],
+            },
+            expected_version=item.version,
+            actor="operator-api",
+        )
+        events = self._claim(
+            Event(
+                source="hermes",
+                external_id="task-stale-completion",
+                event_type="execution.completed",
+                payload={
+                    "work_id": item.id,
+                    "hermes_task_id": "task-stale-completion",
+                    "run_id": run.id,
+                    "attempt": 1,
+                    "evidence_fingerprint": "stale-evidence",
+                    "dispatch_contract_digest": execution_contract[
+                        "dispatch_contract_digest"
+                    ],
+                    "execution_scope_digest": execution_contract[
+                        "execution_scope_digest"
+                    ],
+                    "scope_revision": execution_contract["scope_revision"],
+                    "work_version": execution_contract["work_version"],
+                    "profile": execution_contract["profile"],
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+                provenance={"adapter": "hermes-kanban"},
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=quarantined_disposition(
+                event_id, "Completion belongs to an older execution scope"
+            )
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        current = self.store.get_work(item.id)
+        self.assertNotEqual(current.status, WorkStatus.DONE)
+        self.assertEqual(current.status, WorkStatus.WAITING_INPUT)
+        self.assertEqual(
+            current.metadata["completion_quarantine"]["event_id"], event_id
+        )
+        self.assertEqual(len(result.question_ids), 1)
+        question = self.store.get_question(result.question_ids[0])
+        self.assertEqual(question["blocking_work_ids"], [item.id])
+        self.assertFalse(
+            question["blocking_work_bindings"][item.id]["execution_authorized"]
+        )
+        self.assertGreater(
+            current.authorization_scope_revision,
+            int(execution_contract["scope_revision"]),
+        )
+
+    async def test_unbound_completion_cannot_quarantine_claimed_victim(self) -> None:
+        victim = WorkItem(
+            title="Unrelated ready work",
+            status=WorkStatus.READY,
+            acceptance_criteria=["Unrelated result exists"],
+        )
+        self.store.create_work(victim)
+        events = self._claim(
+            Event(
+                source="hermes",
+                external_id="bogus-task",
+                event_type="execution.completed",
+                payload={
+                    "work_id": victim.id,
+                    "hermes_task_id": "bogus-task",
+                    "run_id": "bogus-run",
+                    "attempt": 1,
+                    "evidence_fingerprint": "bogus-evidence",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+                provenance={"adapter": "hermes-kanban"},
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=quarantined_disposition(
+                event_id,
+                "Completion identifiers do not map to one canonical run",
+            )
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        current = self.store.get_work(victim.id)
+        self.assertEqual(current.status, WorkStatus.READY)
+        self.assertNotIn("completion_quarantine", current.metadata)
+        disposition = result.event_dispositions[0]
+        self.assertNotIn(victim.id, disposition["related_work_ids"])
+        self.assertEqual(len(disposition["related_work_ids"]), 1)
+        review = self.store.get_work(disposition["related_work_ids"][0])
+        self.assertEqual(review.execution_mode, ExecutionMode.NONE)
+        self.assertEqual(review.status, WorkStatus.WAITING_INPUT)
+
     async def test_evidenced_verification_is_terminal_and_retry_idempotent(self) -> None:
         run = RunRecord(
             work_item_id="placeholder",
             runner="hermes-kanban",
             external_run_id="task-9",
             status="completed",
-            result={"updated_at": "evidence-9"},
+            result={},
         )
         item = WorkItem(
             title="Implemented feature",
             status=WorkStatus.REVIEW,
+            execution_mode=ExecutionMode.HERMES,
+            assignee="executor",
             hermes_task_id="task-9",
             acceptance_criteria=["Unit tests pass", "No external action occurred"],
             metadata={
@@ -1788,6 +2434,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         run.work_item_id = item.id
+        execution_contract = self._run_execution_contract(item)
+        run.result = {
+            "execution_contract": execution_contract,
+            "completion": {"updated_at": "evidence-9"},
+        }
         self.store.create_work(item)
         self.store.create_run(run)
         events = self._claim(
@@ -1801,6 +2452,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "run_id": run.id,
                     "attempt": 1,
                     "evidence_fingerprint": "evidence-9",
+                    "dispatch_contract_digest": execution_contract[
+                        "dispatch_contract_digest"
+                    ],
+                    "execution_scope_digest": execution_contract[
+                        "execution_scope_digest"
+                    ],
+                    "scope_revision": execution_contract["scope_revision"],
+                    "work_version": execution_contract["work_version"],
+                    "profile": execution_contract["profile"],
                     "result": {"tests": "passed"},
                 },
                 trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
@@ -1857,7 +2517,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             external_run_id=task_id,
             status="completed",
             attempt=attempt,
-            result={"updated_at": f"evidence-retry-{attempt}"},
+            result={},
         )
         item = WorkItem(
             title="Repair verified implementation",
@@ -1909,6 +2569,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "consumed_run_id": run.id,
             "consumed_external_run_id": task_id,
         }
+        execution_contract = self._run_execution_contract(
+            item,
+            profile="researcher",
+            skills=["kanban-orchestrator"],
+        )
+        run.result = {
+            "execution_contract": execution_contract,
+            "completion": {"updated_at": f"evidence-retry-{attempt}"},
+        }
         self.store.create_work(item)
         self.store.create_run(run)
         PriorityEngine().rescore_store(self.store)
@@ -1924,6 +2593,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "run_id": run.id,
                     "attempt": attempt,
                     "evidence_fingerprint": f"evidence-retry-{attempt}",
+                    "dispatch_contract_digest": execution_contract[
+                        "dispatch_contract_digest"
+                    ],
+                    "execution_scope_digest": execution_contract[
+                        "execution_scope_digest"
+                    ],
+                    "scope_revision": execution_contract["scope_revision"],
+                    "work_version": execution_contract["work_version"],
+                    "profile": execution_contract["profile"],
                 },
                 trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
                 provenance={"adapter": "hermes-kanban"},

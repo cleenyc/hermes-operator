@@ -91,8 +91,8 @@ class HermesConfig:
     control_timeout_seconds: int = 10
     require_policy_attestation: bool = True
     policy_attestation_ttl_seconds: int = 300
-    allowed_plugin_versions: list[str] = field(default_factory=lambda: ["1.4.0"])
-    allowed_policy_versions: list[str] = field(default_factory=lambda: ["5.0.0"])
+    allowed_plugin_versions: list[str] = field(default_factory=lambda: ["1.5.0"])
+    allowed_policy_versions: list[str] = field(default_factory=lambda: ["6.0.0"])
     allowed_policy_digests: list[str] = field(default_factory=list)
 
     def resolved_control_token(self) -> str:

@@ -5,7 +5,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from .models import WorkItem
+from .models import TERMINAL_WORK_STATUSES, WorkItem
 
 
 def _effective_skills(
@@ -156,6 +156,13 @@ def binding_execution_parameters(
 
 def binding_matches_work(binding: Mapping[str, Any], item: WorkItem) -> bool:
     """Return whether a persisted authorization binding still matches work."""
+
+    # Terminal work is never executable.  In addition to lifecycle mutations
+    # advancing the authorization scope revision, keep this predicate
+    # fail-closed for imported or legacy rows that may not have crossed the
+    # current transition path.
+    if item.status in TERMINAL_WORK_STATUSES:
+        return False
 
     digest = binding.get("scope_digest")
     work_version = binding.get("work_version")

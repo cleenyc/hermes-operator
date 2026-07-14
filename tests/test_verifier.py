@@ -21,7 +21,9 @@ from hermes_operator.config import (  # noqa: E402
     VerificationCheckConfig,
     VerificationConfig,
 )
+from hermes_operator.authority import execution_scope_digest  # noqa: E402
 from hermes_operator.db import SQLiteStore  # noqa: E402
+from hermes_operator.dispatcher import dispatch_contract_digest  # noqa: E402
 from hermes_operator.llm import ScriptedLLM  # noqa: E402
 from hermes_operator.models import (  # noqa: E402
     Event,
@@ -294,17 +296,58 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def _immutable_run_result(
+        self,
+        item: WorkItem,
+        completion: dict,
+    ) -> dict:
+        profile = str(item.assignee or self.config.hermes.default_assignee)
+        skills: list[str] = []
+        goal_mode = self.config.hermes.goal_mode
+        return {
+            "execution_contract": {
+                "schema": "hermes-operator.run-execution-contract.v1",
+                "dispatch_contract_digest": dispatch_contract_digest(
+                    item,
+                    profile=profile,
+                    skills=skills,
+                    default_skills=self.config.hermes.default_skills,
+                    goal_mode=goal_mode,
+                ),
+                "execution_scope_digest": execution_scope_digest(
+                    item,
+                    profile=profile,
+                    skills=skills,
+                    default_skills=self.config.hermes.default_skills,
+                    goal_mode=goal_mode,
+                ),
+                "scope_revision": item.authorization_scope_revision,
+                "work_version": item.version,
+                "profile": profile,
+                "skills": skills,
+                "default_skills": list(self.config.hermes.default_skills),
+                "goal_mode": goal_mode,
+                "captured_at": "2026-07-15T00:00:00+00:00",
+            },
+            "completion": completion,
+        }
+
+    @staticmethod
+    def _completion_contract_payload(run: RunRecord) -> dict:
+        contract = run.result["execution_contract"]
+        return {
+            "dispatch_contract_digest": contract["dispatch_contract_digest"],
+            "execution_scope_digest": contract["execution_scope_digest"],
+            "scope_revision": contract["scope_revision"],
+            "work_version": contract["work_version"],
+            "profile": contract["profile"],
+        }
+
     async def test_failed_artifact_gate_overrides_model_passed_verdict(self) -> None:
-        run = RunRecord(
-            work_item_id="placeholder",
-            runner="hermes-kanban",
-            external_run_id="task-artifact",
-            status="completed",
-            result={"updated_at": "artifact-evidence", "raw": {}},
-        )
         item = WorkItem(
             title="Produce required artifact",
             status=WorkStatus.REVIEW,
+            assignee="operator",
             hermes_task_id="task-artifact",
             acceptance_criteria=["The artifact exists"],
             metadata={
@@ -320,7 +363,7 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 },
                 "hermes": {
                     "completion_fingerprint": "artifact-evidence",
-                    "completion_run_id": run.id,
+                    "completion_run_id": "",
                     "completion_attempt": 1,
                 },
                 "governance": {
@@ -330,8 +373,24 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        run.work_item_id = item.id
         self.store.create_work(item)
+        run = RunRecord(
+            work_item_id=item.id,
+            runner="hermes-kanban",
+            external_run_id="task-artifact",
+            status="completed",
+            result=self._immutable_run_result(
+                item,
+                {"updated_at": "artifact-evidence", "raw": {}},
+            ),
+        )
+        item.metadata["hermes"]["completion_run_id"] = run.id
+        self.store.update_work(
+            item.id,
+            {"metadata": item.metadata},
+            expected_version=item.version,
+        )
+        item = self.store.get_work(item.id)
         self.store.create_run(run)
         event = Event(
             source="hermes",
@@ -343,7 +402,8 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 "run_id": run.id,
                 "attempt": 1,
                 "evidence_fingerprint": "artifact-evidence",
-                "execution_evidence": run.result,
+                **self._completion_contract_payload(run),
+                "execution_evidence": run.result["completion"],
             },
             trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
             provenance={"adapter": "hermes-kanban"},
@@ -411,16 +471,10 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=5,
             max_output_bytes=1_000,
         )
-        run = RunRecord(
-            work_item_id="placeholder",
-            runner="hermes-kanban",
-            external_run_id="task-nonblocking",
-            status="completed",
-            result={"updated_at": "nonblocking-evidence"},
-        )
         item = WorkItem(
             title="Run one nonblocking check",
             status=WorkStatus.REVIEW,
+            assignee="operator",
             hermes_task_id="task-nonblocking",
             acceptance_criteria=["The fixed check passes"],
             metadata={
@@ -430,7 +484,7 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 },
                 "hermes": {
                     "completion_fingerprint": "nonblocking-evidence",
-                    "completion_run_id": run.id,
+                    "completion_run_id": "",
                     "completion_attempt": 1,
                 },
                 "governance": {
@@ -440,8 +494,24 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        run.work_item_id = item.id
         self.store.create_work(item)
+        run = RunRecord(
+            work_item_id=item.id,
+            runner="hermes-kanban",
+            external_run_id="task-nonblocking",
+            status="completed",
+            result=self._immutable_run_result(
+                item,
+                {"updated_at": "nonblocking-evidence"},
+            ),
+        )
+        item.metadata["hermes"]["completion_run_id"] = run.id
+        self.store.update_work(
+            item.id,
+            {"metadata": item.metadata},
+            expected_version=item.version,
+        )
+        item = self.store.get_work(item.id)
         self.store.create_run(run)
         event = Event(
             source="hermes",
@@ -453,6 +523,7 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 "run_id": run.id,
                 "attempt": 1,
                 "evidence_fingerprint": "nonblocking-evidence",
+                **self._completion_contract_payload(run),
             },
             trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
             provenance={"adapter": "hermes-kanban"},

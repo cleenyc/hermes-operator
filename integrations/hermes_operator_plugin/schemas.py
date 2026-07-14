@@ -69,6 +69,46 @@ OPERATOR_DUE_REMINDERS = {
     },
 }
 
+OPERATOR_RESOLVE_REMINDER = {
+    "name": "operator_resolve_reminder",
+    "description": (
+        "Apply one reminder lifecycle action using optimistic concurrency. Snooze "
+        "sets reminder_snoozed_until while preserving due_at; acknowledge records "
+        "delivery without moving the schedule; complete closes the reminder."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "work_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "expected_version": {"type": "integer", "minimum": 1},
+            "action": {
+                "type": "string",
+                "enum": ["snooze", "acknowledge", "complete"],
+            },
+            "until": {
+                "type": "string",
+                "description": (
+                    "Timezone-aware ISO 8601 timestamp. Required only for snooze."
+                ),
+            },
+        },
+        "required": ["work_id", "expected_version", "action"],
+        "oneOf": [
+            {
+                "properties": {"action": {"const": "snooze"}},
+                "required": ["until"],
+            },
+            {
+                "properties": {
+                    "action": {"enum": ["acknowledge", "complete"]}
+                },
+                "not": {"required": ["until"]},
+            },
+        ],
+        "additionalProperties": False,
+    },
+}
+
 OPERATOR_CLAIM_ATTENTION = {
     "name": "operator_claim_attention",
     "description": (
@@ -154,6 +194,31 @@ OPERATOR_ANSWER_QUESTION = {
     },
 }
 
+OPERATOR_AUTHORIZATION_SCOPE = {
+    "name": "operator_authorization_scope",
+    "description": (
+        "Read the current version, dependency-fenced authorization scope revision, "
+        "digest, and execution shape for one work item. Call this immediately before "
+        "requesting native human confirmation; this read does not authorize execution."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "work_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "profile": {"type": "string", "minLength": 1, "maxLength": 128},
+            "skills": {
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+            "goal_mode": {"type": "boolean"},
+        },
+        "required": ["work_id"],
+        "additionalProperties": False,
+    },
+}
+
 OPERATOR_AUTHORIZE_WORK = {
     "name": "operator_authorize_work",
     "description": (
@@ -166,6 +231,11 @@ OPERATOR_AUTHORIZE_WORK = {
         "properties": {
             "work_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "expected_version": {"type": "integer", "minimum": 1},
+            "expected_scope_revision": {"type": "integer", "minimum": 1},
+            "expected_scope_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
             "reason": {"type": "string", "maxLength": 2000},
             "profile": {"type": "string", "minLength": 1, "maxLength": 128},
             "skills": {
@@ -175,7 +245,12 @@ OPERATOR_AUTHORIZE_WORK = {
             },
             "goal_mode": {"type": "boolean"},
         },
-        "required": ["work_id", "expected_version"],
+        "required": [
+            "work_id",
+            "expected_version",
+            "expected_scope_revision",
+            "expected_scope_digest",
+        ],
         "additionalProperties": False,
     },
 }

@@ -26,7 +26,9 @@ The daemon has no outbound connector and no outbound execution route. It may sta
 - Hermes Kanban dispatch through public CLI commands plus an authenticated run-control endpoint for terminating native compute. The adapter uses `create`, `show`, `list`, `comment`, `block`, `unblock`, and `runs`.
 - Atomic run-slot reservations with one compute-active run per work item and a database-wide `max_parallel_work` cap. A blocked Hermes attempt is closed and releases compute capacity.
 - Finalized-plan, exact-contract, allowlisted-profile, skill, timing, attempt-budget, work-version, and fresh per-profile policy-attestation checks before dispatch.
+- Linearizable live worker contracts, policy-state-fenced dispatch commits, and immutable recovery snapshots prevent cancellation, revocation, or crash recovery from reviving stale authority.
 - Native Hermes plugin with scoped read and conversational-management tools, bounded context injection, lifecycle observations, a managed-card pre-tool guard, and policy-attestation refresh.
+- Managed completion blocks explicit artifacts plus every promotable absolute, home-relative, Windows, or `MEDIA:` local path; files remain deliverable from unmanaged interactive turns under Hermes-native approval.
 - A required pinned real-host compatibility lane for Hermes Agent `0.18.2` (`v2026.7.7.2`, commit `9de9c25f620ff7f1ce0fd5457d596052d5159596`) plus an advisory current-`main` lane, including ordinary-turn UUID, first-valid hook-order, and completion-delivery integration checks.
 - Parallel execution through multiple independent canonical Operator cards, atomically capped by `max_parallel_work`. Current top-level `delegate_task` is background and non-durable, so it is blocked on Operator-managed cards; unmanaged interactive Hermes sessions keep native delegation behavior.
 - Installed Hermes-native Cron contracts for Google Workspace intake, durable reminder and question delivery, and daily briefings. Signed webhooks and fixed-argv command readers remain optional extension paths.
@@ -136,11 +138,28 @@ hermes-operator --config operator.toml work add "Draft planning summary" \
   --criterion "A Markdown draft exists" \
   --criterion "Every metric cites its source"
 
-hermes-operator --config operator.toml work dispatch WORK_ID \
+hermes-operator --config operator.toml work authorization-scope WORK_ID \
   --profile operator
+
+# Review the returned scope, then echo its three exact fences.
+hermes-operator --config operator.toml work dispatch WORK_ID \
+  --profile operator \
+  --expected-version WORK_VERSION \
+  --expected-scope-revision SCOPE_REVISION \
+  --expected-scope-digest SCOPE_DIGEST
 ```
 
-`work dispatch` writes a durable one-shot authorization for the exact current contract. `not_before` is bound to the work schedule, `review_after` marks when the authorization should be reviewed operationally, and `max_attempts` is capped by `hermes.max_execution_attempts`. This authorization has no automatic wall-clock expiry, but contract changes invalidate it and the first dispatch consumes it. The dispatcher still checks work version, contract digest, allowlists, dependencies, acceptance criteria, capacity, attempt budget, and policy attestation. Live model plans can issue at most `operator.max_authorizations_per_pass` exact authorizations in one pass.
+`work dispatch` writes a durable one-shot authorization only when the echoed work
+version, authorization scope revision, and scope digest still match the reviewed
+preview. Set or clear a verifier contract first with `work verification-contract`,
+then obtain a new preview. `not_before` is bound to the work schedule,
+`review_after` marks when the authorization should be reviewed operationally, and
+`max_attempts` is capped by `hermes.max_execution_attempts`. This authorization has
+no automatic wall-clock expiry, but contract changes invalidate it and the first
+dispatch consumes it. The dispatcher still checks the exact scope and contract,
+allowlists, dependencies, acceptance criteria, capacity, attempt budget, and policy
+attestation. Live model plans can issue at most
+`operator.max_authorizations_per_pass` exact authorizations in one pass.
 
 ## Autonomy modes
 
@@ -177,9 +196,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.4.0"]
-allowed_policy_versions = ["5.0.0"]
-allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
+allowed_plugin_versions = ["1.5.0"]
+allowed_policy_versions = ["6.0.0"]
+allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
 ```
 
 `profile`, `default_assignee`, `orchestrator_profile`, and entries in `allowed_profiles` form the effective execution-profile allowlist. Each selected profile installs the plugin with its own `HERMES_OPERATOR_PROFILE` value and must produce a fresh accepted attestation before receiving work. This supports multiple attested profiles without adding profile-specific capacity pools.
@@ -188,7 +207,7 @@ Parallel work comes from independent canonical WorkItems dispatched as separate 
 
 The plugin sends one synchronous attestation at registration, then starts one daemon heartbeat and shares the same refresh limiter with normal Hermes lifecycle hooks. The default refresh interval is 120 seconds; the core example accepts an attestation for 300 seconds. Dispatch fails closed when evidence is absent, stale, for another profile, or outside the configured plugin version, policy version, or policy digest allowlists. Internal and active execution also require `control_base_url` and the token named by `control_token_env`; the daemon uses that authenticated control endpoint to terminate native compute and then blocks the card. Never add the control token to `hermes.pass_env`.
 
-When a Hermes card blocks for missing context, reconciliation closes that run attempt and releases its compute slot. After the operator answers a linked question and the work is freshly authorized, the dispatcher reserves a new slot, comments the bounded answer context onto the same card, and unblocks it. A failed independent verification uses a new card and a new run attempt instead. Retries retain the original authorization root and cannot exceed `max_execution_attempts`.
+When a Hermes card blocks for missing context, reconciliation closes that run attempt and releases its compute slot. After the operator answers a linked question and the work is freshly authorized, the dispatcher reserves a new slot. It reuses the old card and includes only currently bound answers when the immutable scope is unchanged; otherwise it creates a new card carrying the new scope. A failed independent verification always uses a new card and run attempt. Retries retain the original authorization root and cannot exceed `max_execution_attempts`.
 
 The task-scoped plugin guard is defense in depth for Operator-managed cards, not an end-to-end enforcement claim for the Hermes harness. Contract-authorized local tests and builds can invoke project-defined code, and unmanaged interactive or Cron sessions follow Hermes-native policy. Credential separation, operating-system isolation, and network controls are optional deployment hardening when a stronger boundary is required. See [Hermes Integration](docs/HERMES_INTEGRATION.md) and [Threat Model](docs/THREAT_MODEL.md).
 

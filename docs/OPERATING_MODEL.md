@@ -126,7 +126,7 @@ Hermes reports map as follows:
 - Cancelled state blocks local work for operator or supervisor decision; it is not treated as trusted cancellation authority.
 - Repeated missing or failed reconciliation marks a run `lost` and blocks the work.
 
-When Hermes blocks, the active run attempt is closed and releases compute capacity. The card stays blocked. Answered context plus fresh authorization can reserve a new attempt, add the bounded answer to the same card, and unblock it. The adapter also has an authenticated run-control call for terminating native compute when canonical work becomes terminal or authorization is invalid.
+When Hermes blocks, the active run attempt is closed and releases compute capacity. The lifecycle edge must match the latest canonical card, run, and attempt. Answered context plus fresh authorization can reserve a new attempt. The same card is unblocked only when its prior immutable contract still matches the current scope, and only answers with current work bindings are included; otherwise a new card carries the changed scope. The adapter also has an authenticated run-control call for terminating native compute when canonical work becomes terminal or authorization is invalid.
 
 ## Planning
 
@@ -228,7 +228,7 @@ Every acceptance criterion must appear exactly once in the verification result. 
 
 Failure moves work to `blocked`. Missing input moves it to `waiting_input`. The evidence fingerprint prevents later reconciliation of the same card result from erasing a failed review outcome.
 
-A failed verification may produce a bounded correction attempt only from the exact completion event and prior authorization root, while the attempt budget remains. The correction gets a new canonical run, new idempotency key, and new Hermes card. By contrast, a card blocked for missing operator context resumes on the same card after answer delivery and a fresh slot reservation.
+A failed verification may produce a bounded correction attempt only from the exact completion event and prior authorization root, while the attempt budget remains. The correction gets a new canonical run, new idempotency key, and new Hermes card. A card blocked for missing operator context may resume on the same card after answer delivery and a fresh slot reservation only while its immutable execution scope is unchanged.
 
 ## Memory and Obsidian
 

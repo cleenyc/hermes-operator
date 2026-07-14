@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from hermes_operator.adapters import InMemoryHermesAdapter
+from hermes_operator.authority import execution_scope_binding
 from hermes_operator.config import (
     AppConfig,
     HermesConfig,
@@ -225,6 +226,20 @@ class DispatcherTests(unittest.TestCase):
             allow_transition_override=True,
         )
 
+    def _question_binding(self, item: WorkItem) -> dict[str, object]:
+        request = item.metadata.get("dispatch_request", {})
+        request = request if isinstance(request, dict) else {}
+        skills = request.get("skills", [])
+        skills = skills if isinstance(skills, list) else []
+        return execution_scope_binding(
+            item,
+            profile=str(request.get("profile") or item.assignee or "executor"),
+            skills=[str(value) for value in skills],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=bool(request.get("goal_mode", False)),
+            execution_authorized=True,
+        )
+
     def _dispatcher(self, config: AppConfig | None = None) -> HermesDispatcher:
         return HermesDispatcher(
             config=config or self.config,
@@ -274,7 +289,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(task.assignee, "executor")
         self.assertIn("Acceptance criteria", task.description)
         self.assertIn("Do not send, publish, submit", task.description)
-        self.assertIn("Use Hermes subagents in parallel", task.description)
+        self.assertIn("Do not start background subagents", task.description)
         self.assertEqual(
             task.raw["operator_metadata"]["skills"],
             ["kanban-orchestrator"],
@@ -301,7 +316,7 @@ class DispatcherTests(unittest.TestCase):
 
         self.assertTrue(contract["authorized"])
         self.assertEqual(contract["work_id"], item.id)
-        self.assertIn("delegate_task", contract["internal_capabilities"])
+        self.assertNotIn("delegate_task", contract["internal_capabilities"])
         self.assertIn("local_test", contract["internal_capabilities"])
         self.assertEqual(
             dispatcher.execution_contract("t_unknown"),
@@ -318,6 +333,74 @@ class DispatcherTests(unittest.TestCase):
         )
         revoked = dispatcher.execution_contract(str(linked.hermes_task_id))
         self.assertFalse(revoked["authorized"])
+
+    def test_execution_contract_linearizes_before_concurrent_cancellation(self) -> None:
+        item = self._ready("Linearize worker authorization")
+        dispatcher = self._dispatcher()
+        dispatcher.dispatch_ready()
+        linked = self.store.get_work(item.id)
+        task_id = str(linked.hermes_task_id)
+        item_loaded = threading.Event()
+        release_lookup = threading.Event()
+        cancellation_started = threading.Event()
+        cancellation_committed = threading.Event()
+        contracts: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+        original_lookup = self.store.find_work_by_hermes_id
+
+        def paused_lookup(external_id: str) -> WorkItem | None:
+            value = original_lookup(external_id)
+            item_loaded.set()
+            if not release_lookup.wait(timeout=3):
+                raise TimeoutError("test did not release contract lookup")
+            return value
+
+        def read_contract() -> None:
+            try:
+                contracts.append(dispatcher.execution_contract(task_id))
+            except BaseException as error:  # pragma: no cover - assertion path
+                errors.append(error)
+
+        def cancel_work() -> None:
+            try:
+                cancellation_started.set()
+                current = self.store.get_work(item.id)
+                self.store.update_work(
+                    item.id,
+                    {"status": WorkStatus.CANCELLED},
+                    expected_version=current.version,
+                    allow_transition_override=True,
+                )
+                cancellation_committed.set()
+            except BaseException as error:  # pragma: no cover - assertion path
+                errors.append(error)
+
+        self.store.find_work_by_hermes_id = paused_lookup  # type: ignore[method-assign]
+        self.addCleanup(
+            setattr,
+            self.store,
+            "find_work_by_hermes_id",
+            original_lookup,
+        )
+        reader = threading.Thread(target=read_contract)
+        reader.start()
+        self.assertTrue(item_loaded.wait(timeout=2))
+        writer = threading.Thread(target=cancel_work)
+        writer.start()
+        self.assertTrue(cancellation_started.wait(timeout=2))
+
+        # The cancellation writer cannot commit inside the capability read.
+        self.assertFalse(cancellation_committed.wait(timeout=0.2))
+        release_lookup.set()
+        reader.join(timeout=3)
+        writer.join(timeout=3)
+
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(contracts[0]["authorized"])
+        self.assertTrue(cancellation_committed.is_set())
+        self.assertFalse(dispatcher.execution_contract(task_id)["authorized"])
 
     def test_running_work_rejects_new_dependency_and_contract_checks_legacy_edges(self) -> None:
         item = self._ready("Keep dependency invariant while running")
@@ -381,25 +464,20 @@ class DispatcherTests(unittest.TestCase):
             stale_dispatcher.execution_contract(task_id)
         self.assertEqual(calls, 2)
 
-    def test_delegation_batch_claim_is_durable_and_one_shot_per_run(self) -> None:
-        item = self._ready("Use one bounded subagent batch")
+    def test_background_delegation_is_not_advertised_or_claimable(self) -> None:
+        item = self._ready("Keep work on the canonical card")
         dispatcher = self._dispatcher()
         dispatcher.dispatch_ready()
         linked = self.store.get_work(item.id)
         task_id = str(linked.hermes_task_id)
 
-        first = dispatcher.claim_delegation_batch(task_id, 3)
-        repeated = dispatcher.claim_delegation_batch(task_id, 1)
+        claim = dispatcher.claim_delegation_batch(task_id, 3)
 
-        self.assertTrue(first["claimed"])
-        self.assertEqual(first["requested_children"], 3)
-        self.assertFalse(repeated["claimed"])
-        self.assertEqual(repeated["reason"], "delegation_batch_already_claimed")
-        state = self.store.get_state(
-            f"hermes.delegation_claim:{first['run_id']}"
+        self.assertFalse(claim["claimed"])
+        self.assertEqual(claim["reason"], "live_delegation_contract_required")
+        self.assertIsNone(
+            self.store.get_state(f"hermes.delegation_claim:{claim['run_id']}")
         )
-        self.assertEqual(state["task_id"], task_id)
-        self.assertEqual(state["requested_children"], 3)
 
     def test_dispatch_passes_native_goal_and_effective_skills(self) -> None:
         item = self._ready(
@@ -676,6 +754,46 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(active[0]["status"], "running")
         self.assertEqual(active[0]["work_item_id"], first.id)
 
+    def test_known_external_recovery_preserves_immutable_execution_contract(self) -> None:
+        item = self._ready("Recover a persisted external task id")
+        authorization = item.metadata["dispatch_authorization"]
+        reserved = self.store.reserve_run_slot(
+            item.id,
+            runner="hermes-kanban",
+            max_active=1,
+            stale_queue_seconds=180,
+            expected_work_version=item.version,
+            contract_digest=authorization["contract_digest"],
+        )
+        self.assertIsNotNone(reserved)
+        assert reserved is not None
+        task = self.adapter.create_task(
+            title=item.title,
+            description="Card created before the local commit response was lost",
+            idempotency_key=f"hermes-operator:{item.id}:attempt:1",
+        )
+        self.store.update_run(
+            str(reserved["id"]),
+            external_run_id=task.id,
+            result=reserved["result"] | {"dispatch": {"id": task.id}},
+        )
+
+        report = self._dispatcher().reconcile()
+
+        self.assertIn(item.id, report.reconciled_work_ids)
+        recovered = self.store.get_run(str(reserved["id"]))
+        contract = recovered["result"]["execution_contract"]
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(
+            contract["dispatch_contract_digest"],
+            authorization["contract_digest"],
+        )
+        self.assertEqual(
+            contract["scope_revision"],
+            item.authorization_scope_revision,
+        )
+        self.assertNotIn("contract_unavailable", contract)
+
     def test_orphan_recovery_revalidates_authorization_before_linking(self) -> None:
         item = self._ready("Recover only if still authorized")
         authorization = item.metadata["dispatch_authorization"]
@@ -781,7 +899,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(report.reconciled_work_ids, [item.id])
         with self.store.connection() as connection:
             events = connection.execute(
-                "SELECT event_type, trust_level FROM events WHERE event_type = ?",
+                "SELECT event_type, trust_level, payload_json FROM events WHERE event_type = ?",
                 ("execution.completed",),
             ).fetchall()
             runs = connection.execute(
@@ -791,6 +909,19 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["trust_level"], "authenticated_untrusted")
         self.assertEqual(runs[-1]["status"], "completed")
+        payload = json.loads(events[0]["payload_json"])
+        run = self.store.list_runs()[0]
+        contract = run["result"]["execution_contract"]
+        self.assertEqual(
+            payload["execution_scope_digest"],
+            contract["execution_scope_digest"],
+        )
+        self.assertEqual(
+            payload["dispatch_contract_digest"],
+            contract["dispatch_contract_digest"],
+        )
+        self.assertIn("completion", run["result"])
+        self.assertIn("reservation", run["result"])
 
         dispatcher.reconcile()
         with self.store.connection() as connection:
@@ -954,6 +1085,9 @@ class DispatcherTests(unittest.TestCase):
         question = UserQuestion(
             question="Which schema should the worker use?",
             blocking_work_ids=[item.id],
+            blocking_work_bindings={
+                item.id: self._question_binding(self.store.get_work(item.id))
+            },
         )
         self.store.create_question(question)
         self.store.answer_question(question.id, "Use the 2026 schema")
@@ -972,6 +1106,82 @@ class DispatcherTests(unittest.TestCase):
         self.assertTrue(
             any("Use the 2026 schema" in str(value.get("body", "")) for value in comments)
         )
+
+    def test_changed_execution_scope_creates_new_card_instead_of_resuming_old(self) -> None:
+        item = self._ready(
+            "Do scope-bound work",
+            description="OLD scope description",
+            acceptance_criteria=["OLD proof is present"],
+        )
+        dispatcher = self._dispatcher()
+        dispatcher.dispatch_ready()
+        first = self.store.get_work(item.id)
+        first_task_id = str(first.hermes_task_id)
+        self.adapter.set_status(first_task_id, "blocked")
+        dispatcher.reconcile()
+        blocked = self.store.get_work(item.id)
+
+        changed = self.store.update_work(
+            item.id,
+            {
+                "description": "NEW scope description",
+                "acceptance_criteria": ["NEW proof is present"],
+            },
+            expected_version=blocked.version,
+        )
+        self.assertGreater(
+            changed.authorization_scope_revision,
+            blocked.authorization_scope_revision,
+        )
+        self._reauthorize(item.id, reason="Authorize the NEW scope")
+
+        report = dispatcher.dispatch_ready()
+
+        self.assertIn(item.id, report.dispatched_work_ids)
+        second = self.store.get_work(item.id)
+        second_task_id = str(second.hermes_task_id)
+        self.assertNotEqual(second_task_id, first_task_id)
+        self.assertEqual(len(self.adapter.list_tasks()), 2)
+        self.assertEqual(self.adapter.show_task(first_task_id).status, "blocked")
+        second_description = self.adapter.show_task(second_task_id).description
+        self.assertIn("NEW scope description", second_description)
+        self.assertIn("NEW proof is present", second_description)
+        self.assertNotIn("OLD scope description", second_description)
+
+    def test_resume_comment_excludes_answers_bound_to_stale_scope(self) -> None:
+        item = self._ready("Bind resume context to one scope")
+        old_question = UserQuestion(
+            question="What belongs to the old scope?",
+            blocking_work_ids=[item.id],
+            blocking_work_bindings={item.id: self._question_binding(item)},
+        )
+        self.store.create_question(old_question)
+        self.store.answer_question(old_question.id, "STALE answer")
+        changed = self.store.update_work(
+            item.id,
+            {"description": "The execution scope is now different"},
+            expected_version=item.version,
+        )
+        current = self._reauthorize(
+            changed.id,
+            reason="Authorize the replacement scope",
+        )
+        current_question = UserQuestion(
+            question="What belongs to the current scope?",
+            blocking_work_ids=[item.id],
+            blocking_work_bindings={item.id: self._question_binding(current)},
+        )
+        self.store.create_question(current_question)
+        self.store.answer_question(current_question.id, "CURRENT answer")
+
+        comment = self._dispatcher()._resume_comment(
+            current,
+            "run_current",
+            "[resume marker]",
+        )
+
+        self.assertIn("CURRENT answer", comment)
+        self.assertNotIn("STALE answer", comment)
 
     def test_failed_verification_retry_gets_distinct_card_and_event(self) -> None:
         item = self._ready("Retry a corrected implementation")

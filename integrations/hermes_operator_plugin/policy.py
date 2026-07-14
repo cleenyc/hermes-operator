@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -231,7 +232,7 @@ class TaskScopedPolicyGuard:
                 )
             )
 
-POLICY_VERSION = "5.0.0"
+POLICY_VERSION = "6.0.0"
 POLICY_MODE = "default_deny"
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -274,6 +275,7 @@ _EXPLICITLY_ALLOWED_TOOLS = {
     "clarify",
     "operator_next_work",
     "operator_open_questions",
+    "operator_authorization_scope",
     "operator_create_work",
     "operator_ingest_inbound",
     "operator_update_work",
@@ -298,6 +300,7 @@ _EXPLICITLY_ALLOWED_TOOLS = {
 _HUMAN_CONFIRMATION_TOOLS = {
     "operator_answer_question": "question_id",
     "operator_authorize_work": "work_id",
+    "operator_resolve_reminder": "work_id",
 }
 
 _READ_ONLY_KANBAN_TOOLS = {
@@ -950,28 +953,23 @@ def _required_capability(tool_name: str, args: Mapping[str, Any]) -> str:
 
 
 def _current_task_identity(hook_task_id: str) -> tuple[str, str]:
-    """Return a managed-worker identity only when Hermes marks the process as one.
+    """Return the dispatcher-owned managed-worker identity when present.
 
     Current Hermes assigns every ordinary interactive and Cron turn an ephemeral UUID
     and forwards it as the hook ``task_id``.  That value isolates the turn but does not
     make it an Operator-managed Kanban worker.  The dispatcher-controlled
-    ``HERMES_KANBAN_TASK`` environment marker is authoritative.  When it exists, the
-    hook identity must be the same valid task id; when it does not, the turn is native
+    ``HERMES_KANBAN_TASK`` environment marker is authoritative. Quiet Kanban workers
+    also receive a fresh turn UUID, so equality with the hook identity would reject
+    every real managed worker. When the marker does not exist, the turn is native
     regardless of the ordinary Hermes UUID.
     """
 
+    del hook_task_id
     environment_identity = os.getenv("HERMES_KANBAN_TASK", "").strip()
     if not environment_identity:
         return "", ""
     if not _TASK_ID_PATTERN.fullmatch(environment_identity):
         return "", "HERMES_KANBAN_TASK is not a valid Hermes task identity"
-    if not isinstance(hook_task_id, str):
-        return "", "pre_tool_call task_id must be a string for a managed worker"
-    hook_identity = hook_task_id.strip()
-    if not _TASK_ID_PATTERN.fullmatch(hook_identity):
-        return "", "pre_tool_call task_id is not a valid Hermes task identity"
-    if hook_identity != environment_identity:
-        return "", "pre_tool_call task_id does not match HERMES_KANBAN_TASK"
     return environment_identity, ""
 
 
@@ -1088,41 +1086,54 @@ def _kanban_completion_artifact_error(args: Mapping[str, Any]) -> str:
             if normalized in {"artifact", "artifacts", "attachment", "attachments"}:
                 return "Operator-managed completion metadata cannot attach or deliver files"
 
-    # Newer Hermes hosts discover existing files named in completion prose after
-    # pre_tool_call hooks have returned, then promote them into notification
-    # attachments.  Block the exact dispatcher-provided workspace prefix here so
-    # that post-hook transformation cannot bypass the managed-card boundary.  We
-    # intentionally do not offer an allow flag: the hook receives no authenticated
+    # Newer Hermes hosts discover existing absolute/home-relative files named in
+    # completion prose after pre_tool_call hooks have returned, then promote them
+    # into notification attachments. That promotion is not confined to the worker
+    # workspace: an existing file anywhere the Hermes process can read may be sent.
+    # Reject every path shape the Gateway can promote, without consulting existence
+    # or containment, so ``~``, ``..``, symlinks, and paths written outside the
+    # workspace cannot cross the approval boundary.
+    # We intentionally do not offer an allow flag: the hook receives no authenticated
     # notification-recipient identity and therefore cannot prove a configured sink
-    # is the actual destination.  Files can still be delivered from an interactive
+    # is the actual destination. Files can still be delivered from an interactive
     # Hermes turn after native approval.
     prose = "\n".join(
         value for key in ("summary", "result")
         if isinstance((value := args.get(key)), str) and value
     )
-    if prose:
-        workspace_candidates: list[str] = []
-        workspace = os.getenv("HERMES_KANBAN_WORKSPACE", "").strip()
-        if workspace:
-            workspace_candidates.append(workspace)
-        workspaces_root = os.getenv("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
-        task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
-        if workspaces_root and task_id:
-            workspace_candidates.append(str(Path(workspaces_root) / task_id))
-        for candidate in workspace_candidates:
-            path = Path(candidate).expanduser()
-            if not path.is_absolute():
-                continue
-            prefix = str(path).rstrip("/\\")
-            if prefix and re.search(
-                re.escape(prefix) + r"(?:[/\\][^\s`\"'<>]+)", prose
-            ):
-                return (
-                    "Operator-managed completion prose cannot name files in the "
-                    "Hermes worker workspace because Hermes may promote them to "
-                    "notification attachments"
-                )
+    if prose and _prose_path_candidates(prose):
+        return (
+            "Operator-managed completion prose cannot name absolute or home-relative "
+            "local paths because Hermes may promote them to notification attachments"
+        )
     return ""
+
+
+_PROSE_PATH_PATTERN = re.compile(
+    r"(?P<quoted>['\"](?P<quoted_path>(?:~[/\\]|/|[A-Za-z]:[/\\])[^'\"\r\n]+)['\"])"
+    r"|(?<![A-Za-z0-9_:/\\])"
+    r"(?P<bare>(?:~[/\\]|/|[A-Za-z]:[/\\])[^\s`'\"<>]+)"
+)
+_PROSE_MEDIA_PATH_ANCHOR_PATTERN = re.compile(
+    r"(?i:\bMEDIA)\s*:\s*[`'\"]?(?:~[/\\]|/|[A-Za-z]:[/\\])"
+)
+_PATH_TRAILING_PUNCTUATION = "`\"',.;:)}]"
+
+
+def _prose_path_candidates(prose: str) -> tuple[str, ...]:
+    """Extract path shapes Hermes can later promote into native attachments."""
+
+    candidates: list[str] = []
+    candidates.extend(
+        match.group(0)
+        for match in _PROSE_MEDIA_PATH_ANCHOR_PATTERN.finditer(prose)
+    )
+    for match in _PROSE_PATH_PATTERN.finditer(prose):
+        raw = match.group("quoted_path") or match.group("bare") or ""
+        candidate = raw.strip().rstrip(_PATH_TRAILING_PUNCTUATION)
+        if candidate:
+            candidates.append(candidate)
+    return tuple(candidates)
 
 
 def _human_confirmation(
@@ -1172,8 +1183,85 @@ def _human_confirmation(
             ),
             "rule_key": f"{tool_name}:{identity.strip()}:{answer_digest[:16]}",
         }
+    if tool_name == "operator_resolve_reminder":
+        expected_version = args.get("expected_version")
+        action = args.get("action")
+        until = args.get("until")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+            or action not in {"snooze", "acknowledge", "complete"}
+        ):
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "reminder confirmation requires an exact version and lifecycle action",
+                )
+            ) or {}
+        if action == "snooze":
+            if not isinstance(until, str) or not until.strip() or len(until) > 128:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "snooze confirmation requires one bounded timezone-aware until timestamp",
+                    )
+                ) or {}
+            try:
+                parsed_until = datetime.fromisoformat(until)
+            except ValueError:
+                parsed_until = None
+            if parsed_until is None or parsed_until.tzinfo is None:
+                return _blocked_response(
+                    PolicyDecision(
+                        True,
+                        "authorization",
+                        "snooze confirmation requires one bounded timezone-aware until timestamp",
+                    )
+                ) or {}
+            normalized_until: str | None = until
+        elif until is not None:
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "until is accepted only for an exact snooze confirmation",
+                )
+            ) or {}
+        else:
+            normalized_until = None
+        reminder_shape = {
+            "action": action,
+            "expected_version": expected_version,
+            "until": normalized_until,
+            "work_id": identity.strip(),
+        }
+        shape_digest = hashlib.sha256(
+            json.dumps(
+                reminder_shape,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        until_suffix = f" until {normalized_until}" if normalized_until else ""
+        return {
+            "action": "approve",
+            "message": (
+                "Confirm this exact Operator reminder action: "
+                f"{action} {identity.strip()} version {expected_version}{until_suffix}"
+            ),
+            "rule_key": (
+                f"{tool_name}:{identity.strip()}:v{expected_version}:"
+                f"{shape_digest[:16]}"
+            ),
+        }
     if tool_name == "operator_authorize_work":
         expected_version = args.get("expected_version")
+        expected_scope_revision = args.get("expected_scope_revision")
+        expected_scope_digest = args.get("expected_scope_digest")
         profile = args.get("profile")
         skills = args.get("skills")
         goal_mode = args.get("goal_mode")
@@ -1181,6 +1269,11 @@ def _human_confirmation(
             not isinstance(expected_version, int)
             or isinstance(expected_version, bool)
             or expected_version < 1
+            or not isinstance(expected_scope_revision, int)
+            or isinstance(expected_scope_revision, bool)
+            or expected_scope_revision < 1
+            or not isinstance(expected_scope_digest, str)
+            or not _CONTRACT_DIGEST_PATTERN.fullmatch(expected_scope_digest)
             or (
                 profile is not None
                 and (
@@ -1208,12 +1301,14 @@ def _human_confirmation(
                 PolicyDecision(
                     True,
                     "authorization",
-                    "work authorization requires an exact positive version and valid execution parameters",
+                    "work authorization requires an exact version, scope revision, scope digest, and valid execution parameters",
                 )
             ) or {}
         execution_shape = {
             "goal_mode": goal_mode,
             "profile": profile.strip() if isinstance(profile, str) else None,
+            "scope_digest": expected_scope_digest,
+            "scope_revision": expected_scope_revision,
             "skills": [value.strip() for value in skills] if isinstance(skills, list) else None,
             "work_id": identity.strip(),
             "work_version": expected_version,
@@ -1238,10 +1333,12 @@ def _human_confirmation(
             "action": "approve",
             "message": (
                 "Confirm that you want Hermes to authorize this exact Operator work "
-                f"scope: {identity.strip()} version {expected_version}{suffix}"
+                f"scope: {identity.strip()} version {expected_version}, scope revision "
+                f"{expected_scope_revision}, digest {expected_scope_digest}{suffix}"
             ),
             "rule_key": (
                 f"{tool_name}:{identity.strip()}:v{expected_version}:"
+                f"r{expected_scope_revision}:{expected_scope_digest}:"
                 f"{shape_digest[:16]}"
             ),
         }

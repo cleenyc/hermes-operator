@@ -25,13 +25,15 @@ hermes-operator --config operator.toml native-jobs install
 
 ## Scope and policy boundary
 
-The plugin exposes eleven scoped tools:
+The plugin exposes thirteen scoped tools:
 
 - Reads: `operator_status`, `operator_next_work`, `operator_open_questions`,
-  `operator_due_reminders`, and `operator_diagnostics`.
+  `operator_due_reminders`, `operator_authorization_scope`, and
+  `operator_diagnostics`.
 - Private delivery: `operator_claim_attention`.
 - Conversational management: `operator_create_work`, `operator_answer_question`,
-  `operator_authorize_work`, and `operator_update_work`.
+  `operator_authorize_work`, `operator_update_work`, and
+  `operator_resolve_reminder`.
 - Provider evidence: `operator_ingest_inbound`.
 
 These tools do not send messages, publish, deploy, purchase, issue approval grants, or
@@ -98,6 +100,13 @@ no-egress boundary. Deployments that need a stronger boundary can add operating-
 container filesystem scoping, credential isolation, and network egress controls. The
 managed-card guard still blocks direct network, publication, destructive, and shell-escape forms.
 
+Managed `kanban_complete` calls also reject explicit artifact fields and every absolute,
+home-relative, Windows drive-letter, or `MEDIA:` local path in completion prose. The
+check does not trust workspace containment or file existence because Hermes Gateway can
+promote any readable matching path, including an outside-workspace file, after the hook
+returns. Relative paths and URLs remain ordinary text. Use an unmanaged interactive turn
+and Hermes-native approval when a file must be delivered.
+
 The injected context contains an explicit statement that priorities do not authorize
 external side effects. If the control plane is unavailable, context injection returns
 nothing and Hermes continues normally. Only context availability is fail-open. The
@@ -147,13 +156,15 @@ required lane. A separate advisory lane runs the same contracts against current 
 diagnostic-only until they are pilot-tested or added to the required compatibility lane.
 
 The plugin records a separate `compatibility_observed` diagnostic and exposes
-`operator_diagnostics`. It reports host surfaces, active profile, hook position, and
-detected delegation mode without attempting to reorder Hermes plugins and hooks. A known
-active-profile mismatch, or known first-valid hook semantics with the Operator guard not
-first, disables bridge tools and policy attestation while leaving the local guard installed
-in fail-closed policy-only mode. Unknown internals remain visible diagnostics. Unsupported
-optional hooks reduce observation only; rejection of the required pre-tool hook disables
-the bridge for managed execution.
+`operator_diagnostics`. It reports host surfaces, active profile, hook position, managed
+worker identity semantics, and detected delegation mode without attempting to reorder
+Hermes plugins and hooks. Bridge activation requires positive evidence for the active
+profile, first-valid directive behavior, first-position Operator guard, and dispatcher
+ownership of `HERMES_KANBAN_TASK`. Unknown or incompatible required semantics leave the
+local guard installed in fail-closed policy-only mode and publish a best-effort negative
+policy observation. The installed Hermes version remains diagnostic rather than an exact
+activation lock. Unsupported optional hooks reduce observation only; rejection of the
+required pre-tool hook disables the bridge for managed execution.
 
 ## HTTP contract
 
@@ -168,6 +179,7 @@ The plugin reads these endpoints:
 | `GET` | `/v1/hermes/attention?limit=N` | Read-only reminder and question preview |
 | `GET` | `/v1/hermes/reminders?limit=N` | Read-only reminder preview |
 | `GET` | `/v1/hermes/execution-contract?task_id=ID` | Exact live task capabilities for the guard |
+| `GET` | `/v1/hermes/work/{id}/authorization-scope` | Exact work and executor preview for authorization |
 | `POST` | `/v1/hermes/attention/claim` | Atomic private Cron delivery claim |
 | `POST` | `/v1/hermes/work` | Capture reversible work or a reminder |
 | `POST` | `/v1/hermes/work/{id}/update` | Apply a version-fenced work update |
@@ -188,6 +200,12 @@ surfaces continues only when the endpoint returns an authenticated-ingress
 acknowledgement containing a nonempty `event_id`, a Boolean `created` value, and
 `"trust_level": "authenticated_untrusted"`.
 
+If startup or a later compatibility check proves that required guard semantics
+are unavailable, the plugin sends an authenticated `policy.revoked` envelope
+with `guard_active: false` and a bounded reason. The core immediately replaces
+that profile's cached attestation, so managed dispatch stops without waiting
+for attestation expiry.
+
 The request envelope is:
 
 ```json
@@ -199,8 +217,8 @@ The request envelope is:
   "occurred_at": "2026-07-13T22:30:00+00:00",
   "payload": {
     "profile": "operator",
-    "plugin_version": "1.4.0",
-    "policy_version": "5.0.0",
+    "plugin_version": "1.5.0",
+    "policy_version": "6.0.0",
     "policy_digest": "<64 lowercase SHA-256 hex characters>",
     "guard_active": true,
     "policy_mode": "default_deny",
@@ -312,13 +330,17 @@ validated, the guard must post exactly `task_id` and `requested_children`, and t
 atomically binds one claim to the canonical run. The current supported mode does not use
 that path.
 
-When a card reports blocked, the control plane closes that run attempt and releases its
-global compute slot. After a linked operator answer and fresh authorization, it reserves
-a new attempt, comments bounded answer context onto the same card, and calls `unblock`.
-The worker itself cannot unblock the card. If independent verification fails after a
+When a card reports blocked, the control plane accepts the event only when the card, run,
+attempt, and status match the latest canonical blocked run, then closes that attempt and
+releases its global compute slot. After a linked operator answer and fresh authorization,
+it reserves a new attempt. It comments currently bound answer context and calls `unblock`
+only when the old card's immutable contract still matches the new authorization; changed
+scope creates a new card. The worker itself cannot unblock the card. If independent
+verification fails after a
 completion, a bounded correction uses a new run and a new Hermes card under the remaining
-`max_execution_attempts` budget. These two paths deliberately differ: missing context
-resumes the same card, while failed evidence starts a separately auditable card.
+`max_execution_attempts` budget. These two paths deliberately differ: missing context may
+resume an unchanged card, while changed scope or failed evidence starts a separately
+auditable card.
 
 If canonical work becomes terminal or its authorization is invalid while Hermes compute
 is still live, the core uses its separate authenticated Kanban control token to terminate
@@ -367,7 +389,7 @@ The plugin is packaged independently from the control plane. A release wheel can
 
 ```bash
 export HERMES_PLUGIN_ROOT="${HERMES_HOME:-$HOME/.hermes}/plugins"
-export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.4.0-py3-none-any.whl"
+export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.5.0-py3-none-any.whl"
 export PLUGIN_STAGE="$(mktemp -d)"
 python -m pip install --no-deps --target "$PLUGIN_STAGE" "$PLUGIN_WHEEL"
 install -d "$HERMES_PLUGIN_ROOT"
@@ -400,7 +422,7 @@ hermes plugins list
 In a Hermes conversation, use `/operator status`, `/operator next`, `/operator questions`,
 `/operator reminders`, `/operator add`, `/operator remind`, `/operator answer`,
 `/operator authorize`, `/operator done`, `/operator snooze`, or `/operator diagnostics`.
-The model can also call the eleven registered tools. Authority-bearing tool calls use
+The model can also call the thirteen registered tools. Authority-bearing tool calls use
 Hermes-native confirmation where described above. The bundled
 skill is namespaced as `hermes-operator:operator-workflow` when the running Hermes build
 supports `ctx.register_skill()`.
@@ -520,7 +542,8 @@ Then test against a running control plane:
 8. Dispatch several independent canonical WorkItems. Confirm their cards run in parallel
    without exceeding `operator.max_parallel_work`.
 9. On an Operator-managed card, confirm current top-level `delegate_task`, native Kanban
-   fanout, and artifact-bearing completion delivery fail closed. In an unmanaged
+   fanout, explicit artifact fields, absolute/home/Windows paths, and `MEDIA:` completion
+   delivery fail closed, including an outside-workspace file. In an unmanaged
    interactive session, confirm delegation retains Hermes-native behavior.
 10. Confirm authenticated lifecycle events that the host supplies appear in the
    control-plane event log with stable task and child identities.

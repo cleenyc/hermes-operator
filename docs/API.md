@@ -50,6 +50,7 @@ Use TLS termination or a private authenticated network beyond loopback. The buil
 | `GET` | `/v1/hermes/attention` | Bridge | Read-only preview of due reminders and pending questions |
 | `GET` | `/v1/hermes/reminders` | Bridge | Read-only preview of due reminders |
 | `GET` | `/v1/hermes/execution-contract?task_id=ID` | Bridge | Exact live capabilities for the current Hermes task |
+| `GET` | `/v1/hermes/work/{id}/authorization-scope` | Bridge | Exact work and executor preview for authorization |
 | `POST` | `/v1/hermes/delegation-claim` | Bridge | Fail-closed compatibility claim for a host with proven foreground delegation |
 | `POST` | `/v1/hermes/attention/claim` | Bridge | Atomically claim attention for one private native-Cron delivery |
 | `POST` | `/v1/hermes/work` | Bridge | Capture operator-authorized local work, including reminders |
@@ -165,6 +166,7 @@ GET /v1/hermes/status
 GET /v1/hermes/attention
 GET /v1/hermes/reminders
 GET /v1/hermes/execution-contract?task_id=ID
+GET /v1/hermes/work/{id}/authorization-scope
 POST /v1/hermes/attention/claim
 POST /v1/hermes/work
 POST /v1/hermes/work/{id}/update
@@ -175,13 +177,21 @@ POST /v1/hermes/inbound
 POST /v1/hermes/delegation-claim
 ```
 
-`POST /v1/hermes/work/{id}/authorize` is an optimistic, exact-scope
-authorization. The request requires the work version the user reviewed and
-may name the exact executor shape:
+`GET /v1/hermes/work/{id}/authorization-scope` is the required read step before
+interactive authorization. Optional `profile`, repeated or comma-separated
+`skill`, and Boolean `goal_mode` query parameters select the executor shape.
+The response contains the bounded `scope` document that must be shown to the
+operator, plus `work_version`, `authorization_scope_revision`, and
+`authorization_scope_digest`. `authorizable` is false for terminal work.
+
+`POST /v1/hermes/work/{id}/authorize` must echo all three displayed fences and
+the same executor shape:
 
 ```json
 {
   "expected_version": 7,
+  "expected_scope_revision": 3,
+  "expected_scope_digest": "64-lowercase-hex-characters",
   "reason": "Approved this bounded implementation",
   "profile": "operator",
   "skills": ["kanban-orchestrator"],
@@ -189,19 +199,19 @@ may name the exact executor shape:
 }
 ```
 
-Omitted executor fields use the configured work and Hermes defaults. In one
-immediate SQLite transaction, the API verifies `expected_version`, computes a
-scope digest over the work identity, title, description, hierarchy, criteria,
-schedule, recurrence, verifier contract, profile, effective skills, and goal
-mode, then enqueues the authorization event. A concurrent mutation returns
-`409 state_conflict`. The response includes `work_version`,
-`authorization_scope_revision`, and `authorization_scope_digest` so the exact
-captured scope is auditable.
+Omitted executor fields use the configured work and Hermes defaults in both
+steps. In one immediate SQLite transaction, the API verifies the exact work
+version, scope revision, and caller-supplied digest against the live work and
+submitted executor shape before it enqueues the authorization event. A changed
+dependency edge, work scope, lifecycle generation, or executor shape returns
+`409 state_conflict`. Terminal work is never authorizable.
 
-Priority rescoring and runtime status changes do not alter the authorization
-scope. Scope-bearing work changes and dependency graph changes advance a
-dedicated scope revision, revoke existing execution governance, and invalidate
-the prior digest.
+Priority rescoring and nonterminal runtime status changes do not alter the
+authorization scope. Scope-bearing work changes and dependency graph changes
+advance both the ordinary work version and dedicated scope revision, revoke
+existing execution governance, and invalidate the prior digest. Entering a
+terminal state does the same. Reopening terminal work starts a fresh execution
+generation with no prior card, completion evidence, or execution authority.
 
 Ordinary lifecycle observations use the generic envelope and remain `authenticated_untrusted`.
 
@@ -210,8 +220,8 @@ An event whose `event_type` is `policy.attested` has a stricter fixed contract. 
 ```json
 {
   "profile": "operator",
-  "plugin_version": "1.4.0",
-  "policy_version": "5.0.0",
+  "plugin_version": "1.5.0",
+  "policy_version": "6.0.0",
   "policy_digest": "64-lowercase-hex-characters",
   "guard_active": true,
   "policy_mode": "default_deny",
@@ -220,6 +230,13 @@ An event whose `event_type` is `policy.attested` has a stricter fixed contract. 
 ```
 
 The API validates the exact identity digest and UTC timestamp before atomically storing monotonic profile attestation state and an audit record. Each explicitly configured Hermes profile maintains independent evidence, so multiple attested profiles are supported. Attestations are not inserted into the planner event queue and do not wake or invoke the model. A replay or older timestamp cannot replace newer evidence. Core dispatch later validates freshness and allowlists for the exact selected profile.
+
+`policy.revoked` uses the same fixed envelope and authenticated bridge route.
+Its payload adds a nonempty `reason`, requires `guard_active: false`, and binds
+the identity digest to `"revoked"`, profile and policy identity, timestamp, and
+reason. A newer revocation immediately replaces the cached profile state and
+blocks dispatch without waiting for its TTL. A replay or older attestation
+cannot overwrite it; a strictly newer valid attestation can restore service.
 
 `GET /v1/hermes/execution-contract` requires one bounded `task_id`. It returns `authorized: true` only when that exact task is linked to canonical running work, its consumed dispatch authorization names the same task and local run, and the current contract is still valid. The response binds the task, work, profile, contract digest, run, and explicit internal capabilities. Missing, stale, terminal, blocked, foreign, or mismatched tasks fail closed. This endpoint lets the native guard authorize task-scoped local writes, tests, builds, and any future compatible foreground delegation without exposing operator mutation authority. Current background top-level delegation remains blocked on managed cards.
 

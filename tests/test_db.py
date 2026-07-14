@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import tempfile
@@ -11,6 +12,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from hermes_operator.db import LeaseFenceLost, SQLiteStore, StateConflict
+from hermes_operator.authority import (
+    binding_matches_work,
+    execution_scope_binding,
+    execution_scope_digest,
+)
 from hermes_operator.models import (
     Event,
     EventState,
@@ -110,6 +116,7 @@ class SQLiteStoreTests(unittest.TestCase):
             prerequisite.id,
             WorkRelation.DEPENDS_ON,
         )
+        task = self.store.get_work(task.id)
 
         self.store.update_work(
             task.id,
@@ -543,6 +550,7 @@ class SQLiteStoreTests(unittest.TestCase):
         self.store.add_work_link(
             dependent.id, dependency.id, WorkRelation.DEPENDS_ON
         )
+        dependency = self.store.get_work(dependency.id)
         self.store.create_run(
             RunRecord(
                 work_item_id=dependent.id,
@@ -669,6 +677,10 @@ class SQLiteStoreTests(unittest.TestCase):
     def test_work_authorization_capture_is_atomically_version_fenced(self) -> None:
         work = WorkItem(title="Exact scope before the race")
         self.store.create_work(work)
+        displayed_digest = execution_scope_digest(
+            work,
+            profile="operator",
+        )
         barrier = threading.Barrier(2)
         outcomes: list[str] = []
 
@@ -678,6 +690,8 @@ class SQLiteStoreTests(unittest.TestCase):
                 self.store.enqueue_work_authorization(
                     work.id,
                     expected_version=work.version,
+                    expected_scope_revision=work.authorization_scope_revision,
+                    expected_scope_digest=displayed_digest,
                     profile="operator",
                     skills=[],
                     default_skills=[],
@@ -733,6 +747,275 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertIn("authorization_conflict", outcomes)
             self.assertIsNone(event)
 
+    def test_terminal_transition_revokes_authority_and_reopen_starts_fresh(self) -> None:
+        work = WorkItem(
+            title="Cancelable managed work",
+            status=WorkStatus.READY,
+            execution_mode=ExecutionMode.HERMES,
+            hermes_task_id="task-old",
+            metadata={
+                "governance": {"execution_authorized": True},
+                "dispatch_request": {"profile": "operator", "skills": []},
+                "dispatch_authorization": {"work_id": "stale"},
+                "hermes": {"completion_run_id": "run-old"},
+                "last_verification": {"verdict": "passed"},
+            },
+        )
+        self.store.create_work(work)
+        old_binding = execution_scope_binding(work, profile="operator")
+
+        cancelled = self.store.update_work(
+            work.id,
+            {"status": WorkStatus.CANCELLED.value},
+            expected_version=work.version,
+        )
+
+        self.assertEqual(cancelled.version, work.version + 1)
+        self.assertEqual(
+            cancelled.authorization_scope_revision,
+            work.authorization_scope_revision + 1,
+        )
+        self.assertFalse(cancelled.metadata["governance"]["execution_authorized"])
+        self.assertNotIn("dispatch_request", cancelled.metadata)
+        self.assertNotIn("dispatch_authorization", cancelled.metadata)
+        self.assertFalse(binding_matches_work(old_binding, cancelled))
+        with self.assertRaisesRegex(StateConflict, "Terminal work"):
+            self.store.enqueue_work_authorization(
+                work.id,
+                expected_version=cancelled.version,
+                expected_scope_revision=cancelled.authorization_scope_revision,
+                expected_scope_digest=execution_scope_digest(
+                    cancelled, profile="operator"
+                ),
+                profile="operator",
+                skills=[],
+                default_skills=[],
+                goal_mode=False,
+                reason="Must not authorize terminal work",
+            )
+
+        reopened = self.store.update_work(
+            work.id,
+            {"status": WorkStatus.TRIAGE.value},
+            expected_version=cancelled.version,
+        )
+
+        self.assertEqual(
+            reopened.authorization_scope_revision,
+            cancelled.authorization_scope_revision + 1,
+        )
+        self.assertEqual(reopened.execution_mode, ExecutionMode.NONE)
+        self.assertIsNone(reopened.hermes_task_id)
+        self.assertNotIn("hermes", reopened.metadata)
+        self.assertNotIn("last_verification", reopened.metadata)
+        self.assertFalse(reopened.metadata["governance"]["execution_authorized"])
+
+    def test_terminal_scope_edits_require_reopening_in_the_same_mutation(self) -> None:
+        work = WorkItem(
+            title="Archived immutable scope",
+            description="Original scope",
+            status=WorkStatus.ARCHIVED,
+            assignee="operator",
+        )
+        self.store.create_work(work)
+
+        for changes in (
+            {"description": "Silent terminal rewrite"},
+            {"assignee": "other-profile"},
+            {"execution_mode": ExecutionMode.HERMES.value},
+            {"acceptance_criteria": ["A rewritten terminal outcome"]},
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                StateConflict, "only while reopening"
+            ):
+                self.store.update_work(
+                    work.id,
+                    changes,
+                    expected_version=work.version,
+                )
+
+        unchanged = self.store.get_work(work.id)
+        self.assertEqual(unchanged.description, "Original scope")
+        self.assertEqual(unchanged.assignee, "operator")
+        self.assertEqual(unchanged.version, work.version)
+
+        reopened = self.store.update_work(
+            work.id,
+            {
+                "status": WorkStatus.TRIAGE.value,
+                "description": "Fresh reopened scope",
+                "assignee": "other-profile",
+            },
+            expected_version=work.version,
+            allow_transition_override=True,
+        )
+
+        self.assertEqual(reopened.status, WorkStatus.TRIAGE)
+        self.assertEqual(reopened.description, "Fresh reopened scope")
+        self.assertEqual(reopened.assignee, "other-profile")
+        self.assertEqual(
+            reopened.authorization_scope_revision,
+            work.authorization_scope_revision + 1,
+        )
+
+    def test_executor_changes_and_explicit_disable_invalidate_authority(self) -> None:
+        cases = (
+            (
+                "assignee",
+                {"assignee": "other-profile"},
+                "execution_assignee_changed",
+            ),
+            (
+                "disable",
+                {"execution_mode": ExecutionMode.NONE.value},
+                "execution_disabled",
+            ),
+        )
+        for label, changes, expected_reason in cases:
+            with self.subTest(case=label):
+                work = WorkItem(
+                    title=f"Executor scope {label}",
+                    status=WorkStatus.READY,
+                    assignee="operator",
+                    execution_mode=ExecutionMode.HERMES,
+                    metadata={
+                        "governance": {"execution_authorized": True},
+                        "dispatch_request": {"profile": "operator"},
+                        "dispatch_authorization": {"contract_digest": "a" * 64},
+                    },
+                )
+                self.store.create_work(work)
+
+                changed = self.store.update_work(
+                    work.id,
+                    changes,
+                    expected_version=work.version,
+                )
+
+                self.assertEqual(
+                    changed.authorization_scope_revision,
+                    work.authorization_scope_revision + 1,
+                )
+                self.assertFalse(
+                    changed.metadata["governance"]["execution_authorized"]
+                )
+                self.assertNotIn("dispatch_request", changed.metadata)
+                self.assertNotIn("dispatch_authorization", changed.metadata)
+                self.assertEqual(
+                    changed.metadata["authorization_invalidated"]["reason"],
+                    expected_reason,
+                )
+
+    def test_explicit_authority_invalidation_advances_scope_revision(self) -> None:
+        work = WorkItem(
+            title="Blocked lifecycle authority",
+            status=WorkStatus.BLOCKED,
+            execution_mode=ExecutionMode.HERMES,
+            hermes_task_id="task-blocked",
+            metadata={
+                "governance": {"execution_authorized": True},
+                "dispatch_request": {"profile": "operator"},
+                "dispatch_authorization": {"contract_digest": "a" * 64},
+            },
+        )
+        self.store.create_work(work)
+
+        invalidated = self.store.update_work(
+            work.id,
+            {"status": WorkStatus.WAITING_INPUT.value},
+            expected_version=work.version,
+            allow_transition_override=True,
+            invalidate_authority=True,
+            authority_invalidation_reason=(
+                "worker_blocked_requires_fresh_authorization"
+            ),
+        )
+
+        self.assertEqual(invalidated.status, WorkStatus.WAITING_INPUT)
+        self.assertEqual(
+            invalidated.authorization_scope_revision,
+            work.authorization_scope_revision + 1,
+        )
+        self.assertFalse(
+            invalidated.metadata["governance"]["execution_authorized"]
+        )
+        self.assertNotIn("dispatch_request", invalidated.metadata)
+        self.assertNotIn("dispatch_authorization", invalidated.metadata)
+        self.assertEqual(
+            invalidated.metadata["authorization_invalidated"]["reason"],
+            "worker_blocked_requires_fresh_authorization",
+        )
+
+    def test_reopen_cannot_smuggle_execution_authority(self) -> None:
+        work = WorkItem(title="Archived work", status=WorkStatus.ARCHIVED)
+        self.store.create_work(work)
+        metadata = dict(work.metadata)
+        metadata["governance"] = {"execution_authorized": True}
+        metadata["dispatch_request"] = {"profile": "operator"}
+
+        with self.assertRaisesRegex(StateConflict, "reauthorized"):
+            self.store.update_work(
+                work.id,
+                {
+                    "status": WorkStatus.TRIAGE.value,
+                    "execution_mode": ExecutionMode.HERMES.value,
+                    "metadata": metadata,
+                },
+                expected_version=work.version,
+            )
+
+        current = self.store.get_work(work.id)
+        self.assertEqual(current.status, WorkStatus.ARCHIVED)
+        self.assertEqual(current.version, work.version)
+
+    def test_dependency_graph_mutation_advances_both_version_fences(self) -> None:
+        dependent = WorkItem(
+            title="Dependent",
+            metadata={"governance": {"execution_authorized": True}},
+        )
+        dependency = WorkItem(
+            title="Dependency",
+            metadata={"governance": {"execution_authorized": True}},
+        )
+        self.store.create_work(dependent)
+        self.store.create_work(dependency)
+        displayed_digest = execution_scope_digest(
+            dependent, profile="operator"
+        )
+
+        self.store.add_work_link(
+            dependent.id,
+            dependency.id,
+            WorkRelation.DEPENDS_ON,
+            expected_from_version=dependent.version,
+            expected_to_version=dependency.version,
+        )
+
+        changed_dependent = self.store.get_work(dependent.id)
+        changed_dependency = self.store.get_work(dependency.id)
+        for before, after in (
+            (dependent, changed_dependent),
+            (dependency, changed_dependency),
+        ):
+            self.assertEqual(after.version, before.version + 1)
+            self.assertEqual(
+                after.authorization_scope_revision,
+                before.authorization_scope_revision + 1,
+            )
+            self.assertFalse(after.metadata["governance"]["execution_authorized"])
+        with self.assertRaises(StateConflict):
+            self.store.enqueue_work_authorization(
+                dependent.id,
+                expected_version=dependent.version,
+                expected_scope_revision=dependent.authorization_scope_revision,
+                expected_scope_digest=displayed_digest,
+                profile="operator",
+                skills=[],
+                default_skills=[],
+                goal_mode=False,
+                reason="Stale graph must not be approved",
+            )
+
     def test_duplicate_terminal_run_attempt_is_idempotent_under_concurrency(self) -> None:
         work = WorkItem(title="Terminal run")
         self.store.create_work(work)
@@ -767,6 +1050,94 @@ class SQLiteStoreTests(unittest.TestCase):
                 (work.id,),
             ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_dispatch_commit_revalidates_reserved_policy_state(self) -> None:
+        state_key = "hermes.policy_attestation:operator"
+        original_state = {
+            "profile": "operator",
+            "guard_active": True,
+            "policy_digest": "a" * 64,
+        }
+        self.store.set_state(state_key, original_state)
+        with self.store.connection() as connection:
+            raw_state = connection.execute(
+                "SELECT value_json FROM system_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()["value_json"]
+        state_digest = hashlib.sha256(
+            str(raw_state).encode("utf-8")
+        ).hexdigest()
+        contract_digest = "b" * 64
+        work = WorkItem(
+            title="Policy-bound dispatch commit",
+            status=WorkStatus.READY,
+            execution_mode=ExecutionMode.HERMES,
+            metadata={
+                "governance": {"execution_authorized": True},
+                "dispatch_request": {"profile": "operator", "skills": []},
+                "dispatch_authorization": {
+                    "contract_digest": contract_digest,
+                },
+            },
+        )
+        self.store.create_work(work)
+        reservation = self.store.reserve_run_slot(
+            work.id,
+            runner="hermes-kanban",
+            max_active=1,
+            stale_queue_seconds=60,
+            expected_work_version=work.version,
+            contract_digest=contract_digest,
+            required_state_key=state_key,
+            required_state_digest=state_digest,
+        )
+        assert reservation is not None
+
+        self.store.set_state(state_key, {**original_state, "guard_active": False})
+        with self.assertRaisesRegex(StateConflict, "policy state changed"):
+            self.store.commit_dispatch_reservation(
+                str(reservation["id"]),
+                work.id,
+                expected_work_version=work.version,
+                contract_digest=contract_digest,
+                external_run_id="task-policy-bound",
+                metadata=work.metadata,
+                result={"dispatch": "created"},
+            )
+        self.assertEqual(
+            self.store.get_run(str(reservation["id"]))["status"], "queued"
+        )
+        self.assertEqual(self.store.get_work(work.id).status, WorkStatus.READY)
+
+        with self.store.connection() as connection:
+            connection.execute(
+                "DELETE FROM system_state WHERE key = ?", (state_key,)
+            )
+        with self.assertRaisesRegex(StateConflict, "policy state changed"):
+            self.store.commit_dispatch_reservation(
+                str(reservation["id"]),
+                work.id,
+                expected_work_version=work.version,
+                contract_digest=contract_digest,
+                external_run_id="task-policy-bound",
+                metadata=work.metadata,
+                result={"dispatch": "created"},
+            )
+
+        self.store.set_state(state_key, original_state)
+        committed = self.store.commit_dispatch_reservation(
+            str(reservation["id"]),
+            work.id,
+            expected_work_version=work.version,
+            contract_digest=contract_digest,
+            external_run_id="task-policy-bound",
+            metadata=work.metadata,
+            result={"dispatch": "created"},
+        )
+        self.assertEqual(committed.status, WorkStatus.RUNNING)
+        self.assertEqual(
+            self.store.get_run(str(reservation["id"]))["status"], "running"
+        )
 
     def test_control_plane_lease_allows_only_one_live_owner(self) -> None:
         first_epoch = self.store.acquire_service_lease(
@@ -884,6 +1255,18 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertNotIn("dispatch_request", reset.metadata)
         self.assertNotIn("dispatch_authorization", reset.metadata)
         self.assertFalse(reset.metadata["governance"]["execution_authorized"])
+        self.assertEqual(
+            reset.metadata["authorization_invalidated"]["reason"],
+            "run_resolved_by_operator",
+        )
+        self.assertEqual(
+            reset.metadata["authorization_invalidated"]["from_work_version"],
+            work.version,
+        )
+        self.assertEqual(
+            reset.authorization_scope_revision,
+            work.authorization_scope_revision + 1,
+        )
 
     def test_operator_can_resolve_uncertain_queued_reservation(self) -> None:
         work = WorkItem(

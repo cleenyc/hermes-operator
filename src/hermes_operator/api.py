@@ -14,8 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import __version__ as PACKAGE_VERSION
 from .approvals import ApprovalStateError, ExternalActionStager
-from .authority import execution_scope_binding
+from .authority import execution_scope_binding, execution_scope_document
 from .db import NotFound, SQLiteStore, StateConflict
 from .inbound import (
     InboundValidationError,
@@ -269,9 +270,135 @@ def _validated_policy_attestation(document: Mapping[str, Any]) -> dict[str, Any]
     return dict(payload)
 
 
+def _validated_policy_revocation(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate authenticated fail-closed policy evidence from the plugin."""
+
+    envelope_keys = {
+        "source",
+        "event_type",
+        "external_id",
+        "dedupe_key",
+        "occurred_at",
+        "payload",
+        "provenance",
+    }
+    if set(document) != envelope_keys:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation envelope does not match the fixed contract",
+        )
+    if document.get("source") != "hermes_plugin":
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation source is invalid",
+        )
+    if document.get("provenance") != {
+        "origin": "hermes_plugin",
+        "trust": "authenticated_untrusted",
+    }:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation provenance is invalid",
+        )
+    payload = document.get("payload")
+    required = {
+        "profile",
+        "plugin_version",
+        "policy_version",
+        "policy_digest",
+        "guard_active",
+        "policy_mode",
+        "attested_at",
+        "reason",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation payload does not match the fixed contract",
+        )
+    for key in required - {"guard_active"}:
+        if not isinstance(payload.get(key), str) or not payload[key].strip():
+            raise APIError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_policy_revocation",
+                f"Policy revocation field {key} is invalid",
+            )
+    if len(payload["reason"]) > 512:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation reason is too long",
+        )
+    if payload.get("guard_active") is not False:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation must report an inactive guard",
+        )
+    if payload.get("policy_mode") != "default_deny":
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation policy mode is invalid",
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("policy_digest", ""))):
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation digest must be lowercase SHA-256 hex",
+        )
+    try:
+        revoked_at = datetime.fromisoformat(str(payload["attested_at"]))
+    except ValueError as error:
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation timestamp is invalid",
+        ) from error
+    if (
+        revoked_at.tzinfo is None
+        or revoked_at.utcoffset() != timedelta(0)
+        or revoked_at.astimezone(UTC) > datetime.now(UTC) + timedelta(seconds=60)
+        or document.get("occurred_at") != payload["attested_at"]
+    ):
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation timestamp must be current UTC evidence",
+        )
+    identity = json.dumps(
+        [
+            "revoked",
+            payload["profile"],
+            payload["plugin_version"],
+            payload["policy_version"],
+            payload["policy_digest"],
+            payload["attested_at"],
+            payload["reason"],
+        ],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    expected_id = f"hermes-policy:{hashlib.sha256(identity).hexdigest()}"
+    if (
+        document.get("external_id") != expected_id
+        or document.get("dedupe_key") != expected_id
+    ):
+        raise APIError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_policy_revocation",
+            "Policy revocation identity digest is invalid",
+        )
+    return dict(payload)
+
+
 def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
     class OperatorAPIHandler(BaseHTTPRequestHandler):
-        server_version = "HermesOperator/0.1"
+        server_version = f"HermesOperator/{PACKAGE_VERSION}"
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:  # noqa: N802
@@ -385,6 +512,88 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                         "cycle_count": cycle_count,
                         "operational_counters": context.store.operational_counters(),
                         "as_of": utc_now(),
+                    },
+                )
+                return
+            hermes_scope_prefix = "/v1/hermes/work/"
+            hermes_scope_suffix = "/authorization-scope"
+            if path.startswith(hermes_scope_prefix) and path.endswith(
+                hermes_scope_suffix
+            ):
+                self._require_bridge()
+                work_id = unquote(
+                    path[
+                        len(hermes_scope_prefix) : -len(hermes_scope_suffix)
+                    ]
+                ).strip("/")
+                if not work_id or "/" in work_id:
+                    raise APIError(
+                        HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found"
+                    )
+                if set(query) - {"profile", "skill", "goal_mode"}:
+                    raise ValueError(
+                        "authorization scope accepts only profile, skill, and goal_mode"
+                    )
+                item = context.store.get_work(work_id)
+                profile_values = query.get("profile", [])
+                if len(profile_values) > 1:
+                    raise ValueError("profile may be supplied once")
+                profile = (
+                    profile_values[0]
+                    if profile_values
+                    else item.assignee or context.authorization_profile
+                )
+                if not isinstance(profile, str) or not profile.strip():
+                    raise ValueError("profile must be a nonempty string")
+                skills = _split_query_values(query.get("skill", []))
+                if any(not value.strip() for value in skills):
+                    raise ValueError("skill values must be nonempty strings")
+                goal_values = query.get("goal_mode", [])
+                if len(goal_values) > 1:
+                    raise ValueError("goal_mode may be supplied once")
+                if goal_values:
+                    normalized_goal = goal_values[0].strip().casefold()
+                    if normalized_goal not in {"true", "false"}:
+                        raise ValueError("goal_mode must be true or false")
+                    goal_mode = normalized_goal == "true"
+                else:
+                    goal_mode = context.authorization_goal_mode
+                binding = execution_scope_binding(
+                    item,
+                    profile=profile.strip(),
+                    skills=skills,
+                    default_skills=context.authorization_default_skills,
+                    goal_mode=goal_mode,
+                    execution_authorized=False,
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "work_id": item.id,
+                        "work_version": item.version,
+                        "status": item.status.value,
+                        "authorizable": item.status not in {
+                            WorkStatus.DONE,
+                            WorkStatus.CANCELLED,
+                            WorkStatus.ARCHIVED,
+                        },
+                        "authorization_scope_revision": (
+                            item.authorization_scope_revision
+                        ),
+                        "authorization_scope_digest": binding["scope_digest"],
+                        "profile": profile.strip(),
+                        "skills": skills,
+                        "default_skills": list(
+                            context.authorization_default_skills
+                        ),
+                        "goal_mode": goal_mode,
+                        "scope": execution_scope_document(
+                            item,
+                            profile=profile.strip(),
+                            skills=skills,
+                            default_skills=context.authorization_default_skills,
+                            goal_mode=goal_mode,
+                        ),
                     },
                 )
                 return
@@ -922,22 +1131,50 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 _, document = self._read_json(allow_empty=True)
                 allowed = {
                     "expected_version",
+                    "expected_scope_revision",
+                    "expected_scope_digest",
                     "reason",
                     "profile",
                     "skills",
                     "goal_mode",
                 }
-                if set(document) - allowed or "expected_version" not in document:
+                required = {
+                    "expected_version",
+                    "expected_scope_revision",
+                    "expected_scope_digest",
+                }
+                if set(document) - allowed or not required.issubset(document):
                     raise ValueError(
-                        "authorize requires expected_version and accepts optional reason, profile, skills, and goal_mode"
+                        "authorize requires expected_version, expected_scope_revision, and expected_scope_digest; reason, profile, skills, and goal_mode are optional"
                     )
                 expected_version = document.get("expected_version")
+                expected_scope_revision = document.get(
+                    "expected_scope_revision"
+                )
+                expected_scope_digest = document.get("expected_scope_digest")
                 if (
                     not isinstance(expected_version, int)
                     or isinstance(expected_version, bool)
                     or expected_version < 1
                 ):
                     raise ValueError("expected_version must be a positive integer")
+                if (
+                    not isinstance(expected_scope_revision, int)
+                    or isinstance(expected_scope_revision, bool)
+                    or expected_scope_revision < 1
+                ):
+                    raise ValueError(
+                        "expected_scope_revision must be a positive integer"
+                    )
+                if (
+                    not isinstance(expected_scope_digest, str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}", expected_scope_digest
+                    )
+                ):
+                    raise ValueError(
+                        "expected_scope_digest must be lowercase SHA-256 hex"
+                    )
                 reason = document.get("reason", "Explicit approval in Hermes")
                 if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
                     raise ValueError("reason must be a nonempty string of at most 2000 characters")
@@ -960,6 +1197,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 result = context.store.enqueue_work_authorization(
                     work_id,
                     expected_version=expected_version,
+                    expected_scope_revision=expected_scope_revision,
+                    expected_scope_digest=expected_scope_digest,
                     profile=profile,
                     skills=skills,
                     default_skills=context.authorization_default_skills,
@@ -1046,7 +1285,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     ):
                         code = (
                             "policy_attestation_auth_required"
-                            if document.get("event_type") == "policy.attested"
+                            if document.get("event_type")
+                            in {"policy.attested", "policy.revoked"}
                             else "hermes_bridge_auth_required"
                         )
                         raise APIError(
@@ -1087,6 +1327,7 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                         "A configured HMAC secret or operator bearer token is required",
                     )
                 attestation = None
+                revocation = None
                 if document.get("event_type") == "policy.attested":
                     if source != "hermes" or not bridge_authenticated:
                         raise APIError(
@@ -1095,6 +1336,14 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                             "Policy attestation requires the scoped Hermes bridge token",
                         )
                     attestation = _validated_policy_attestation(document)
+                elif document.get("event_type") == "policy.revoked":
+                    if source != "hermes" or not bridge_authenticated:
+                        raise APIError(
+                            HTTPStatus.UNAUTHORIZED,
+                            "policy_attestation_auth_required",
+                            "Policy revocation requires the scoped Hermes bridge token",
+                        )
+                    revocation = _validated_policy_revocation(document)
                 normalized = normalize_external_event(
                     source,
                     document,
@@ -1114,6 +1363,23 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                         HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
                         {
                             "event_id": attestation_id,
+                            "created": created,
+                            "trust_level": normalized.event.trust_level.value,
+                        },
+                    )
+                    return
+                if revocation is not None:
+                    revocation_id = str(document["external_id"])
+                    created = context.store.record_policy_revocation(
+                        str(revocation["profile"]),
+                        revocation_id,
+                        revocation,
+                        actor="hermes-bridge",
+                    )
+                    self._send_json(
+                        HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                        {
+                            "event_id": revocation_id,
                             "created": created,
                             "trust_level": normalized.event.trust_level.value,
                         },

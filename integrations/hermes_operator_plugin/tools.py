@@ -67,12 +67,26 @@ def answer_question(client: OperatorClient, args: dict, **kwargs: Any) -> str:
     )
 
 
+def authorization_scope(client: OperatorClient, args: dict, **kwargs: Any) -> str:
+    del kwargs
+    return _result(
+        lambda: client.authorization_scope(
+            args.get("work_id", ""),
+            profile=args.get("profile"),
+            skills=args.get("skills"),
+            goal_mode=args.get("goal_mode"),
+        )
+    )
+
+
 def authorize_work(client: OperatorClient, args: dict, **kwargs: Any) -> str:
     del kwargs
     return _result(
         lambda: client.authorize_work(
             args.get("work_id", ""),
             args.get("expected_version", 0),
+            args.get("expected_scope_revision", 0),
+            args.get("expected_scope_digest", ""),
             args.get("reason", ""),
             profile=args.get("profile"),
             skills=args.get("skills"),

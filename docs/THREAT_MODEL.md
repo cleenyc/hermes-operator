@@ -143,8 +143,8 @@ Controls:
 - Supervisor authorization includes pass ID and finalized plan digest.
 - Dispatcher re-reads and revalidates work after atomic reservation.
 - Reservation stores the work version and contract digest.
-- Reservation commit repeats version, state, and dependency checks.
-- A live worker contract also rechecks dependencies and the leader fence before returning internal capabilities.
+- Reservation commit repeats version, state, dependency, and exact policy-attestation-state checks.
+- A live worker contract performs every canonical work, dependency, authorization, policy, and run read inside one immediate transaction and rechecks the leader fence before returning internal capabilities.
 - Commit consumes the authorization for the exact local run and Hermes card. A verification retry can retain only the authorization root and unused bounded attempts.
 
 ### Global capacity race
@@ -156,7 +156,7 @@ Controls:
 - Capacity count and queued-run insert occur in one immediate transaction.
 - A partial unique index allows only one ordinary capacity-active row per work item across `queued`, `running`, `cancel_requested`, and `lost`.
 - Capacity counts `queued`, `running`, `cancel_requested`, `lost`, and quarantined `legacy_conflict` runs across the database.
-- A Hermes-blocked attempt is closed and releases compute capacity. A governed resume must reserve a fresh slot before unblocking the same card.
+- A Hermes-blocked attempt is closed and releases compute capacity. A governed resume must reserve a fresh slot and may unblock the same card only when its immutable scope is unchanged.
 - Queued reservations are not aged out automatically because a lost create response may hide live remote compute. Idempotent reconciliation or explicit operator resolution is required.
 
 There are no profile, project, or provider capacity pools. Deploy separate instances only with separate databases and authority domains.
@@ -188,6 +188,7 @@ Controls:
 - Filesystem hashing and fixed checks execute once outside SQLite write transactions. Their report is bound to work version, execution scope, card, run, attempt, fingerprint, canonical result, verification inputs, and artifact digests before fast transactional application.
 - An applicable deterministic failure overrides a model's passed verdict after exact binding validation.
 - Failed verification is persisted and the same evidence cannot automatically regress it to review.
+- Rejected completion evidence may mutate existing work only when the claimed work, card, and run map to one canonical identity; malformed or foreign evidence receives a separate non-executable review item.
 
 Residual risk: existence, hashing, and a successful configured check do not prove arbitrary semantic correctness. A compromised worker may also influence project-defined test scripts. Keep verifier commands deployment-owned, run them under a restricted identity, and use human review for consequential or subjective output.
 
@@ -205,6 +206,7 @@ Controls:
 - Plugin sends synchronous startup evidence and maintains a daemon heartbeat, with hooks sharing the same rate limiter.
 - Task-scoped writes, tests, builds, delegation, and Kanban lifecycle mutation require a live execution-contract lookup for the exact current task.
 - Current top-level `delegate_task` is background and non-durable, so it and native Kanban fanout are blocked on Operator-managed cards. Parallelism comes from independent canonical cards capped atomically by `max_parallel_work`.
+- Managed completion rejects explicit attachment fields and every absolute, home-relative, Windows, and `MEDIA:` local path before Hermes Gateway can promote readable files, including files outside the worker workspace.
 - Outside managed cards, interactive and Cron sessions defer to Hermes-native policy; identifiable scheduler and external Google mutations use native human confirmation.
 
 Residual risk: name and argument inspection is not complete mediation. The plugin attestation proves bridge credential possession and reports loaded source, but it is not hardware-backed attestation. Reviewed `local_test` and `local_build` command shapes can invoke project-defined scripts, which may execute arbitrary repository code.

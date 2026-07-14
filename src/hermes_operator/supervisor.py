@@ -10,10 +10,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
 from .authority import (
+    binding_execution_parameters,
     binding_matches_execution,
     binding_matches_work,
     execution_scope_binding,
     execution_scope_digest,
+    execution_scope_document,
 )
 from .config import AppConfig
 from .db import LeaseFenceLost, NotFound, SQLiteStore, StateConflict
@@ -114,6 +116,9 @@ class PassResult:
     memory_candidate_ids: list[str] = field(default_factory=list)
     verified_work_ids: list[str] = field(default_factory=list)
     action_intent_ids: list[str] = field(default_factory=list)
+    staged_action_intent_ids_by_event: dict[str, list[str]] = field(
+        default_factory=dict
+    )
     observations: list[str] = field(default_factory=list)
     event_dispositions: list[dict[str, Any]] = field(default_factory=list)
     llm_model: str = ""
@@ -132,6 +137,7 @@ class PassResult:
             "memory_candidate_ids": self.memory_candidate_ids,
             "verified_work_ids": self.verified_work_ids,
             "action_intent_ids": self.action_intent_ids,
+            "staged_action_intent_ids_by_event": self.staged_action_intent_ids_by_event,
             "observations": self.observations,
             "event_dispositions": self.event_dispositions,
             "llm_model": self.llm_model,
@@ -240,6 +246,14 @@ def _task_like_event(event: dict[str, Any]) -> bool:
     """Conservatively identify events that cannot be dismissed as FYI."""
 
     event_type = str(event.get("event_type", "")).casefold()
+    if event_type in {
+        "execution.blocked",
+        "execution.completed",
+        "execution.quarantined",
+        "execution.cancelled",
+        "execution.lost",
+    }:
+        return True
     if any(
         marker in event_type
         for marker in (
@@ -255,6 +269,36 @@ def _task_like_event(event: dict[str, Any]) -> bool:
     payload = event.get("payload", {})
     if not isinstance(payload, dict):
         return False
+
+    def nested_action_items(value: Any, *, depth: int = 0) -> bool:
+        if depth > 5:
+            return False
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                normalized = str(key).casefold().replace("-", "_")
+                if normalized in {
+                    "action_item",
+                    "action_items",
+                    "actionitems",
+                    "assigned_tasks",
+                    "follow_ups",
+                    "followups",
+                    "todos",
+                } and nested not in (None, False, "", [], {}):
+                    return True
+                if isinstance(nested, (dict, list)) and nested_action_items(
+                    nested, depth=depth + 1
+                ):
+                    return True
+        elif isinstance(value, list):
+            return any(
+                nested_action_items(nested, depth=depth + 1)
+                for nested in value[:64]
+            )
+        return False
+
+    if nested_action_items(payload):
+        return True
     if any(
         key in payload and payload.get(key) not in (None, False, "", [], {})
         for key in (
@@ -267,6 +311,14 @@ def _task_like_event(event: dict[str, Any]) -> bool:
         )
     ):
         return True
+    if event_type in {
+        "calendar.observed",
+        "calendar.synced",
+        "email.newsletter",
+        "meeting.transcript_recorded",
+        "meeting.recording_available",
+    }:
+        return False
     command_starts = (
         "prepare ",
         "review ",
@@ -282,12 +334,53 @@ def _task_like_event(event: dict[str, Any]) -> bool:
         "draft ",
         "deliver ",
         "submit ",
+        "please ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "i need you to ",
     )
-    for field in ("subject", "title", "body", "text", "summary"):
+    for field in (
+        "subject",
+        "title",
+        "body",
+        "body_text",
+        "bodytext",
+        "text",
+        "summary",
+        "description",
+        "content",
+    ):
         text = payload.get(field)
         if isinstance(text, str) and text.strip().casefold().startswith(command_starts):
             return True
     return False
+
+
+def _blocked_lifecycle_event(
+    event: dict[str, Any] | None,
+    work: WorkItem | None = None,
+) -> bool:
+    """Recognize only the authenticated canonical Hermes blocked lifecycle edge."""
+
+    if not isinstance(event, dict) or (
+        event.get("source") != "hermes"
+        or event.get("event_type") != "execution.blocked"
+        or event.get("trust_level") != TrustLevel.AUTHENTICATED_UNTRUSTED.value
+        or event.get("provenance", {}).get("adapter") != "hermes-kanban"
+    ):
+        return False
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        return False
+    if work is None:
+        return bool(payload.get("work_id") and payload.get("hermes_task_id"))
+    return bool(
+        str(payload.get("work_id", "")) == work.id
+        and str(payload.get("hermes_task_id", ""))
+        == str(work.hermes_task_id or "")
+        and work.status in {WorkStatus.BLOCKED, WorkStatus.WAITING_INPUT}
+    )
 
 
 def _event_authorizes(
@@ -483,6 +576,7 @@ class Supervisor:
                 raise StateConflict("Claimed event batch has no unique lease token")
             with self.store.transaction():
                 self.leadership_guard()
+                self._apply_policy_revocations(events)
                 self.priority_engine.rescore_store(self.store)
             await self._preflight_completion_events(events, pass_id=pass_id)
             snapshot = self._snapshot_for_events(
@@ -654,14 +748,102 @@ class Supervisor:
                 f"Verification evidence has no completed Hermes run for {work_id}"
             )
         try:
-            completed_result = json.loads(completed_run["result_json"] or "{}")
+            run_result = json.loads(completed_run["result_json"] or "{}")
         except (json.JSONDecodeError, TypeError) as error:
             raise PlanValidationError(
                 f"Verification evidence has an invalid canonical run result for {work_id}"
             ) from error
-        if not isinstance(completed_result, dict):
+        if not isinstance(run_result, dict):
             raise PlanValidationError(
                 f"Verification evidence has an invalid canonical run result for {work_id}"
+            )
+        execution_contract = run_result.get("execution_contract")
+        completed_result = run_result.get("completion")
+        if not isinstance(execution_contract, dict) or execution_contract.get(
+            "contract_unavailable"
+        ) is True:
+            raise PlanValidationError(
+                f"Verification evidence has no immutable execution contract for {work_id}"
+            )
+        if not isinstance(completed_result, dict):
+            raise PlanValidationError(
+                f"Verification evidence has no immutable completion observation for {work_id}"
+            )
+        contract_dispatch_digest = execution_contract.get(
+            "dispatch_contract_digest"
+        )
+        contract_scope_digest = execution_contract.get("execution_scope_digest")
+        contract_scope_revision = execution_contract.get("scope_revision")
+        contract_work_version = execution_contract.get("work_version")
+        contract_profile = execution_contract.get("profile")
+        contract_skills = execution_contract.get("skills")
+        contract_default_skills = execution_contract.get("default_skills")
+        contract_goal_mode = execution_contract.get("goal_mode")
+        if (
+            execution_contract.get("schema")
+            != "hermes-operator.run-execution-contract.v1"
+            or not isinstance(contract_dispatch_digest, str)
+            or len(contract_dispatch_digest) != 64
+            or not isinstance(contract_scope_digest, str)
+            or len(contract_scope_digest) != 64
+            or isinstance(contract_scope_revision, bool)
+            or not isinstance(contract_scope_revision, int)
+            or contract_scope_revision < 1
+            or isinstance(contract_work_version, bool)
+            or not isinstance(contract_work_version, int)
+            or contract_work_version < 1
+            or not isinstance(contract_profile, str)
+            or not contract_profile
+            or not isinstance(contract_skills, list)
+            or not all(isinstance(value, str) for value in contract_skills)
+            or not isinstance(contract_default_skills, list)
+            or not all(isinstance(value, str) for value in contract_default_skills)
+            or not isinstance(contract_goal_mode, bool)
+        ):
+            raise PlanValidationError(
+                f"Verification evidence has a malformed execution contract for {work_id}"
+            )
+        event_contract = {
+            "dispatch_contract_digest": payload.get("dispatch_contract_digest"),
+            "execution_scope_digest": payload.get("execution_scope_digest"),
+            "scope_revision": payload.get("scope_revision"),
+            "work_version": payload.get("work_version"),
+            "profile": payload.get("profile"),
+        }
+        expected_event_contract = {
+            "dispatch_contract_digest": contract_dispatch_digest,
+            "execution_scope_digest": contract_scope_digest,
+            "scope_revision": contract_scope_revision,
+            "work_version": contract_work_version,
+            "profile": contract_profile,
+        }
+        if event_contract != expected_event_contract:
+            raise PlanValidationError(
+                f"Completion event contract does not match canonical run {completion_run_id}"
+            )
+        current_scope_digest = execution_scope_digest(
+            work,
+            profile=contract_profile,
+            skills=contract_skills,
+            default_skills=contract_default_skills,
+            goal_mode=contract_goal_mode,
+        )
+        current_dispatch_digest = dispatch_contract_digest(
+            work,
+            profile=contract_profile,
+            skills=contract_skills,
+            default_skills=contract_default_skills,
+            goal_mode=contract_goal_mode,
+        )
+        if (
+            work.authorization_scope_revision != contract_scope_revision
+            or current_scope_digest != contract_scope_digest
+            or current_dispatch_digest != contract_dispatch_digest
+            or work.version < contract_work_version
+            or str(work.assignee or "") != contract_profile
+        ):
+            raise PlanValidationError(
+                f"Completion evidence belongs to a stale execution scope for {work_id}"
             )
         canonical_fingerprint = str(completed_result.get("updated_at") or "")
         if not canonical_fingerprint:
@@ -673,52 +855,16 @@ class Supervisor:
         if work.status != WorkStatus.REVIEW:
             raise PlanValidationError(f"Work {work_id} is not in review")
 
-        authorization = work.metadata.get("dispatch_authorization", {})
-        request = work.metadata.get("dispatch_request", {})
-        profile = (
-            _optional_text(authorization.get("profile"))
-            if isinstance(authorization, dict)
-            else None
-        ) or (
-            _optional_text(request.get("profile"))
-            if isinstance(request, dict)
-            else None
-        ) or work.assignee or self.config.hermes.default_assignee
-        raw_skills = (
-            authorization.get("skills", [])
-            if isinstance(authorization, dict)
-            else []
-        )
-        if not isinstance(raw_skills, list) or not all(
-            isinstance(value, str) for value in raw_skills
-        ):
-            raw_skills = []
-        goal_mode = (
-            request.get("goal_mode", self.config.hermes.goal_mode)
-            if isinstance(request, dict)
-            else self.config.hermes.goal_mode
-        )
-        if not isinstance(goal_mode, bool):
-            goal_mode = self.config.hermes.goal_mode
-        dispatch_digest = (
-            authorization.get("contract_digest")
-            if isinstance(authorization, dict)
-            and isinstance(authorization.get("contract_digest"), str)
-            else None
-        )
         binding: dict[str, Any] = {
             "schema": "hermes-operator.completion-verification.v1",
             "event_id": str(event.get("id", "")),
             "work_id": work.id,
             "work_version": work.version,
-            "execution_scope_digest": execution_scope_digest(
-                work,
-                profile=str(profile or ""),
-                skills=raw_skills,
-                default_skills=self.config.hermes.default_skills,
-                goal_mode=goal_mode,
-            ),
-            "dispatch_contract_digest": dispatch_digest,
+            "dispatch_work_version": contract_work_version,
+            "scope_revision": contract_scope_revision,
+            "profile": contract_profile,
+            "execution_scope_digest": contract_scope_digest,
+            "dispatch_contract_digest": contract_dispatch_digest,
             "hermes_task_id": hermes_task_id,
             "run_id": completion_run_id,
             "attempt": completion_attempt,
@@ -750,11 +896,26 @@ class Supervisor:
                 continue
             payload = event.get("payload")
             if not isinstance(payload, dict):
-                raise PlanValidationError("Completion evidence payload is invalid")
+                with self.store.transaction():
+                    self.leadership_guard()
+                    self._ensure_completion_followup(
+                        event=event,
+                        reason="Completion evidence payload is invalid",
+                    )
+                continue
             work_id = str(payload.get("work_id", ""))
             try:
                 work = self.store.get_work(work_id)
             except NotFound:
+                with self.store.transaction():
+                    self.leadership_guard()
+                    self._ensure_completion_followup(
+                        event=event,
+                        reason=(
+                            "Completion evidence is not bound to canonical "
+                            f"work {work_id or '[missing]'}"
+                        ),
+                    )
                 payload["deterministic_verification"] = {
                     "schema_version": 1,
                     "applicable": True,
@@ -780,10 +941,16 @@ class Supervisor:
 
             try:
                 context = self._completion_verification_context(event)
-            except (NotFound, PlanValidationError):
+            except (NotFound, PlanValidationError) as error:
                 # Malformed or stale completion evidence remains visible to the
                 # planner for an explicit quarantine disposition, but this
                 # unbound failure can never satisfy the transactional gate.
+                with self.store.transaction():
+                    self.leadership_guard()
+                    self._ensure_completion_followup(
+                        event=event,
+                        reason=str(error),
+                    )
                 payload["deterministic_verification"] = {
                     "schema_version": 1,
                     "applicable": True,
@@ -791,7 +958,8 @@ class Supervisor:
                     "artifacts": [],
                     "checks": [],
                     "errors": [
-                        "completion evidence is not bound to canonical completed work"
+                        "completion evidence is not bound to canonical completed work: "
+                        + str(error)[:1_000]
                     ],
                     "verified_at": utc_now(),
                 }
@@ -1181,7 +1349,9 @@ class Supervisor:
                 ):
                     outcome = outcome or "external_action_proposed"
                 if len(event_ids) == 1 and plan.get("verifications"):
-                    outcome = outcome or "execution_reconciled"
+                    # Completion verification is the durable event effect even
+                    # when a bounded retry dispatch is also proposed but denied.
+                    outcome = "execution_reconciled"
                 if outcome:
                     inferred.append(
                         {
@@ -1495,6 +1665,370 @@ class Supervisor:
         )
         return work_id, question_id
 
+    def _question_binding_for_work(
+        self,
+        work: WorkItem,
+        *,
+        execution_authorized: bool | None = None,
+    ) -> dict[str, Any]:
+        authorization = work.metadata.get("dispatch_authorization", {})
+        request = work.metadata.get("dispatch_request", {})
+        authorization = authorization if isinstance(authorization, Mapping) else {}
+        request = request if isinstance(request, Mapping) else {}
+        profile = str(
+            authorization.get("profile")
+            or request.get("profile")
+            or work.assignee
+            or self.config.hermes.default_assignee
+            or ""
+        )
+        raw_skills = authorization.get("skills", request.get("skills", []))
+        skills = (
+            [str(value) for value in raw_skills]
+            if isinstance(raw_skills, list)
+            and all(isinstance(value, str) for value in raw_skills)
+            else []
+        )
+        goal_mode = request.get("goal_mode", self.config.hermes.goal_mode)
+        if not isinstance(goal_mode, bool):
+            goal_mode = self.config.hermes.goal_mode
+        if execution_authorized is None:
+            governance = work.metadata.get("governance", {})
+            execution_authorized = bool(
+                isinstance(governance, Mapping)
+                and governance.get("execution_authorized") is True
+            )
+        return execution_scope_binding(
+            work,
+            profile=profile,
+            skills=skills,
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=goal_mode,
+            execution_authorized=execution_authorized,
+        )
+
+    def _ensure_blocked_lifecycle_question(
+        self,
+        *,
+        event: dict[str, Any],
+        result: PassResult,
+    ) -> tuple[str, str]:
+        """Turn a canonical blocked worker edge into one linked private question."""
+
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            raise PlanValidationError("Blocked execution payload is invalid")
+        work_id = str(payload.get("work_id", ""))
+        try:
+            work = self.store.get_work(work_id)
+        except NotFound:
+            return self._ensure_quarantine_review(
+                event=event,
+                reason=(
+                    "Blocked execution is not bound to an existing canonical "
+                    f"work item {work_id or '[missing]'}"
+                ),
+                result=result,
+            )
+        run_id = str(payload.get("run_id", ""))
+        try:
+            blocked_run = self.store.get_run(run_id) if run_id else None
+        except NotFound:
+            blocked_run = None
+        with self.store.connection() as connection:
+            latest_run = connection.execute(
+                "SELECT id FROM runs WHERE work_item_id = ? "
+                "ORDER BY attempt DESC, id DESC LIMIT 1",
+                (work.id,),
+            ).fetchone()
+        attempt = payload.get("attempt")
+        canonical_blocked_run = bool(
+            _blocked_lifecycle_event(event, work)
+            and blocked_run
+            and blocked_run.get("work_item_id") == work.id
+            and blocked_run.get("external_run_id")
+            == str(payload.get("hermes_task_id", ""))
+            and blocked_run.get("status") == "blocked"
+            and isinstance(attempt, int)
+            and not isinstance(attempt, bool)
+            and blocked_run.get("attempt") == attempt
+            and latest_run is not None
+            and str(latest_run["id"]) == run_id
+        )
+        if not canonical_blocked_run:
+            return self._ensure_quarantine_review(
+                event=event,
+                reason=(
+                    "Blocked execution identifiers do not match the latest "
+                    "canonical blocked run"
+                ),
+                result=result,
+            )
+        identity = hashlib.sha256(
+            f"blocked-lifecycle-question:{event['id']}:{work.id}".encode("utf-8")
+        ).hexdigest()
+        question_id = f"qst_{identity[:24]}"
+        try:
+            existing = self.store.get_question(question_id)
+            if work.id not in map(str, existing.get("blocking_work_ids", [])):
+                raise StateConflict(
+                    f"Blocked lifecycle question identity collision for {event['id']}"
+                )
+            if question_id not in result.question_ids:
+                result.question_ids.append(question_id)
+            return work.id, question_id
+        except NotFound:
+            pass
+
+        if work.status == WorkStatus.BLOCKED:
+            metadata = dict(work.metadata)
+            governance = dict(metadata.get("governance", {}))
+            governance["execution_authorized"] = False
+            metadata["governance"] = governance
+            metadata.pop("dispatch_authorization", None)
+            metadata["authorization_invalidated"] = {
+                "reason": "worker_blocked_requires_fresh_authorization",
+                "from_work_version": work.version,
+                "from_scope_revision": work.authorization_scope_revision,
+                "invalidated_at": utc_now(),
+            }
+            metadata["blocked_lifecycle"] = {
+                "event_id": str(event["id"]),
+                "hermes_task_id": str(payload.get("hermes_task_id", "")),
+                "run_id": str(payload.get("run_id", "")),
+                "attempt": payload.get("attempt"),
+                "recorded_at": utc_now(),
+            }
+            work = self.store.update_work(
+                work.id,
+                {"status": WorkStatus.WAITING_INPUT, "metadata": metadata},
+                actor=self.worker_id,
+                expected_version=work.version,
+                allow_transition_override=True,
+                invalidate_authority=True,
+                authority_invalidation_reason=(
+                    "worker_blocked_requires_fresh_authorization"
+                ),
+            )
+        evidence = payload.get("execution_evidence", {})
+        evidence_preview = json.dumps(
+            _bounded_context_value(evidence),
+            sort_keys=True,
+            ensure_ascii=True,
+            default=str,
+        )[:2_000]
+        self.store.create_question(
+            UserQuestion(
+                id=question_id,
+                question=(
+                    f"What input or decision should be provided to resume "
+                    f"{work.title[:240]}?"
+                ),
+                context=(
+                    f"Hermes card {work.hermes_task_id} reported blocked. "
+                    "Your answer will be returned only to this canonical card after "
+                    "a fresh exact execution authorization.\n\n"
+                    f"Bounded worker evidence: {evidence_preview}"
+                ),
+                urgency=max(0.7, work.urgency),
+                blocking_work_ids=[work.id],
+                blocking_work_bindings={
+                    work.id: self._question_binding_for_work(
+                        work, execution_authorized=False
+                    )
+                },
+            ),
+            actor=self.worker_id,
+        )
+        result.question_ids.append(question_id)
+        self.store.audit(
+            self.worker_id,
+            "execution.blocked_question_ensured",
+            entity_type="work",
+            entity_id=work.id,
+            data={"event_id": str(event["id"]), "question_id": question_id},
+        )
+        return work.id, question_id
+
+    def _ensure_completion_followup(
+        self,
+        *,
+        event: dict[str, Any],
+        reason: str,
+        result: PassResult | None = None,
+    ) -> tuple[str, str]:
+        """Persist a human-visible stop for stale or malformed completion evidence."""
+
+        payload = event.get("payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        claimed_work_id = str(payload.get("work_id", "")).strip()
+        task_id = str(payload.get("hermes_task_id", "")).strip()
+        run_id = str(payload.get("run_id", "")).strip()
+        mapped_work_ids: list[str] = []
+        mapping_valid = bool(task_id or run_id)
+
+        if run_id:
+            try:
+                run = self.store.get_run(run_id)
+            except NotFound:
+                mapping_valid = False
+            else:
+                mapped_work_ids.append(str(run.get("work_item_id", "")))
+                if task_id and str(run.get("external_run_id", "")) != task_id:
+                    mapping_valid = False
+        if task_id:
+            task_work = self.store.find_work_by_hermes_id(task_id)
+            if task_work is None:
+                mapping_valid = False
+            else:
+                mapped_work_ids.append(task_work.id)
+
+        canonical_ids = {value for value in mapped_work_ids if value}
+        if (
+            not mapping_valid
+            or len(canonical_ids) != 1
+            or (
+                claimed_work_id
+                and claimed_work_id not in canonical_ids
+            )
+        ):
+            fallback = result or PassResult(
+                pass_id="completion-preflight",
+                trigger="completion-preflight",
+                event_ids=[str(event.get("id", ""))],
+                summary="Preserved unbound completion evidence",
+            )
+            return self._ensure_quarantine_review(
+                event=event,
+                reason=reason,
+                result=fallback,
+            )
+
+        canonical_work_id = next(iter(canonical_ids))
+        try:
+            work = self.store.get_work(canonical_work_id)
+        except NotFound:
+            fallback = result or PassResult(
+                pass_id="completion-preflight",
+                trigger="completion-preflight",
+                event_ids=[str(event.get("id", ""))],
+                summary="Preserved unbound completion evidence",
+            )
+            return self._ensure_quarantine_review(
+                event=event,
+                reason=reason,
+                result=fallback,
+            )
+
+        identity = hashlib.sha256(
+            f"completion-followup:{event.get('id')}:{work.id}".encode("utf-8")
+        ).hexdigest()
+        question_id = f"qst_{identity[:24]}"
+        marker = work.metadata.get("completion_quarantine", {})
+        if not (
+            isinstance(marker, Mapping)
+            and marker.get("event_id") == str(event.get("id", ""))
+        ):
+            metadata = dict(work.metadata)
+            metadata["completion_quarantine"] = {
+                "event_id": str(event.get("id", "")),
+                "run_id": str(payload.get("run_id", "")),
+                "hermes_task_id": str(payload.get("hermes_task_id", "")),
+                "reason": reason[:2_000],
+                "recorded_at": utc_now(),
+            }
+            target_status = (
+                work.status
+                if work.status
+                in {WorkStatus.DONE, WorkStatus.CANCELLED, WorkStatus.ARCHIVED}
+                else WorkStatus.WAITING_INPUT
+            )
+            work = self.store.update_work(
+                work.id,
+                {"status": target_status, "metadata": metadata},
+                actor=self.worker_id,
+                expected_version=work.version,
+                allow_transition_override=True,
+                invalidate_authority=True,
+                authority_invalidation_reason="completion_evidence_quarantined",
+            )
+        try:
+            existing = self.store.get_question(question_id)
+            if work.id not in map(str, existing.get("blocking_work_ids", [])):
+                raise StateConflict(
+                    f"Completion follow-up identity collision for {event.get('id')}"
+                )
+        except NotFound:
+            self.store.create_question(
+                UserQuestion(
+                    id=question_id,
+                    question=(
+                        f"Review rejected completion evidence for {work.title[:220]}"
+                    ),
+                    context=(
+                        "The completion could not be matched exactly to its immutable "
+                        f"run scope and was not allowed to finalize work. Reason: {reason[:2_000]}"
+                    ),
+                    urgency=0.95,
+                    blocking_work_ids=[work.id],
+                    blocking_work_bindings={
+                        work.id: self._question_binding_for_work(
+                            work, execution_authorized=False
+                        )
+                    },
+                ),
+                actor=self.worker_id,
+            )
+        if result is not None and question_id not in result.question_ids:
+            result.question_ids.append(question_id)
+        self.store.audit(
+            self.worker_id,
+            "completion.evidence_quarantined",
+            entity_type="work",
+            entity_id=work.id,
+            data={
+                "event_id": str(event.get("id", "")),
+                "question_id": question_id,
+                "reason": reason[:2_000],
+            },
+        )
+        return work.id, question_id
+
+    def _apply_policy_revocations(self, events: list[dict[str, Any]]) -> None:
+        """Invalidate a cached attestation when authenticated Hermes revokes it."""
+
+        for event in events:
+            if not (
+                event.get("source") == "hermes"
+                and event.get("event_type") == "policy.revoked"
+                and event.get("trust_level")
+                == TrustLevel.AUTHENTICATED_UNTRUSTED.value
+                and event.get("provenance", {}).get("authenticated") is True
+            ):
+                continue
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            profile = str(payload.get("profile", "")).strip()
+            if not profile or payload.get("guard_active") is not False:
+                continue
+            state = {
+                **payload,
+                "profile": profile,
+                "guard_active": False,
+                "authenticated_ingress": True,
+                "event_id": str(event.get("external_id") or event.get("id", "")),
+                "received_at": utc_now(),
+            }
+            self.store.set_state(f"hermes.policy_attestation:{profile}", state)
+            self.store.audit(
+                self.worker_id,
+                "policy_attestation.revoked",
+                entity_type="hermes_profile",
+                entity_id=profile,
+                data={"event_id": str(event.get("id", ""))},
+            )
+
     def _resolve_event_dispositions(
         self,
         *,
@@ -1511,7 +2045,9 @@ class Supervisor:
             event_id: [] for event_id in event_by_id
         }
         memory_effects: set[str] = set()
-        external_effects: set[str] = set()
+        external_effects: dict[str, list[str]] = {
+            event_id: [] for event_id in event_by_id
+        }
         verification_effects: set[str] = set()
 
         for operation in plan["work_operations"]:
@@ -1583,10 +2119,11 @@ class Supervisor:
             source_event_id = _optional_text(candidate.get("source_event_id"))
             if source_event_id:
                 memory_effects.add(source_event_id)
-        for proposal in plan["external_action_proposals"]:
-            source_event_id = _optional_text(proposal.get("source_event_id"))
-            if source_event_id:
-                external_effects.add(source_event_id)
+        for source_event_id, intent_ids in (
+            result.staged_action_intent_ids_by_event.items()
+        ):
+            if source_event_id in external_effects:
+                external_effects[source_event_id].extend(intent_ids)
         for event_id, event in event_by_id.items():
             payload = event.get("payload", {})
             work_id = str(payload.get("work_id", "")) if isinstance(payload, dict) else ""
@@ -1617,6 +2154,16 @@ class Supervisor:
                         f"Disposition for {event_id} references missing work {work_id}"
                     ) from error
             related_question_ids = question_effects[event_id]
+            event = event_by_id[event_id]
+            if _blocked_lifecycle_event(event) and not related_question_ids:
+                lifecycle_work_id, lifecycle_question_id = (
+                    self._ensure_blocked_lifecycle_question(
+                        event=event,
+                        result=result,
+                    )
+                )
+                related_work_ids.add(lifecycle_work_id)
+                related_question_ids.append(lifecycle_question_id)
             if (
                 disposition.get("_compatibility_inferred") is True
                 and outcome == "work_recorded"
@@ -1639,25 +2186,40 @@ class Supervisor:
                 raise PlanValidationError(
                     f"Memory disposition for {event_id} has no memory candidate"
                 )
-            if outcome == "external_action_proposed" and event_id not in external_effects:
+            if outcome == "external_action_proposed" and not external_effects[event_id]:
                 raise PlanValidationError(
-                    f"External-action disposition for {event_id} has no proposal"
+                    f"External-action disposition for {event_id} has no staged durable intent"
                 )
             if outcome == "duplicate" and not related_work_ids:
                 raise PlanValidationError(
                     f"Duplicate disposition for {event_id} needs related work"
                 )
-            event = event_by_id[event_id]
             if outcome == "non_actionable" and _task_like_event(event):
                 raise PlanValidationError(
                     f"Task-like event {event_id} cannot be dismissed as non-actionable"
                 )
             if outcome == "quarantined" and _task_like_event(event):
-                review_work_id, review_question_id = self._ensure_quarantine_review(
-                    event=event,
-                    reason=str(disposition["reason"]).strip(),
-                    result=result,
-                )
+                if _completion_event(event):
+                    review_work_id, review_question_id = (
+                        self._ensure_completion_followup(
+                            event=event,
+                            reason=str(disposition["reason"]).strip(),
+                            result=result,
+                        )
+                    )
+                elif _blocked_lifecycle_event(event):
+                    review_work_id, review_question_id = (
+                        self._ensure_blocked_lifecycle_question(
+                            event=event,
+                            result=result,
+                        )
+                    )
+                else:
+                    review_work_id, review_question_id = self._ensure_quarantine_review(
+                        event=event,
+                        reason=str(disposition["reason"]).strip(),
+                        result=result,
+                    )
                 related_work_ids.add(review_work_id)
                 if review_question_id not in related_question_ids:
                     related_question_ids.append(review_question_id)
@@ -1668,6 +2230,7 @@ class Supervisor:
                     "reason": str(disposition["reason"]).strip(),
                     "related_work_ids": sorted(related_work_ids),
                     "related_question_ids": related_question_ids,
+                    "related_action_intent_ids": external_effects[event_id],
                     "metadata": {
                         "source": event.get("source"),
                         "event_type": event.get("event_type"),
@@ -1697,11 +2260,18 @@ class Supervisor:
             llm_model=llm_result.model,
             llm_usage=llm_result.usage,
         )
+        for event in events:
+            if _blocked_lifecycle_event(event):
+                self._ensure_blocked_lifecycle_question(
+                    event=event,
+                    result=result,
+                )
         references: dict[str, str] = {}
         reference_update_authority: dict[str, bool] = {}
         reference_execution_authority: dict[str, bool] = {}
         reference_reused: dict[str, bool] = {}
         updated_authority_sources: dict[str, str] = {}
+        reassignment_dispatch_authority: dict[str, dict[str, Any]] = {}
         version_lineage: dict[str, tuple[int, int]] = {}
 
         def effective_version(work_id: str, planned_version: int) -> int:
@@ -1727,39 +2297,7 @@ class Supervisor:
             version_lineage[work_id] = (initial_version, current_version)
 
         def question_binding(work: WorkItem) -> dict[str, Any]:
-            prior = work.metadata.get("dispatch_authorization", {})
-            request = work.metadata.get("dispatch_request", {})
-            profile = (
-                _optional_text(prior.get("profile"))
-                if isinstance(prior, dict)
-                else None
-            ) or work.assignee or self.config.hermes.default_assignee
-            raw_skills = (
-                prior.get("skills", []) if isinstance(prior, dict) else []
-            )
-            skills = (
-                [str(value) for value in raw_skills]
-                if isinstance(raw_skills, list)
-                and all(isinstance(value, str) for value in raw_skills)
-                else []
-            )
-            goal_mode = (
-                request.get("goal_mode", self.config.hermes.goal_mode)
-                if isinstance(request, dict)
-                else self.config.hermes.goal_mode
-            )
-            governance = work.metadata.get("governance", {})
-            return execution_scope_binding(
-                work,
-                profile=str(profile or ""),
-                skills=skills,
-                default_skills=self.config.hermes.default_skills,
-                goal_mode=bool(goal_mode),
-                execution_authorized=bool(
-                    isinstance(governance, dict)
-                    and governance.get("execution_authorized") is True
-                ),
-            )
+            return self._question_binding_for_work(work)
 
         def record_stale_authority_followup(
             event: dict[str, Any] | None,
@@ -2273,6 +2811,70 @@ class Supervisor:
                     actor=self.worker_id,
                     expected_version=expected_version,
                 )
+                if (
+                    trusted_source_authorization
+                    and source_event_id
+                    and updated.assignee != work_before.assignee
+                    and updated.status
+                    not in {
+                        WorkStatus.DONE,
+                        WorkStatus.CANCELLED,
+                        WorkStatus.ARCHIVED,
+                    }
+                    and updated.authorization_scope_revision
+                    == work_before.authorization_scope_revision + 1
+                ):
+                    binding = _event_work_binding(
+                        source_event,
+                        work_id=work_id,
+                        capability="dispatch",
+                    )
+                    parameters = (
+                        binding_execution_parameters(binding)
+                        if isinstance(binding, dict)
+                        else None
+                    )
+                    if parameters is not None:
+                        profile, skills, default_skills, goal_mode = parameters
+                        before_scope = execution_scope_document(
+                            work_before,
+                            profile=profile,
+                            skills=skills,
+                            default_skills=default_skills,
+                            goal_mode=goal_mode,
+                        )
+                        after_scope = execution_scope_document(
+                            updated,
+                            profile=profile,
+                            skills=skills,
+                            default_skills=default_skills,
+                            goal_mode=goal_mode,
+                        )
+                        before_scope.pop("scope_revision", None)
+                        after_scope.pop("scope_revision", None)
+                        if (
+                            profile.strip()
+                            and updated.assignee == profile
+                            and before_scope == after_scope
+                        ):
+                            # The trusted event already bound this exact
+                            # executor shape. Reassignment invalidated prior
+                            # authority and advanced the scope revision; carry
+                            # only a one-pass proof that permits installing a
+                            # fresh authorization against the new revision.
+                            reassignment_dispatch_authority[work_id] = {
+                                "source_event_id": source_event_id,
+                                "scope_revision": (
+                                    updated.authorization_scope_revision
+                                ),
+                                "scope_digest": execution_scope_digest(
+                                    updated,
+                                    profile=profile,
+                                    skills=skills,
+                                    default_skills=default_skills,
+                                    goal_mode=goal_mode,
+                                ),
+                            }
                 record_version(work_id, planned_version, updated.version)
                 result.updated_work_ids.append(updated.id)
                 if operation_trusted and source_event_id:
@@ -2336,6 +2938,16 @@ class Supervisor:
                         },
                     )
                     continue
+                planned_from_version = (
+                    int(operation["expected_from_version"])
+                    if _optional_text(operation.get("from_id"))
+                    else from_work.version
+                )
+                planned_to_version = (
+                    int(operation["expected_to_version"])
+                    if _optional_text(operation.get("to_id"))
+                    else to_work.version
+                )
                 self.store.add_work_link(
                     from_id,
                     to_id,
@@ -2344,7 +2956,7 @@ class Supervisor:
                     expected_from_version=(
                         effective_version(
                             from_id,
-                            int(operation["expected_from_version"]),
+                            planned_from_version,
                         )
                         if _optional_text(operation.get("from_id"))
                         else None
@@ -2352,17 +2964,38 @@ class Supervisor:
                     expected_to_version=(
                         effective_version(
                             to_id,
-                            int(operation["expected_to_version"]),
+                            planned_to_version,
                         )
                         if _optional_text(operation.get("to_id"))
                         else None
                     ),
+                )
+                # Scope-bearing dependency edges advance both endpoint work
+                # versions. Keep later operations in this same model plan on
+                # the original snapshot lineage while using the new live
+                # versions, just as ordinary work updates do.
+                linked_from = self.store.get_work(from_id)
+                linked_to = self.store.get_work(to_id)
+                record_version(
+                    from_id,
+                    planned_from_version,
+                    linked_from.version,
+                )
+                record_version(
+                    to_id,
+                    planned_to_version,
+                    linked_to.version,
                 )
 
         for index, proposal in enumerate(plan["questions"]):
             blocking = [references.get(value, value) for value in proposal.get("blocking_work_ids", [])]
             question_source_id = _optional_text(proposal.get("source_event_id"))
             question_source = event_by_id.get(question_source_id or "")
+            if _blocked_lifecycle_event(question_source):
+                # The canonical lifecycle question was created deterministically
+                # before model-authored operations and already carries the narrow
+                # non-executable binding for this card.
+                continue
             blocking_versions: dict[str, int | None] = {}
             blocking_bindings: dict[str, dict[str, Any]] = {}
             if events:
@@ -2377,6 +3010,9 @@ class Supervisor:
                     ) or (
                         updated_authority_sources.get(str(work_id))
                         == question_source_id
+                    ) or _blocked_lifecycle_event(
+                        question_source,
+                        blocking_work,
                     ) or _event_authorizes(
                             question_source,
                             "update",
@@ -2695,7 +3331,16 @@ class Supervisor:
                 )
                 continue
             intent_id = self.action_stager.stage(proposal, created_by=self.worker_id)
+            if not isinstance(intent_id, str) or not intent_id.strip():
+                raise PlanValidationError(
+                    "Approval broker returned no durable external action intent ID"
+                )
+            intent_id = intent_id.strip()
             result.action_intent_ids.append(intent_id)
+            source_event_id = str(proposal.get("source_event_id", ""))
+            result.staged_action_intent_ids_by_event.setdefault(
+                source_event_id, []
+            ).append(intent_id)
 
         for dispatch in plan["dispatch"]:
             work_id = _optional_text(dispatch.get("work_id")) or references.get(
@@ -2721,6 +3366,26 @@ class Supervisor:
                 raise StateConflict(
                     f"Work changed while dispatch was being planned: {work_id}"
                 )
+            active_run = next(
+                (
+                    run
+                    for run in self.store.list_active_runs()
+                    if str(run.get("work_item_id", "")) == work_id
+                ),
+                None,
+            )
+            if active_run is not None:
+                self.store.audit(
+                    self.worker_id,
+                    "dispatch.rejected_active_run",
+                    entity_type="work",
+                    entity_id=work_id,
+                    data={
+                        "run_id": str(active_run.get("id", "")),
+                        "run_status": str(active_run.get("status", "")),
+                    },
+                )
+                continue
             if work.status == WorkStatus.WAITING_INPUT:
                 self.store.audit(
                     self.worker_id,
@@ -2743,6 +3408,23 @@ class Supervisor:
             ]
             candidate_goal_mode = bool(
                 dispatch.get("goal_mode", self.config.hermes.goal_mode)
+            )
+            reassignment_authority = reassignment_dispatch_authority.get(
+                work_id, {}
+            )
+            reassignment_authorized = bool(
+                reassignment_authority.get("source_event_id")
+                == dispatch_source_id
+                and reassignment_authority.get("scope_revision")
+                == work.authorization_scope_revision
+                and reassignment_authority.get("scope_digest")
+                == execution_scope_digest(
+                    work,
+                    profile=str(candidate_profile or ""),
+                    skills=candidate_skills,
+                    default_skills=self.config.hermes.default_skills,
+                    goal_mode=candidate_goal_mode,
+                )
             )
             prior_authorization = work.metadata.get("dispatch_authorization", {})
             last_verification = work.metadata.get("last_verification", {})
@@ -2825,6 +3507,7 @@ class Supervisor:
                 or reference_execution_authority.get(
                     str(dispatch.get("work_ref", "")), False
                 )
+                or reassignment_authorized
                 or retry_authorized
             ):
                 record_stale_authority_followup(
@@ -2853,8 +3536,11 @@ class Supervisor:
                 continue
             governance = work.metadata.get("governance", {})
             if not (
-                isinstance(governance, dict)
-                and governance.get("execution_authorized") is True
+                (
+                    isinstance(governance, dict)
+                    and governance.get("execution_authorized") is True
+                )
+                or reassignment_authorized
             ):
                 self.store.audit(
                     self.worker_id,
@@ -2901,6 +3587,22 @@ class Supervisor:
                     f"Hermes skills are not allowed: {sorted(unknown_skills)}"
                 )
             goal_mode = candidate_goal_mode
+            if work.assignee != requested_profile:
+                # Assignment is an authorization-scope mutation. Commit it
+                # before minting dispatch authority so the latter is bound to
+                # the advanced revision and cannot preserve stale authority.
+                work = self.store.update_work(
+                    work_id,
+                    {"assignee": requested_profile},
+                    actor=self.worker_id,
+                    expected_version=work.version,
+                )
+                if planned_dispatch_version is not None:
+                    record_version(
+                        work_id,
+                        planned_dispatch_version,
+                        work.version,
+                    )
             contract_digest_value = dispatch_contract_digest(
                 work,
                 profile=requested_profile,
@@ -2932,6 +3634,14 @@ class Supervisor:
                 else self.config.hermes.max_execution_attempts
             )
             metadata = dict(work.metadata)
+            governance_value = metadata.get("governance", {})
+            dispatch_governance = (
+                dict(governance_value)
+                if isinstance(governance_value, dict)
+                else {}
+            )
+            dispatch_governance["execution_authorized"] = True
+            metadata["governance"] = dispatch_governance
             metadata["dispatch_request"] = {
                 "profile": requested_profile,
                 "goal_mode": goal_mode,
@@ -2976,18 +3686,23 @@ class Supervisor:
             }
             changes: dict[str, Any] = {
                 "execution_mode": ExecutionMode.HERMES.value,
-                "assignee": metadata["dispatch_request"]["profile"],
                 "metadata": metadata,
             }
             if work.status not in {WorkStatus.READY, WorkStatus.RUNNING, WorkStatus.REVIEW}:
                 changes["status"] = WorkStatus.READY.value
-            self.store.update_work(
+            dispatched = self.store.update_work(
                 work_id,
                 changes,
                 actor=self.worker_id,
                 expected_version=work.version,
                 allow_transition_override=True,
             )
+            if planned_dispatch_version is not None:
+                record_version(
+                    work_id,
+                    planned_dispatch_version,
+                    dispatched.version,
+                )
             result.dispatch_work_ids.append(work_id)
 
         result.event_dispositions = self._resolve_event_dispositions(
