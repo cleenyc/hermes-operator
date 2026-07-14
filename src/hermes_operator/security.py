@@ -372,7 +372,7 @@ class ApprovalGrant:
             raise ValueError("ttl must be a positive timedelta")
         issued_at = _require_aware(now or datetime.now(UTC), "now")
         return cls(
-            grant_id=grant_id or secrets.token_urlsafe(24),
+            grant_id=grant_id or f"gr_{secrets.token_urlsafe(24)}",
             action_type=intent.action_type_value,
             action_digest=intent.digest,
             recipients_digest=intent.recipients_digest,

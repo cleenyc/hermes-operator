@@ -6,6 +6,7 @@ import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -164,6 +165,20 @@ class ApprovalTests(unittest.TestCase):
         )
         self.store.add(grant)
         return grant
+
+    def test_generated_grant_id_is_safe_as_a_cli_argument(self) -> None:
+        with patch(
+            "hermes_operator.security.secrets.token_urlsafe",
+            return_value="-leading-dash",
+        ):
+            grant = ApprovalGrant.issue(
+                self.intent,
+                approved_by="operator:chris",
+                now=NOW,
+                ttl=timedelta(minutes=5),
+            )
+
+        self.assertEqual(grant.grant_id, "gr_-leading-dash")
 
     def test_exact_grant_is_allowed_once_then_replay_is_denied(self) -> None:
         grant = self.issue()

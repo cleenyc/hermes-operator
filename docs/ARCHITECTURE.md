@@ -90,7 +90,7 @@ The OpenAI-compatible transport accepts only an HTTP or HTTPS base path without 
 
 ## Atomic supervisor transaction
 
-The model returns one structured plan containing an explicit disposition for every claimed event, work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, allowlisted worker profiles, skills, and expected versions before the transaction can commit. A disposition must be backed by the effect it claims, such as applied work, a created question, or a verification. `duplicate` must identify existing work. `non_actionable` and `quarantined` require an auditable reason. A quarantined task-like signal deterministically creates a non-executable decision item and a bound pending question, so the source event may be finalized without disappearing from the active attention workflow. An empty plan cannot silently consume an event. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
+The model returns one structured plan containing an explicit disposition for every claimed event, work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, allowlisted worker profiles, skills, and expected versions before the transaction can commit. A disposition must be backed by the effect it claims, such as applied work, a created question, or a verification. `duplicate` must identify existing work. `non_actionable` and `quarantined` require an auditable reason. Every explicit quarantine deterministically creates a non-executable decision item and a bound pending question, while task-signal detection separately prevents actionable provider evidence from being dismissed as `non_actionable`. The source event may therefore be finalized without disappearing from the active attention workflow. An empty plan cannot silently consume an event. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
 
 The normalized plan is canonicalized and hashed with SHA-256. Plan application then occurs inside one `BEGIN IMMEDIATE` SQLite transaction. Nested store calls share that connection. The same transaction:
 
@@ -162,7 +162,7 @@ Before creating a card, the dispatcher verifies:
 - A supervisor authorization points to a finalized plan with the same plan digest, or a direct operator CLI authorization is present.
 - Fresh policy attestation exists for the exact worker profile when required.
 
-The dispatch contract digest binds the work ID, kind, title, description, parent, acceptance criteria, due and scheduled times, operator priority, profile, effective skills after configured defaults are added, and goal mode. Authorization uses `lifetime = "until_consumed_or_contract_change"`, `expires_at = null`, and a stable `authorization_root`. `review_after` is an operational review marker rather than an automatic expiry. `max_attempts` cannot exceed `hermes.max_execution_attempts`.
+The dispatch contract digest binds the work ID, kind, title, description, parent ID, acceptance criteria, due and scheduled times, recurrence rule, profile, effective skills after configured defaults are added, goal mode, the canonical internal-capability set, verification requirement, and verification contract. Runtime state and priority are deliberately absent, so reprioritization cannot invalidate otherwise identical authority. Authorization uses `lifetime = "until_consumed_or_contract_change"`, `expires_at = null`, and a stable `authorization_root`. `review_after` is an operational review marker rather than an automatic expiry. `max_attempts` cannot exceed `hermes.max_execution_attempts`.
 
 ## Atomic global concurrency
 
@@ -179,7 +179,7 @@ No profile-specific, project-specific, or model-provider-specific concurrency po
 
 ## Per-profile worker policy attestation
 
-The native plugin registers a local `pre_tool_call` guard before it initializes the HTTP bridge. It then sends a synchronous `policy.attested` envelope through the scoped bridge token. The API validates it and writes monotonic profile evidence directly to authenticated system state and audit. It does not place heartbeat attestations in the planner event queue or wake the autonomy loop. Each Hermes profile that can receive Operator work installs the plugin with its own `HERMES_OPERATOR_PROFILE` value. Dispatch requires current accepted evidence for the exact selected profile. The fixed payload binds:
+The native plugin registers a local `pre_tool_call` guard before it initializes the HTTP bridge. It loads the bridge token and independent proof secret into a private client, removes both from `os.environ`, and sends a synchronous `policy.attested` envelope with an exact short-lived HMAC proof. The API durably consumes its nonce and writes monotonic profile evidence directly to authenticated system state and audit. It does not place heartbeat attestations in the planner event queue or wake the autonomy loop. Each Hermes profile that can receive Operator work installs the plugin with its own `HERMES_OPERATOR_PROFILE` value. Dispatch requires current accepted evidence for the exact selected profile. The fixed payload binds:
 
 - Hermes profile
 - Plugin version
@@ -189,7 +189,7 @@ The native plugin registers a local `pre_tool_call` guard before it initializes 
 - `default_deny` mode
 - UTC attestation time
 
-The example core configuration accepts plugin `1.5.0`, policy `6.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
+The example core configuration accepts plugin `1.6.0`, policy `7.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
 
 The heartbeat is process-scoped because current Hermes exposes no plugin-unload hook. It uses a process-exit wake and bounded join. A refresh failure leaves the local guard and bridge installed, but core freshness expires and blocks subsequent reservations.
 
@@ -199,7 +199,13 @@ that profile's cached attestation with `guard_active: false` immediately, so
 dispatch fails closed without waiting for the attestation TTL. Only a strictly
 newer valid attestation can restore the profile.
 
-Attestation proves possession of the bridge credential and reports plugin state. It is not hardware-backed evidence and is not a substitute for process isolation.
+Activation is pinned to Hermes `0.18.2` unless a deployment-owned reviewed-host
+override is present. The override never bypasses semantic checks for hook order,
+dispatcher task/workspace ownership, credential scrubbing, or artifact transport.
+Attestation proves possession of bridge credentials and reports plugin state. It is
+not hardware-backed evidence and is not a substitute for process isolation. Active
+configuration separately requires acknowledgement that deployment filesystem,
+credential, and egress isolation was reviewed.
 
 ## Reconciliation and verification
 

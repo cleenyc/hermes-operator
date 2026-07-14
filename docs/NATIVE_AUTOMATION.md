@@ -56,7 +56,21 @@ hermes-operator --config operator.toml native-jobs install
 ```
 
 Existing jobs are not silently edited. Use `hermes cron edit` for a deliberate
-change, or remove the old managed job and reinstall it.
+change, or explicitly reconcile the complete managed contract after reviewing
+the dry run:
+
+```bash
+hermes-operator --config operator.toml native-jobs install --dry-run --reconcile
+hermes-operator --config operator.toml native-jobs install --reconcile
+```
+
+Reconciliation lists jobs with Hermes `cron list --all`, so paused and disabled
+managed jobs are updated rather than duplicated. It edits only the three stable
+Hermes Operator job names. Existing v0.3 or v0.4 installations should use this
+path once during upgrade to receive the current intake, attention-claim, and
+briefing prompts. Jobs remain paused if Hermes preserves that native state; review
+and resume them in Hermes deliberately. Duplicate exact managed names fail both
+live readiness and reconciliation until the operator removes the extra jobs.
 
 ## Deployment bindings
 
@@ -109,6 +123,21 @@ cards therefore do not treat it as durable child execution. The live planner
 decomposes independent work into canonical WorkItems, and the dispatcher starts
 those cards in parallel up to `operator.max_parallel_work`. Normal interactive
 Hermes sessions may continue to use native delegation.
+
+## Active acceptance
+
+After all deployment bindings are configured, run:
+
+```bash
+hermes-operator --config operator.toml doctor --live
+```
+
+The live doctor performs a real structured model request, validates every effective
+execution profile attestation, probes the authenticated read-only Kanban active-worker
+endpoint, and confirms that all desired native jobs are active, use the configured
+non-local private delivery target, and have a healthy Hermes Cron scheduler or Gateway
+ticker. Google OAuth and native Obsidian vault access remain Hermes-owned acceptance
+checks and must be exercised in Hermes before unattended operation.
 
 ## Why this is still a live autonomous loop
 

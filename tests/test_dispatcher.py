@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -22,16 +23,26 @@ from hermes_operator.config import (
     ServerConfig,
 )
 from hermes_operator.db import LeaseFenceLost, SQLiteStore, StateConflict
-from hermes_operator.dispatcher import HermesDispatcher, dispatch_contract_digest
+from hermes_operator.dispatcher import (
+    MANAGED_INTERNAL_CAPABILITIES,
+    HermesDispatcher,
+    dispatch_contract_digest,
+)
+from hermes_operator.llm import ScriptedLLM
 from hermes_operator.models import (
+    Event,
     ExecutionMode,
+    QuestionStatus,
     RunRecord,
+    TrustLevel,
     UserQuestion,
     WorkItem,
     WorkRelation,
     WorkStatus,
     utc_now,
 )
+from hermes_operator.prioritization import PriorityEngine
+from hermes_operator.supervisor import Supervisor
 
 
 class MutableHermesAdapter(InMemoryHermesAdapter):
@@ -258,6 +269,77 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(self.store.list_active_runs(), [])
         self.assertEqual(self.store.get_work(item.id).status, WorkStatus.READY)
 
+    def test_completion_assurance_is_bound_to_both_execution_digests(self) -> None:
+        item = WorkItem(
+            title="Bind the completion assurance",
+            acceptance_criteria=["The result is checked"],
+            metadata={"verification_requirement": "model_evidence"},
+        )
+        model_scope = execution_scope_binding(
+            item,
+            profile="executor",
+            default_skills=self.config.hermes.default_skills,
+        )["scope_digest"]
+        model_dispatch = dispatch_contract_digest(
+            item,
+            profile="executor",
+            skills=[],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+        )
+        item.metadata["verification_requirement"] = "deterministic_required"
+        item.metadata["verification_contract"] = {
+            "artifacts": [],
+            "checks": ["deployment-check"],
+        }
+
+        deterministic_scope = execution_scope_binding(
+            item,
+            profile="executor",
+            default_skills=self.config.hermes.default_skills,
+        )["scope_digest"]
+        deterministic_dispatch = dispatch_contract_digest(
+            item,
+            profile="executor",
+            skills=[],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+        )
+
+        self.assertNotEqual(model_scope, deterministic_scope)
+        self.assertNotEqual(model_dispatch, deterministic_dispatch)
+
+    def test_dispatch_rejects_unconfigured_deterministic_assurance(self) -> None:
+        item = self._ready(
+            "Do not run without the deployment check",
+            metadata={
+                "governance": {
+                    "execution_authorized": True,
+                    "source_trust": "operator",
+                },
+                "dispatch_request": {"profile": "executor", "skills": []},
+                "verification_requirement": "deterministic_required",
+                "verification_contract": {
+                    "artifacts": [],
+                    "checks": ["not-configured-here"],
+                },
+            },
+        )
+
+        report = self._dispatcher().dispatch_ready()
+
+        self.assertEqual(report.skipped_work_ids, [item.id])
+        self.assertEqual(self.adapter.list_tasks(), [])
+        audit = self.store.list_audit(limit=20)
+        self.assertTrue(
+            any(
+                value["event"] == "dispatcher.work_not_eligible"
+                and value["data"].get("reason")
+                == "verification_assurance_not_ready"
+                for value in audit
+            )
+        )
+
     def test_every_executable_work_mode_has_a_runner(self) -> None:
         self.assertEqual(
             {value.value for value in ExecutionMode},
@@ -300,6 +382,7 @@ class DispatcherTests(unittest.TestCase):
             parent.id,
         )
         self.assertIn("organizational context, not a Hermes dependency", task.description)
+        self.assertNotIn(parent.title, task.description)
         self.assertFalse(task.raw["operator_metadata"]["goal_mode"])
         active = self.store.list_active_runs()
         self.assertEqual(len(active), 1)
@@ -316,8 +399,21 @@ class DispatcherTests(unittest.TestCase):
 
         self.assertTrue(contract["authorized"])
         self.assertEqual(contract["work_id"], item.id)
-        self.assertNotIn("delegate_task", contract["internal_capabilities"])
-        self.assertIn("local_test", contract["internal_capabilities"])
+        self.assertEqual(
+            contract["internal_capabilities"],
+            list(MANAGED_INTERNAL_CAPABILITIES),
+        )
+        run_contract = self.store.list_active_runs()[0]["result"][
+            "execution_contract"
+        ]
+        self.assertEqual(
+            run_contract["internal_capabilities"],
+            contract["internal_capabilities"],
+        )
+        self.assertEqual(
+            run_contract["dispatch_contract_digest"],
+            contract["contract_digest"],
+        )
         self.assertEqual(
             dispatcher.execution_contract("t_unknown"),
             {"authorized": False, "task_id": "t_unknown"},
@@ -794,6 +890,71 @@ class DispatcherTests(unittest.TestCase):
         )
         self.assertNotIn("contract_unavailable", contract)
 
+    def test_legacy_v03_active_run_without_contract_fails_closed(self) -> None:
+        item = self._ready(
+            "Legacy in-flight execution",
+            acceptance_criteria=["The migrated execution is independently verified"],
+        )
+        dispatcher = self._dispatcher()
+        dispatcher.dispatch_ready()
+        linked = self.store.get_work(item.id)
+        task_id = str(linked.hermes_task_id)
+        active = self.store.list_active_runs()[0]
+        legacy_result = dict(active["result"])
+        legacy_result.pop("execution_contract", None)
+        legacy_result["legacy_schema"] = "v0.3"
+        self.store.update_run(
+            str(active["id"]),
+            result=legacy_result,
+        )
+        self.adapter.set_status(task_id, "done")
+
+        report = dispatcher.reconcile()
+
+        self.assertIn(item.id, report.reconciled_work_ids)
+        self.assertEqual(self.store.get_work(item.id).status, WorkStatus.REVIEW)
+        events = self.store.claim_events("legacy-completion", 1, 60)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["event_type"], "execution.completed")
+        self.assertIsNone(event["payload"]["dispatch_contract_digest"])
+        plan = {
+            "summary": "Quarantined an unverifiable legacy completion",
+            "observations": [],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [],
+            "external_action_proposals": [],
+            "event_dispositions": [
+                {
+                    "event_id": event["id"],
+                    "disposition": "quarantined",
+                    "reason": "The v0.3 run has no immutable execution contract",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+        }
+        result = asyncio.run(
+            Supervisor(
+                config=self.config,
+                store=self.store,
+                llm=ScriptedLLM([plan]),
+                priority_engine=PriorityEngine(),
+            ).run_pass(trigger="event", events=events)
+        )
+
+        migrated = self.store.get_work(item.id)
+        self.assertNotEqual(migrated.status, WorkStatus.DONE)
+        self.assertEqual(migrated.status, WorkStatus.WAITING_INPUT)
+        self.assertGreaterEqual(len(result.question_ids), 1)
+        self.assertEqual(
+            migrated.metadata["completion_quarantine"]["event_id"],
+            event["id"],
+        )
+
     def test_orphan_recovery_revalidates_authorization_before_linking(self) -> None:
         item = self._ready("Recover only if still authorized")
         authorization = item.metadata["dispatch_authorization"]
@@ -1082,12 +1243,47 @@ class DispatcherTests(unittest.TestCase):
         task_id = str(first.hermes_task_id)
         self.adapter.set_status(task_id, "blocked")
         dispatcher.reconcile()
+        blocked = self.store.get_work(item.id)
+        blocked_run = self.store.list_runs()[0]
+        question_id = "qst_exact_blocked_resume"
+        metadata = dict(blocked.metadata)
+        metadata["governance"] = {
+            "execution_authorized": False,
+            "source_trust": "operator",
+        }
+        metadata.pop("dispatch_authorization", None)
+        metadata["blocked_lifecycle"] = {
+            "event_id": "evt_exact_blocked_resume",
+            "hermes_task_id": task_id,
+            "run_id": blocked_run["id"],
+            "attempt": blocked_run["attempt"],
+            "question_id": question_id,
+            "answer_scope_revision": blocked.authorization_scope_revision + 1,
+        }
+        waiting = self.store.update_work(
+            item.id,
+            {"status": WorkStatus.WAITING_INPUT, "metadata": metadata},
+            expected_version=blocked.version,
+            allow_transition_override=True,
+            invalidate_authority=True,
+            authority_invalidation_reason="worker_blocked_requires_fresh_authorization",
+        )
+        binding = self._question_binding(waiting)
+        binding["execution_authorized"] = False
+        binding["blocked_resume"] = {
+            "schema": "hermes-operator.blocked-resume.v1",
+            "question_id": question_id,
+            "work_id": item.id,
+            "blocked_event_id": "evt_exact_blocked_resume",
+            "blocked_run_id": blocked_run["id"],
+            "blocked_attempt": blocked_run["attempt"],
+            "hermes_task_id": task_id,
+        }
         question = UserQuestion(
+            id=question_id,
             question="Which schema should the worker use?",
             blocking_work_ids=[item.id],
-            blocking_work_bindings={
-                item.id: self._question_binding(self.store.get_work(item.id))
-            },
+            blocking_work_bindings={item.id: binding},
         )
         self.store.create_question(question)
         self.store.answer_question(question.id, "Use the 2026 schema")
@@ -1148,40 +1344,297 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("NEW proof is present", second_description)
         self.assertNotIn("OLD scope description", second_description)
 
-    def test_resume_comment_excludes_answers_bound_to_stale_scope(self) -> None:
-        item = self._ready("Bind resume context to one scope")
-        old_question = UserQuestion(
-            question="What belongs to the old scope?",
-            blocking_work_ids=[item.id],
-            blocking_work_bindings={item.id: self._question_binding(item)},
-        )
-        self.store.create_question(old_question)
-        self.store.answer_question(old_question.id, "STALE answer")
-        changed = self.store.update_work(
+    def test_priority_only_edit_preserves_running_completion_contract(self) -> None:
+        item = self._ready("Finish work while the scheduler reprioritizes it")
+        dispatcher = self._dispatcher()
+        dispatcher.dispatch_ready()
+        running = self.store.get_work(item.id)
+        run = self.store.list_active_runs()[0]
+        original_contract = run["result"]["execution_contract"]
+
+        reprioritized = self.store.update_work(
             item.id,
-            {"description": "The execution scope is now different"},
-            expected_version=item.version,
-        )
-        current = self._reauthorize(
-            changed.id,
-            reason="Authorize the replacement scope",
-        )
-        current_question = UserQuestion(
-            question="What belongs to the current scope?",
-            blocking_work_ids=[item.id],
-            blocking_work_bindings={item.id: self._question_binding(current)},
-        )
-        self.store.create_question(current_question)
-        self.store.answer_question(current_question.id, "CURRENT answer")
-
-        comment = self._dispatcher()._resume_comment(
-            current,
-            "run_current",
-            "[resume marker]",
+            {"priority": 99},
+            expected_version=running.version,
+            actor="priority-engine",
         )
 
-        self.assertIn("CURRENT answer", comment)
-        self.assertNotIn("STALE answer", comment)
+        self.assertEqual(
+            reprioritized.authorization_scope_revision,
+            running.authorization_scope_revision,
+        )
+        self.assertEqual(
+            dispatch_contract_digest(
+                reprioritized,
+                profile="executor",
+                skills=[],
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=False,
+            ),
+            original_contract["dispatch_contract_digest"],
+        )
+        self.adapter.set_status(str(running.hermes_task_id), "done")
+        report = dispatcher.reconcile()
+
+        self.assertIn(item.id, report.reconciled_work_ids)
+        self.assertEqual(self.store.get_work(item.id).status, WorkStatus.REVIEW)
+        completed_run = self.store.list_runs()[0]
+        self.assertEqual(completed_run["status"], "completed")
+        self.assertEqual(
+            completed_run["result"]["execution_contract"],
+            original_contract,
+        )
+
+    def test_block_answer_reauthorize_resume_and_verify_end_to_end(self) -> None:
+        item = self._ready(
+            "Resume and finish the exact canonical card",
+            acceptance_criteria=["The named implementation check passes"],
+        )
+        dispatcher = self._dispatcher()
+        dispatcher.dispatch_ready()
+        first = self.store.get_work(item.id)
+        task_id = str(first.hermes_task_id)
+        self.adapter.set_status(task_id, "blocked")
+        dispatcher.reconcile()
+
+        blocked_events = self.store.claim_events("blocked-supervisor", 10, 60)
+        blocked_event = next(
+            value
+            for value in blocked_events
+            if value["event_type"] == "execution.blocked"
+        )
+        blocked_plan = {
+            "summary": "Captured the canonical worker blocker",
+            "observations": [],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [],
+            "external_action_proposals": [],
+            "event_dispositions": [
+                {
+                    "event_id": blocked_event["id"],
+                    "disposition": "question_requested",
+                    "reason": "The exact blocked worker needs operator context",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+        }
+        blocked_result = asyncio.run(
+            Supervisor(
+                config=self.config,
+                store=self.store,
+                llm=ScriptedLLM([blocked_plan]),
+                priority_engine=PriorityEngine(),
+            ).run_pass(trigger="event", events=blocked_events)
+        )
+        self.assertEqual(len(blocked_result.question_ids), 1)
+        question_id = blocked_result.question_ids[0]
+        waiting = self.store.get_work(item.id)
+        question = self.store.get_question(question_id)
+        blocked_context = question["blocking_work_bindings"][item.id][
+            "blocked_resume"
+        ]
+        self.assertEqual(blocked_context["blocked_run_id"], blocked_event["payload"]["run_id"])
+        self.assertEqual(blocked_context["hermes_task_id"], task_id)
+        self.assertEqual(
+            waiting.metadata["blocked_lifecycle"]["answer_scope_revision"],
+            waiting.authorization_scope_revision,
+        )
+
+        self.store.answer_question(question_id, "Use the 2026 schema")
+        unrelated_binding = self._question_binding(waiting)
+        self.store.create_question(
+            UserQuestion(
+                id="qst_unrelated_same_work",
+                question="Unrelated planning preference?",
+                blocking_work_ids=[item.id],
+                blocking_work_bindings={item.id: unrelated_binding},
+                status=QuestionStatus.ANSWERED,
+                answer="UNRELATED ANSWER MUST NOT REACH THE WORKER",
+                answered_at=utc_now(),
+            )
+        )
+        binding = execution_scope_binding(
+            waiting,
+            profile="executor",
+            skills=[],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+        )
+        authorization = self.store.enqueue_work_authorization(
+            item.id,
+            expected_version=waiting.version,
+            expected_scope_revision=waiting.authorization_scope_revision,
+            expected_scope_digest=str(binding["scope_digest"]),
+            profile="executor",
+            skills=[],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+            reason="Fresh authorization after the operator answered the blocker",
+        )
+        answer_events = self.store.claim_events("answer-supervisor", 10, 60)
+        answer_event = next(
+            value for value in answer_events if value["event_type"] == "question.answered"
+        )
+        answer_plan = {
+            "summary": "Recorded the bound operator answer",
+            "observations": [],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [],
+            "external_action_proposals": [],
+            "event_dispositions": [
+                {
+                    "event_id": answer_event["id"],
+                    "disposition": "duplicate",
+                    "reason": "The answer is durably bound to the blocked work",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+        }
+        asyncio.run(
+            Supervisor(
+                config=self.config,
+                store=self.store,
+                llm=ScriptedLLM([answer_plan]),
+                priority_engine=PriorityEngine(),
+            ).run_pass(trigger="event", events=answer_events)
+        )
+        resume_events = self.store.claim_events("resume-supervisor", 10, 60)
+        authorization_event = next(
+            value
+            for value in resume_events
+            if value["id"] == authorization["event_id"]
+        )
+        resume_plan = {
+            "summary": "Applied the fresh exact authorization",
+            "observations": [],
+            "work_operations": [
+                {
+                    "op": "update",
+                    "work_id": item.id,
+                    "expected_version": waiting.version,
+                    "source_event_id": authorization_event["id"],
+                    "changes": {"status": "ready"},
+                }
+            ],
+            "questions": [],
+            "dispatch": [
+                {
+                    "work_id": item.id,
+                    "expected_version": waiting.version,
+                    "source_event_id": authorization_event["id"],
+                    "profile": "executor",
+                    "skills": [],
+                    "goal_mode": False,
+                    "reason": "Continue with the bound operator answer",
+                }
+            ],
+            "memory_candidates": [],
+            "verifications": [],
+            "external_action_proposals": [],
+            "event_dispositions": [
+                {
+                    "event_id": authorization_event["id"],
+                    "disposition": "work_recorded",
+                    "reason": "Fresh execution authority was applied",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                },
+            ],
+        }
+        resume_result = asyncio.run(
+            Supervisor(
+                config=self.config,
+                store=self.store,
+                llm=ScriptedLLM([resume_plan]),
+                priority_engine=PriorityEngine(),
+            ).run_pass(trigger="event", events=resume_events)
+        )
+        self.assertEqual(resume_result.dispatch_work_ids, [item.id])
+
+        dispatch_result = dispatcher.dispatch_ready()
+        self.assertEqual(dispatch_result.dispatched_work_ids, [item.id])
+        resumed = self.store.get_work(item.id)
+        self.assertEqual(resumed.hermes_task_id, task_id)
+        self.assertEqual(len(self.adapter.list_tasks()), 1)
+        comments = self.adapter.show_task(task_id).comments
+        self.assertTrue(
+            any("Use the 2026 schema" in str(value.get("body", "")) for value in comments)
+        )
+        self.assertFalse(
+            any("UNRELATED ANSWER" in str(value.get("body", "")) for value in comments)
+        )
+
+        running = self.store.get_work(item.id)
+        self.store.update_work(
+            item.id,
+            {"priority": 73},
+            expected_version=running.version,
+            actor="priority-engine",
+        )
+        self.adapter.set_status(task_id, "done")
+        dispatcher.reconcile()
+        PriorityEngine().rescore_store(self.store)
+        reviewed = self.store.get_work(item.id)
+        self.assertEqual(reviewed.status, WorkStatus.REVIEW)
+        completion_events = self.store.claim_events("verification-supervisor", 10, 60)
+        completion_event = next(
+            value
+            for value in completion_events
+            if value["event_type"] == "execution.completed"
+        )
+        verification_plan = {
+            "summary": "Independently verified the resumed execution",
+            "observations": [],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [
+                {
+                    "work_id": item.id,
+                    "expected_version": reviewed.version,
+                    "verdict": "passed",
+                    "confidence": 0.95,
+                    "summary": "The named implementation check passed",
+                    "criteria_results": [
+                        {
+                            "criterion": "The named implementation check passes",
+                            "passed": True,
+                            "evidence": "The canonical completion evidence reports success",
+                        }
+                    ],
+                }
+            ],
+            "external_action_proposals": [],
+            "event_dispositions": [
+                {
+                    "event_id": completion_event["id"],
+                    "disposition": "execution_reconciled",
+                    "reason": "The exact resumed run passed independent verification",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+        }
+        verification_result = asyncio.run(
+            Supervisor(
+                config=self.config,
+                store=self.store,
+                llm=ScriptedLLM([verification_plan]),
+                priority_engine=PriorityEngine(),
+            ).run_pass(trigger="event", events=completion_events)
+        )
+
+        self.assertEqual(verification_result.verified_work_ids, [item.id])
+        self.assertEqual(self.store.get_work(item.id).status, WorkStatus.DONE)
 
     def test_failed_verification_retry_gets_distinct_card_and_event(self) -> None:
         item = self._ready("Retry a corrected implementation")

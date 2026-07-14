@@ -186,7 +186,13 @@ class CommandLLM:
     def _run(self, system: str, user: str) -> LLMResult:
         if not self.config.command:
             raise LLMNotConfigured("llm.command is empty")
-        command = [part.format(model=self.config.model) for part in self.config.command]
+        # Only the documented token is substituted. ``str.format`` treats any
+        # JSON or template braces in an argv element as placeholders and can
+        # fail before the configured command is started.
+        command = [
+            part.replace("{model}", self.config.model)
+            for part in self.config.command
+        ]
         input_payload = json.dumps({"system": system, "user": user}, ensure_ascii=False)
         child_env = {
             key: value

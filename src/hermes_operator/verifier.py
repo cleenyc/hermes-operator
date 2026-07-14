@@ -24,6 +24,12 @@ from .models import WorkItem, utc_now
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VERIFICATION_REQUIREMENT_MODEL = "model_evidence"
+VERIFICATION_REQUIREMENT_DETERMINISTIC = "deterministic_required"
+VERIFICATION_REQUIREMENTS = {
+    VERIFICATION_REQUIREMENT_MODEL,
+    VERIFICATION_REQUIREMENT_DETERMINISTIC,
+}
 _SAFE_ENV_NAMES = {
     "LANG",
     "LC_ALL",
@@ -286,6 +292,43 @@ def validate_verification_contract(
             allow_nan=False,
         )
     )
+
+
+def work_verification_requirement(work: WorkItem) -> str:
+    """Return the protected completion assurance required for one work item."""
+
+    value = work.metadata.get(
+        "verification_requirement",
+        VERIFICATION_REQUIREMENT_MODEL,
+    )
+    if value not in VERIFICATION_REQUIREMENTS:
+        raise ValueError(f"unsupported verification requirement: {value}")
+    return str(value)
+
+
+def validate_work_verification_readiness(
+    work: WorkItem,
+    config: VerificationConfig | None = None,
+) -> None:
+    """Fail before authorization when deterministic assurance is incomplete."""
+
+    if (
+        work_verification_requirement(work)
+        != VERIFICATION_REQUIREMENT_DETERMINISTIC
+    ):
+        return
+    contract = work.metadata.get("verification_contract")
+    checks = contract.get("checks", []) if isinstance(contract, Mapping) else []
+    if not isinstance(checks, list) or not checks:
+        raise ValueError(
+            "deterministic_required work needs at least one deployment-owned named check"
+        )
+    if config is not None:
+        # Revalidate at the execution boundary. Protected metadata normally
+        # reaches this point only through the operator CLI, but imported or
+        # upgraded databases must not be able to name an absent deployment
+        # check and still enter active execution.
+        validate_verification_contract(contract, config)
 
 
 @dataclass(slots=True)

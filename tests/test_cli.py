@@ -8,12 +8,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from hermes_operator.cli import main  # noqa: E402
+from hermes_operator.adapters.base import AdapterHealth  # noqa: E402
+from hermes_operator.cli import _doctor, main  # noqa: E402
 from hermes_operator.config import load_config  # noqa: E402
 from hermes_operator.db import SQLiteStore  # noqa: E402
+from hermes_operator.llm import ScriptedLLM  # noqa: E402
 from hermes_operator.models import EventState, WorkStatus  # noqa: E402
 
 
@@ -35,7 +38,7 @@ class CLITests(unittest.TestCase):
         status, document = self.invoke("init")
 
         self.assertEqual(status, 0)
-        self.assertEqual(Path(str(document["created"])), self.config_path)
+        self.assertEqual(Path(str(document["created"])), self.config_path.resolve())
         config = load_config(self.config_path)
         self.assertEqual(config.operator.database_path, self.root / "data" / "operator.db")
         self.assertIsNone(config.obsidian.vault_path)
@@ -80,6 +83,166 @@ class CLITests(unittest.TestCase):
         self.assertFalse(document["ok"])
         self.assertFalse(document["checks"]["llm"]["ok"])
         self.assertTrue(document["checks"]["database"]["ok"])
+
+    def test_doctor_rejects_missing_command_executable(self) -> None:
+        self.invoke("init")
+        configured = self.config_path.read_text(encoding="utf-8").replace(
+            'provider = "openai_compatible"',
+            'provider = "command"',
+            1,
+        ).replace(
+            "command = []",
+            'command = ["/definitely/missing/hermes-operator-planner"]',
+            1,
+        )
+        self.config_path.write_text(configured, encoding="utf-8")
+
+        status, document = self.invoke("doctor")
+
+        self.assertEqual(status, 2)
+        self.assertFalse(document["checks"]["llm"]["ok"])
+        self.assertIn("not found", document["checks"]["llm"]["detail"])
+
+    def test_doctor_live_performs_a_real_model_readiness_probe(self) -> None:
+        self.invoke("init")
+        command = json.dumps(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json; "
+                    "print(json.dumps({'ok': True, "
+                    "'probe': 'hermes-operator-readiness'}))"
+                ),
+            ]
+        )
+        configured = self.config_path.read_text(encoding="utf-8").replace(
+            'provider = "openai_compatible"',
+            'provider = "command"',
+            1,
+        ).replace(
+            "command = []",
+            f"command = {command}",
+            1,
+        )
+        self.config_path.write_text(configured, encoding="utf-8")
+
+        status, document = self.invoke("doctor", "--live")
+
+        self.assertEqual(status, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["checks"]["model_live"]["ok"])
+        self.assertEqual(
+            document["checks"]["model_live"]["detail"],
+            "model probe passed",
+        )
+
+    def test_doctor_live_attests_every_effective_execution_profile(self) -> None:
+        requested_profiles: list[str] = []
+
+        class Dispatcher:
+            @staticmethod
+            def _policy_attestation(profile: str):
+                requested_profiles.append(profile)
+                return True, "fresh", {}
+
+        healthy = AdapterHealth(True, True, "ready")
+        config = SimpleNamespace(
+            config_path=self.config_path,
+            llm=SimpleNamespace(
+                provider="command",
+                command=[sys.executable],
+                model="readiness-test",
+            ),
+            hermes=SimpleNamespace(
+                enabled=True,
+                profile="primary",
+                default_assignee="worker",
+                orchestrator_profile="orchestrator",
+                allowed_profiles=["research", "worker"],
+            ),
+            obsidian=SimpleNamespace(enabled=False),
+            native_automation=SimpleNamespace(enabled=False),
+            policy=SimpleNamespace(
+                external_actions_require_approval=True,
+                external_action_mode="stage_only",
+            ),
+        )
+        service = SimpleNamespace(
+            config=config,
+            store=SimpleNamespace(path=self.root / "operator.db"),
+            hermes=SimpleNamespace(
+                health=lambda: healthy,
+                control_health=lambda: healthy,
+            ),
+            obsidian=SimpleNamespace(
+                health=lambda: AdapterHealth(False, False, "disabled")
+            ),
+            dispatcher=Dispatcher(),
+            llm=ScriptedLLM(
+                [{"ok": True, "probe": "hermes-operator-readiness"}]
+            ),
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            status = _doctor(service, live=True)
+
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(status, 0)
+        self.assertTrue(document["checks"]["policy_attestation"]["ok"])
+        self.assertEqual(
+            requested_profiles,
+            ["orchestrator", "primary", "research", "worker"],
+        )
+
+    def test_run_once_returns_failure_when_a_component_fails(self) -> None:
+        self.invoke("init")
+        command = json.dumps(
+            [sys.executable, "-c", "import sys; sys.exit(7)"]
+        )
+        configured = self.config_path.read_text(encoding="utf-8").replace(
+            'provider = "openai_compatible"',
+            'provider = "command"',
+            1,
+        ).replace(
+            "command = []",
+            f"command = {command}",
+            1,
+        )
+        self.config_path.write_text(configured, encoding="utf-8")
+        self.invoke(
+            "ingest",
+            "--type",
+            "operator.request",
+            "--payload",
+            '{"request":"Exercise the failed planner"}',
+        )
+
+        status, document = self.invoke("run-once", "--no-reconcile")
+
+        self.assertEqual(status, 2)
+        self.assertIn("process_events", document["errors"])
+
+    def test_audit_command_exposes_bounded_operator_history(self) -> None:
+        self.invoke("init")
+        _, created = self.invoke("work", "add", "Audited task")
+
+        status, document = self.invoke(
+            "audit",
+            "--entity-type",
+            "work",
+            "--entity-id",
+            str(created["id"]),
+            "--limit",
+            "10",
+        )
+
+        self.assertEqual(status, 0)
+        self.assertGreaterEqual(document["count"], 1)
+        self.assertTrue(
+            all(item["entity_id"] == created["id"] for item in document["items"])
+        )
 
     def test_work_link_connects_two_existing_items_with_version_fences(self) -> None:
         self.invoke("init")

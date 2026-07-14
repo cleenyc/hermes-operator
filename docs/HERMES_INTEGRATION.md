@@ -21,6 +21,10 @@ inside the Operator daemon.
 hermes-operator --config operator.toml native-jobs plan
 hermes-operator --config operator.toml native-jobs install --dry-run
 hermes-operator --config operator.toml native-jobs install
+
+# For reviewed upgrades of managed v0.3 or v0.4 jobs:
+hermes-operator --config operator.toml native-jobs install --dry-run --reconcile
+hermes-operator --config operator.toml native-jobs install --reconcile
 ```
 
 ## Scope and policy boundary
@@ -152,18 +156,19 @@ The tested host target is Hermes Agent `0.18.2`, tag `v2026.7.7.2`, commit
 `9de9c25f620ff7f1ce0fd5457d596052d5159596`. The release CI installs that exact commit
 and exercises the real turn-ID, hook-resolution, and completion-delivery contracts as a
 required lane. A separate advisory lane runs the same contracts against current Hermes
-`main`; failures there do not weaken the pinned release gate. Other versions remain
-diagnostic-only until they are pilot-tested or added to the required compatibility lane.
+`main`; failures there do not weaken the pinned release gate. Other versions require a
+deployment-owned reviewed-host override after the real-host contracts are exercised.
 
 The plugin records a separate `compatibility_observed` diagnostic and exposes
 `operator_diagnostics`. It reports host surfaces, active profile, hook position, managed
-worker identity semantics, and detected delegation mode without attempting to reorder
-Hermes plugins and hooks. Bridge activation requires positive evidence for the active
-profile, first-valid directive behavior, first-position Operator guard, and dispatcher
-ownership of `HERMES_KANBAN_TASK`. Unknown or incompatible required semantics leave the
+worker task/workspace identity semantics, credential scrubbing, completion artifact
+transport, and detected delegation mode without attempting to reorder Hermes plugins
+and hooks. Bridge activation requires the pinned host or reviewed override plus positive
+evidence for the active profile, first-valid directive behavior, first-position Operator
+guard, and dispatcher ownership of `HERMES_KANBAN_TASK` and
+`HERMES_KANBAN_WORKSPACE`. Unknown or incompatible required semantics leave the
 local guard installed in fail-closed policy-only mode and publish a best-effort negative
-policy observation. The installed Hermes version remains diagnostic rather than an exact
-activation lock. Unsupported optional hooks reduce observation only; rejection of the
+policy observation. Unsupported optional hooks reduce observation only; rejection of the
 required pre-tool hook disables the bridge for managed execution.
 
 ## HTTP contract
@@ -217,8 +222,8 @@ The request envelope is:
   "occurred_at": "2026-07-13T22:30:00+00:00",
   "payload": {
     "profile": "operator",
-    "plugin_version": "1.5.0",
-    "policy_version": "6.0.0",
+    "plugin_version": "1.6.0",
+    "policy_version": "7.0.0",
     "policy_digest": "<64 lowercase SHA-256 hex characters>",
     "guard_active": true,
     "policy_mode": "default_deny",
@@ -375,6 +380,14 @@ Every bridge HTTP request carries the required `HERMES_OPERATOR_BRIDGE_TOKEN` as
 `Authorization: Bearer <token>`. Put the service behind a private network or TLS when
 it is not bound only to localhost.
 
+Answers, work authorization and updates, reminder resolution, policy attestation, and
+policy revocation also carry an HMAC made with
+`HERMES_OPERATOR_BRIDGE_PROOF_SECRET`. It binds the exact purpose, method, endpoint,
+body digest, timestamp, and nonce. The server consumes the nonce atomically in SQLite,
+so capture, body substitution, cross-endpoint use, process restart, and replay fail
+closed. The plugin removes both bridge secrets from `os.environ` immediately after
+loading its private client configuration.
+
 Use only the scoped bridge token. Never place the operator API token, approval secret,
 Hermes run-control token, or any outbound connector credential in the Hermes plugin
 environment. The bridge token is authorized only for the endpoints in the table above.
@@ -389,7 +402,7 @@ The plugin is packaged independently from the control plane. A release wheel can
 
 ```bash
 export HERMES_PLUGIN_ROOT="${HERMES_HOME:-$HOME/.hermes}/plugins"
-export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.5.0-py3-none-any.whl"
+export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.6.0-py3-none-any.whl"
 export PLUGIN_STAGE="$(mktemp -d)"
 python -m pip install --no-deps --target "$PLUGIN_STAGE" "$PLUGIN_WHEEL"
 install -d "$HERMES_PLUGIN_ROOT"
@@ -408,6 +421,7 @@ Set runtime configuration in the environment used to start Hermes:
 ```bash
 export HERMES_OPERATOR_URL="http://127.0.0.1:8787"
 export HERMES_OPERATOR_BRIDGE_TOKEN="replace-with-a-random-scoped-bridge-token"
+export HERMES_OPERATOR_BRIDGE_PROOF_SECRET="replace-with-an-independent-32-byte-secret"
 export HERMES_OPERATOR_PROFILE="operator"
 export HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS="120"
 ```
@@ -437,7 +451,9 @@ for a repository the operator trusts.
 | --- | --- | --- |
 | `HERMES_OPERATOR_URL` | `http://127.0.0.1:8787` | Control-plane base URL |
 | `HERMES_OPERATOR_BRIDGE_TOKEN` | required for HTTP bridge | Scoped bridge API token |
+| `HERMES_OPERATOR_BRIDGE_PROOF_SECRET` | required for authority-bearing bridge calls | Independent HMAC secret of at least 32 bytes; scrubbed before tools run |
 | `HERMES_OPERATOR_PROFILE` | required for HTTP bridge | Stable worker profile name used for policy attestation |
+| `HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE` | `false` | Deployment-owned confirmation that a non-pinned Hermes build passed the real-host contract; never bypasses semantic gates |
 | `HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS` | `120` | Daemon and hook refresh attempt interval, from 120 to 240 seconds |
 | `HERMES_OPERATOR_TIMEOUT_SECONDS` | `1.5` | Per-request timeout, from 0.1 to 10 seconds |
 | `HERMES_OPERATOR_INJECT_CONTEXT` | `true` | Read and inject next work and questions |
@@ -453,6 +469,11 @@ missing service credential from silently removing the worker guard. A production
 deployment should still treat missing bridge health and attestation as a startup failure
 because priorities, questions, lifecycle reconciliation, and work reservation are
 absent.
+
+Managed bridge activation is pinned to Hermes `0.18.2` by default. A different host
+requires `HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE=true` after its real-host suite is
+reviewed. Profile, first-hook, directive, task/workspace ownership, credential scrub,
+and completion-artifact transport checks still fail closed under an override.
 
 ## Hermes capabilities used
 

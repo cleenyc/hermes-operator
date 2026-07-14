@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -27,7 +28,11 @@ from .models import (
 )
 from .native_automation import HermesNativeAutomationManager
 from .service import OperatorService
-from .verifier import validate_verification_contract
+from .verifier import (
+    VERIFICATION_REQUIREMENTS,
+    validate_verification_contract,
+    validate_work_verification_readiness,
+)
 
 
 CONFIG_TEMPLATE = """[operator]
@@ -59,6 +64,7 @@ pass_env = []
 
 [hermes]
 enabled = false
+active_isolation_acknowledged = false
 binary = "hermes"
 profile = "operator"
 board = "default"
@@ -78,9 +84,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.5.0"]
-allowed_policy_versions = ["6.0.0"]
-allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
+allowed_plugin_versions = ["1.6.0"]
+allowed_policy_versions = ["7.0.0"]
+allowed_policy_digests = ["15f8e0a622abce0227c9b3f6b0168cf98bd17218933881b4d50f705edf2278d5"]
 
 [obsidian]
 enabled = false
@@ -109,6 +115,7 @@ host = "${HERMES_OPERATOR_BIND_HOST:-127.0.0.1}"
 port = 8787
 api_token_env = "HERMES_OPERATOR_API_TOKEN"
 bridge_token_env = "HERMES_OPERATOR_BRIDGE_TOKEN"
+bridge_proof_secret_env = "HERMES_OPERATOR_BRIDGE_PROOF_SECRET"
 max_body_bytes = 1048576
 allow_unsigned_webhooks = false
 
@@ -166,7 +173,14 @@ def build_parser() -> argparse.ArgumentParser:
     initialize = subcommands.add_parser("init", help="Create a portable configuration")
     initialize.add_argument("--force", action="store_true")
 
-    subcommands.add_parser("doctor", help="Validate configuration and integrations")
+    doctor = subcommands.add_parser(
+        "doctor", help="Validate configuration and integrations"
+    )
+    doctor.add_argument(
+        "--live",
+        action="store_true",
+        help="Run explicit model and active-execution readiness probes",
+    )
     subcommands.add_parser("run", help="Run the live autonomous service")
     once = subcommands.add_parser("run-once", help="Execute one control-plane cycle")
     once.add_argument("--no-reconcile", action="store_true")
@@ -197,6 +211,13 @@ def build_parser() -> argparse.ArgumentParser:
     event_replay = event_commands.add_parser("replay")
     event_replay.add_argument("event_id")
     event_replay.add_argument("--reason", required=True)
+
+    audit = subcommands.add_parser("audit", help="Inspect the append-only audit log")
+    audit.add_argument("--actor", action="append")
+    audit.add_argument("--event", dest="audit_event", action="append")
+    audit.add_argument("--entity-type")
+    audit.add_argument("--entity-id")
+    audit.add_argument("--limit", type=int, default=200)
 
     next_command = subcommands.add_parser("next", help="Show ranked next work")
     next_command.add_argument("--limit", type=int, default=5)
@@ -271,6 +292,11 @@ def build_parser() -> argparse.ArgumentParser:
     verification_change.add_argument("--set", type=Path, dest="contract_file")
     verification_change.add_argument("--clear", action="store_true")
     work_verification.add_argument("--expected-version", type=int, required=True)
+    work_verification.add_argument(
+        "--assurance",
+        choices=sorted(VERIFICATION_REQUIREMENTS),
+        help="Set the protected completion assurance for this work",
+    )
     work_dispatch = work_commands.add_parser("dispatch")
     work_dispatch.add_argument("work_id")
     work_dispatch.add_argument("--profile")
@@ -352,6 +378,11 @@ def build_parser() -> argparse.ArgumentParser:
     native_commands.add_parser("plan")
     native_install = native_commands.add_parser("install")
     native_install.add_argument("--dry-run", action="store_true")
+    native_install.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Explicitly update existing managed jobs to the current desired prompts",
+    )
     return parser
 
 
@@ -383,14 +414,31 @@ def _initialize(path: Path, *, force: bool) -> int:
     return 0
 
 
-def _doctor(service: OperatorService) -> int:
+def _doctor(service: OperatorService, *, live: bool = False) -> int:
     llm = service.config.llm
     if llm.provider == "openai_compatible":
         llm_ok = bool(llm.model and llm.model != "configure-at-deployment" and llm.resolved_api_key())
         llm_detail = "configured" if llm_ok else "model or API key is not configured"
     else:
-        llm_ok = bool(llm.command)
-        llm_detail = "configured" if llm_ok else "command is empty"
+        executable = llm.command[0] if llm.command else ""
+        resolved = shutil.which(executable) if executable else None
+        if executable and ("/" in executable or "\\" in executable):
+            path = Path(executable).expanduser()
+            resolved = (
+                str(path)
+                if path.is_file() and os.access(path, os.X_OK)
+                else None
+            )
+        llm_ok = bool(llm.command and resolved)
+        llm_detail = (
+            f"configured executable: {resolved}"
+            if llm_ok
+            else (
+                "command executable was not found"
+                if llm.command
+                else "command is empty"
+            )
+        )
     hermes = (
         asdict(service.hermes.health())
         if service.hermes is not None
@@ -409,6 +457,96 @@ def _doctor(service: OperatorService) -> int:
             "daemon_has_outbound_connectors": False,
         },
     }
+    if live:
+        model_probe: dict[str, object]
+        if not llm_ok:
+            model_probe = {
+                "ok": False,
+                "detail": "model configuration is not ready",
+            }
+        else:
+            try:
+                response = asyncio.run(
+                    service.llm.generate_json(
+                        system=(
+                            "This is a read-only Hermes Operator readiness probe. "
+                            "Return exactly one JSON object."
+                        ),
+                        user=(
+                            'Return {"ok":true,'
+                            '"probe":"hermes-operator-readiness"}.'
+                        ),
+                    )
+                )
+                valid = bool(
+                    response.data.get("ok") is True
+                    and response.data.get("probe")
+                    == "hermes-operator-readiness"
+                )
+                model_probe = {
+                    "ok": valid,
+                    "detail": (
+                        "model probe passed"
+                        if valid
+                        else "model returned an unexpected readiness object"
+                    ),
+                    "model": response.model,
+                }
+            except Exception as error:
+                model_probe = {
+                    "ok": False,
+                    "detail": f"{type(error).__name__}: {error}"[:2000],
+                }
+        checks["model_live"] = model_probe
+
+        if service.dispatcher is not None:
+            profiles = sorted(
+                {
+                    value
+                    for value in [
+                        service.config.hermes.profile,
+                        service.config.hermes.default_assignee,
+                        service.config.hermes.orchestrator_profile,
+                        *service.config.hermes.allowed_profiles,
+                    ]
+                    if value
+                }
+            )
+            attestations: list[dict[str, object]] = []
+            for profile in profiles:
+                attested, reason, _ = service.dispatcher._policy_attestation(profile)
+                attestations.append(
+                    {
+                        "ok": attested,
+                        "profile": profile,
+                        "detail": reason,
+                    }
+                )
+            checks["policy_attestation"] = {
+                "ok": bool(attestations)
+                and all(bool(value["ok"]) for value in attestations),
+                "profiles": attestations,
+            }
+            control_health = asdict(service.hermes.control_health())
+            checks["run_control"] = {
+                "ok": bool(control_health.get("available")),
+                **control_health,
+            }
+        if service.config.native_automation.enabled:
+            try:
+                native_status = HermesNativeAutomationManager(
+                    service.config
+                ).status()
+            except Exception as error:
+                native_status = {
+                    "ok": False,
+                    "detail": f"{type(error).__name__}: {error}"[:2000],
+                }
+            native_status["provider_access"] = (
+                "Google OAuth and native Obsidian vault access remain Hermes-owned "
+                "deployment acceptance checks"
+            )
+            checks["native_automation"] = native_status
     overall = all(bool(check["ok"]) for check in checks.values())
     _emit({"ok": overall, "checks": checks})
     return 0 if overall else 2
@@ -529,6 +667,14 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
                 contract_value,
                 service.config.verification,
             )
+        if arguments.assurance is not None:
+            metadata["verification_requirement"] = arguments.assurance
+        if metadata.get("verification_requirement") == "deterministic_required":
+            contract = metadata.get("verification_contract")
+            if not isinstance(contract, dict) or not contract.get("checks"):
+                raise ValueError(
+                    "deterministic_required work needs at least one deployment-owned named check"
+                )
         updated = service.store.update_work(
             item.id,
             {"metadata": metadata},
@@ -555,6 +701,10 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
         )
     elif arguments.work_command == "dispatch":
         item = service.store.get_work(arguments.work_id)
+        validate_work_verification_readiness(
+            item,
+            service.config.verification,
+        )
         if item.status in {
             WorkStatus.DONE,
             WorkStatus.CANCELLED,
@@ -727,13 +877,16 @@ def execute(arguments: argparse.Namespace) -> int:
     config = load_config(arguments.config)
     service = OperatorService(config)
     if arguments.command == "doctor":
-        return _doctor(service)
+        return _doctor(service, live=arguments.live)
     if arguments.command == "run":
         asyncio.run(service.run())
         return 0
     if arguments.command == "run-once":
-        _emit(asyncio.run(service.run_once(force_reconcile=not arguments.no_reconcile)))
-        return 0
+        cycle = asyncio.run(
+            service.run_once(force_reconcile=not arguments.no_reconcile)
+        )
+        _emit(cycle)
+        return 2 if cycle.errors else 0
     if arguments.command == "status":
         _emit({"health": service.health(), "state": service.store.snapshot()})
         return 0
@@ -768,6 +921,16 @@ def execute(arguments: argparse.Namespace) -> int:
                     actor="operator-cli",
                 )
             )
+        return 0
+    if arguments.command == "audit":
+        items = service.store.list_audit(
+            actors=arguments.actor,
+            events=arguments.audit_event,
+            entity_type=arguments.entity_type,
+            entity_id=arguments.entity_id,
+            limit=arguments.limit,
+        )
+        _emit({"items": items, "count": len(items)})
         return 0
     if arguments.command == "next":
         items = service.next_work(max(1, arguments.limit))
@@ -861,7 +1024,12 @@ def execute(arguments: argparse.Namespace) -> int:
         if arguments.native_command == "plan":
             _emit(manager.plan())
         else:
-            _emit(manager.install(dry_run=arguments.dry_run))
+            _emit(
+                manager.install(
+                    dry_run=arguments.dry_run,
+                    reconcile=arguments.reconcile,
+                )
+            )
         return 0
     raise ValueError(f"Unsupported command: {arguments.command}")
 

@@ -30,6 +30,10 @@ from .models import (
     WorkStatus,
     utc_now,
 )
+from .verifier import (
+    validate_work_verification_readiness,
+    work_verification_requirement,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,17 @@ _RUNNING_STATES = {
 }
 _READY_STATES = {"backlog", "open", "planned", "ready", "todo", "triage", "queued"}
 _CANCELLED_STATES = {"archived", "canceled", "cancelled", "discarded"}
+
+
+# This is the one canonical capability grant for a managed Hermes worker. It
+# is bound into the approved dispatch digest and returned by the live contract
+# endpoint, so neither side can silently widen the set after authorization.
+MANAGED_INTERNAL_CAPABILITIES = (
+    "local_build",
+    "local_read",
+    "local_test",
+    "local_write",
+)
 
 
 def dispatch_contract_digest(
@@ -76,10 +91,11 @@ def dispatch_contract_digest(
         "due_at": item.due_at,
         "scheduled_at": item.scheduled_at,
         "recurrence_rule": item.recurrence_rule,
-        "priority": item.priority,
         "profile": profile,
         "effective_skills": effective_skills,
         "goal_mode": bool(goal_mode),
+        "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
+        "verification_requirement": work_verification_requirement(item),
         "verification_contract": item.metadata.get("verification_contract"),
     }
     encoded = json.dumps(
@@ -204,12 +220,7 @@ class HermesDispatcher:
                 "profile": str(item.assignee or ""),
                 "contract_digest": str(authorization.get("contract_digest", "")),
                 "run_id": run_id,
-                "internal_capabilities": [
-                    "local_read",
-                    "local_write",
-                    "local_test",
-                    "local_build",
-                ],
+                "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
             }
 
     def claim_delegation_batch(
@@ -899,6 +910,14 @@ class HermesDispatcher:
                 item,
                 reservation=reservation,
             )
+            resume_answer = (
+                self._bound_blocked_answer(item, previous)
+                if item.hermes_task_id
+                and previous
+                and previous.get("status") == "blocked"
+                and previous.get("external_run_id") == item.hermes_task_id
+                else None
+            )
             can_resume = bool(
                 item.hermes_task_id
                 and previous
@@ -908,21 +927,30 @@ class HermesDispatcher:
                     previous,
                     execution_contract,
                 )
+                and resume_answer is not None
             )
             if can_resume:
                 existing = self.adapter.show_task(str(item.hermes_task_id))
                 existing_state = self._normalize_state(existing.status)
-                if existing_state in _BLOCKED_STATES:
+                if existing_state in (
+                    _BLOCKED_STATES | _READY_STATES | _RUNNING_STATES
+                ):
                     marker = f"[hermes-operator resume {run['id']}]"
                     if not any(
                         marker in str(comment.get("body", ""))
                         for comment in existing.comments
                         if isinstance(comment, Mapping)
                     ):
-                        self.adapter.comment_task(
+                        existing = self.adapter.comment_task(
                             existing.id,
-                            self._resume_comment(item, str(run["id"]), marker),
+                            self._resume_comment(
+                                item,
+                                str(run["id"]),
+                                marker,
+                                answered_question=resume_answer,
+                            ),
                         )
+                if existing_state in _BLOCKED_STATES:
                     task = self.adapter.unblock_task(existing.id)
                 elif existing_state in (_READY_STATES | _RUNNING_STATES):
                     # Recovery after an unblock response was lost. The queued
@@ -1486,7 +1514,15 @@ class HermesDispatcher:
         previous_run: Mapping[str, Any],
         current_contract: Mapping[str, Any],
     ) -> bool:
-        """Require an exact immutable execution generation before card reuse."""
+        """Require the same semantic execution contract before card reuse.
+
+        A canonical worker block deliberately revokes authority and advances the
+        authorization scope revision.  That new authority generation must not
+        force a replacement card when the requested work and executor contract
+        are otherwise unchanged.  Fresh authorization is checked before a run
+        reservation is created; this comparison therefore keeps revocation
+        generation separate from semantic card identity.
+        """
 
         result = previous_run.get("result", {})
         if not isinstance(result, Mapping):
@@ -1499,70 +1535,102 @@ class HermesDispatcher:
         digests = (
             previous_contract.get("dispatch_contract_digest"),
             previous_contract.get("execution_scope_digest"),
+            current_contract.get("dispatch_contract_digest"),
+            current_contract.get("execution_scope_digest"),
         )
         if not all(
             isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
             for value in digests
         ):
             return False
-        scope_revision = previous_contract.get("scope_revision")
-        if (
-            isinstance(scope_revision, bool)
-            or not isinstance(scope_revision, int)
-            or scope_revision < 1
+        for scope_revision in (
+            previous_contract.get("scope_revision"),
+            current_contract.get("scope_revision"),
         ):
-            return False
+            if (
+                isinstance(scope_revision, bool)
+                or not isinstance(scope_revision, int)
+                or scope_revision < 1
+            ):
+                return False
         comparable_fields = (
             "schema",
             "dispatch_contract_digest",
-            "execution_scope_digest",
-            "scope_revision",
             "profile",
             "skills",
             "default_skills",
             "goal_mode",
+            "internal_capabilities",
+            "verification_requirement",
         )
         return all(
             previous_contract.get(field) == current_contract.get(field)
             for field in comparable_fields
         )
 
-    def _resume_comment(self, item: WorkItem, run_id: str, marker: str) -> str:
-        answers = [
-            value
-            for value in self.store.list_questions(status="answered", limit=1000)
-            if value.get("answer")
-            and isinstance(value.get("blocking_work_bindings"), Mapping)
-            and isinstance(
-                value["blocking_work_bindings"].get(item.id),
-                Mapping,
-            )
-            and binding_matches_work(
-                value["blocking_work_bindings"][item.id],
-                item,
-            )
-        ][-5:]
+    def _bound_blocked_answer(
+        self,
+        item: WorkItem,
+        blocked_run: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return only the answer bound to this exact blocked card generation."""
+
+        lifecycle = item.metadata.get("blocked_lifecycle", {})
+        if not isinstance(lifecycle, Mapping):
+            return None
+        question_id = lifecycle.get("question_id")
+        attempt = blocked_run.get("attempt")
+        if (
+            not isinstance(question_id, str)
+            or not question_id
+            or lifecycle.get("run_id") != blocked_run.get("id")
+            or lifecycle.get("hermes_task_id") != item.hermes_task_id
+            or lifecycle.get("attempt") != attempt
+            or lifecycle.get("answer_scope_revision")
+            != item.authorization_scope_revision
+        ):
+            return None
+        try:
+            question = self.store.get_question(question_id)
+        except NotFound:
+            return None
+        bindings = question.get("blocking_work_bindings", {})
+        binding = bindings.get(item.id) if isinstance(bindings, Mapping) else None
+        context = binding.get("blocked_resume") if isinstance(binding, Mapping) else None
+        if (
+            question.get("status") != "answered"
+            or not question.get("answer")
+            or not isinstance(context, Mapping)
+            or context.get("schema") != "hermes-operator.blocked-resume.v1"
+            or context.get("question_id") != question_id
+            or context.get("work_id") != item.id
+            or context.get("blocked_event_id") != lifecycle.get("event_id")
+            or context.get("blocked_run_id") != blocked_run.get("id")
+            or context.get("blocked_attempt") != attempt
+            or context.get("hermes_task_id") != item.hermes_task_id
+            or not binding_matches_work(binding, item)
+        ):
+            return None
+        return question
+
+    def _resume_comment(
+        self,
+        item: WorkItem,
+        run_id: str,
+        marker: str,
+        *,
+        answered_question: Mapping[str, Any],
+    ) -> str:
         lines = [
             marker,
             "A fresh exact execution authorization resumed this task.",
             f"Canonical work item: {item.id}",
             f"Canonical run reservation: {run_id}",
+            "Operator answer:",
         ]
-        if answers:
-            lines.append("Operator answers:")
-            for value in answers:
-                question = str(value.get("question", ""))[:500]
-                answer = str(value.get("answer", ""))[:1500]
-                lines.append(f"- {question}\n  Answer: {answer}")
-        else:
-            request = item.metadata.get("dispatch_request", {})
-            reason = (
-                str(request.get("reason", ""))
-                if isinstance(request, Mapping)
-                else ""
-            )
-            if reason:
-                lines.append("Authorization context: " + reason[:1500])
+        question = str(answered_question.get("question", ""))[:500]
+        answer = str(answered_question.get("answer", ""))[:1500]
+        lines.append(f"- {question}\n  Answer: {answer}")
         lines.append("Continue only within the unchanged acceptance criteria.")
         return "\n".join(lines)[:6000]
 
@@ -1579,20 +1647,11 @@ class HermesDispatcher:
             "- Return external-facing drafts and proposed actions for explicit approval."
         )
         if item.parent_id:
-            try:
-                parent = self.store.get_work(item.parent_id)
-                sections.append(
-                    "Operator hierarchy context:\n"
-                    f"- Parent work item: {parent.id}\n"
-                    f"- Parent title: {parent.title}\n"
-                    "- This is organizational context, not a Hermes dependency."
-                )
-            except NotFound:
-                sections.append(
-                    "Operator hierarchy context:\n"
-                    f"- Parent work item: {item.parent_id}\n"
-                    "- This is organizational context, not a Hermes dependency."
-                )
+            sections.append(
+                "Operator hierarchy context:\n"
+                f"- Parent work item: {item.parent_id}\n"
+                "- This is organizational context, not a Hermes dependency."
+            )
         request = item.metadata.get("dispatch_request", {})
         request = request if isinstance(request, Mapping) else {}
         if bool(request.get("goal_mode", self.config.hermes.goal_mode)):
@@ -1619,6 +1678,11 @@ class HermesDispatcher:
                 "Requested Hermes skills: " + ", ".join(str(value) for value in skills)
             )
         verification_contract = item.metadata.get("verification_contract")
+        verification_requirement = work_verification_requirement(item)
+        sections.append(
+            "Completion assurance:\n"
+            f"- Requirement: {verification_requirement}"
+        )
         if isinstance(verification_contract, Mapping):
             artifacts = verification_contract.get("artifacts", [])
             checks = verification_contract.get("checks", [])
@@ -1686,6 +1750,8 @@ class HermesDispatcher:
             "skills": skills,
             "default_skills": list(self.config.hermes.default_skills),
             "goal_mode": goal_mode,
+            "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
+            "verification_requirement": work_verification_requirement(item),
             "captured_at": utc_now(),
         }
 
@@ -1714,6 +1780,10 @@ class HermesDispatcher:
             "scope_revision": contract.get("scope_revision"),
             "work_version": contract.get("work_version"),
             "profile": contract.get("profile"),
+            "internal_capabilities": contract.get("internal_capabilities"),
+            "verification_requirement": contract.get(
+                "verification_requirement"
+            ),
         }
 
     def _dispatch_metadata(
@@ -1740,6 +1810,8 @@ class HermesDispatcher:
             "orchestrator_profile": self.config.hermes.orchestrator_profile,
             "goal_mode": bool(request.get("goal_mode", self.config.hermes.goal_mode)),
             "skills": skills,
+            "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
+            "verification_requirement": work_verification_requirement(item),
         }
 
     def _hermes_metadata(
@@ -1792,6 +1864,13 @@ class HermesDispatcher:
     ) -> tuple[bool, str]:
         if not self.store.dependencies_satisfied(item.id):
             return False, "dependencies_not_satisfied"
+        try:
+            validate_work_verification_readiness(
+                item,
+                self.config.verification,
+            )
+        except ValueError:
+            return False, "verification_assurance_not_ready"
         governance = item.metadata.get("governance", {})
         if not (
             isinstance(governance, Mapping)

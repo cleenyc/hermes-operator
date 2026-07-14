@@ -4,9 +4,12 @@ import hashlib
 import hmac
 import http.client
 import json
+import re
+import secrets
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +33,8 @@ from hermes_operator.models import (  # noqa: E402
 
 
 class APITests(unittest.TestCase):
+    bridge_proof_secret = "proof-secret-that-is-at-least-32-bytes-long"
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.store = SQLiteStore(Path(self.temporary.name) / "operator.db")
@@ -40,6 +45,7 @@ class APITests(unittest.TestCase):
             store=self.store,
             api_token="operator-token",
             bridge_token="bridge-token",
+            bridge_proof_secret=self.bridge_proof_secret,
             webhook_secrets={"gmail": "gmail-secret"},
             allow_unsigned_webhooks=True,
             max_body_bytes=1024,
@@ -69,11 +75,33 @@ class APITests(unittest.TestCase):
         document: dict[str, Any] | None = None,
         raw: bytes | None = None,
         headers: dict[str, str] | None = None,
+        bridge_proof: bool = True,
     ) -> tuple[int, dict[str, Any]]:
         body = raw if raw is not None else (
             json.dumps(document).encode("utf-8") if document is not None else None
         )
         request_headers = dict(headers or {})
+        purpose = self._bridge_proof_purpose(method, path)
+        if method.upper() == "POST" and path.split("?", 1)[0] == "/v1/events/hermes":
+            event_type = document.get("event_type") if isinstance(document, dict) else None
+            if event_type == "policy.attested":
+                purpose = "policy.attest"
+            elif event_type == "policy.revoked":
+                purpose = "policy.revoke"
+        if (
+            bridge_proof
+            and purpose is not None
+            and request_headers.get("Authorization") == "Bearer bridge-token"
+            and "X-Hermes-Operator-Proof" not in request_headers
+        ):
+            request_headers.update(
+                self.signed_bridge_headers(
+                    method,
+                    path,
+                    body or b"",
+                    purpose,
+                )
+            )
         if body is not None:
             request_headers.setdefault("Content-Type", "application/json")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
@@ -92,6 +120,58 @@ class APITests(unittest.TestCase):
     @staticmethod
     def bridge_headers() -> dict[str, str]:
         return {"Authorization": "Bearer bridge-token"}
+
+    @staticmethod
+    def _bridge_proof_purpose(method: str, path: str) -> str | None:
+        if method.upper() != "POST":
+            return None
+        endpoint = path.split("?", 1)[0]
+        patterns = (
+            (r"/v1/hermes/questions/[^/]+/answer", "human.answer_question"),
+            (r"/v1/hermes/work/[^/]+/authorize", "human.authorize_work"),
+            (r"/v1/hermes/work/[^/]+/update", "human.update_work"),
+            (r"/v1/hermes/work/[^/]+/reminder", "human.resolve_reminder"),
+        )
+        for pattern, purpose in patterns:
+            if re.fullmatch(pattern, endpoint):
+                return purpose
+        return None
+
+    def signed_bridge_headers(
+        self,
+        method: str,
+        path: str,
+        body: bytes,
+        purpose: str,
+        *,
+        nonce: str | None = None,
+        timestamp: int | None = None,
+    ) -> dict[str, str]:
+        endpoint = path.split("?", 1)[0]
+        timestamp_text = str(int(time.time()) if timestamp is None else timestamp)
+        nonce = nonce or secrets.token_hex(16)
+        canonical = "\n".join(
+            (
+                "v1",
+                timestamp_text,
+                nonce,
+                purpose,
+                method.upper(),
+                endpoint,
+                hashlib.sha256(body).hexdigest(),
+            )
+        ).encode("utf-8")
+        signature = hmac.new(
+            self.bridge_proof_secret.encode("utf-8"),
+            canonical,
+            hashlib.sha256,
+        ).hexdigest()
+        return {
+            "Authorization": "Bearer bridge-token",
+            "X-Hermes-Operator-Proof": signature,
+            "X-Hermes-Operator-Proof-Nonce": nonce,
+            "X-Hermes-Operator-Proof-Timestamp": timestamp_text,
+        }
 
     def test_health_is_public_but_operator_reads_are_protected(self) -> None:
         status, document = self.request("GET", "/health")
@@ -173,6 +253,43 @@ class APITests(unittest.TestCase):
         self.assertNotIn("database", document)
         self.assertNotIn("last_cycle", document)
         self.assertNotIn("private", json.dumps(document))
+
+    def test_audit_read_requires_admin_and_enforces_filters_and_limit(self) -> None:
+        first = WorkItem(title="First audited work")
+        second = WorkItem(title="Second audited work")
+        self.store.create_work(first, actor="operator-one")
+        self.store.create_work(second, actor="operator-two")
+
+        status, document = self.request("GET", "/v1/audit")
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "unauthorized")
+        status, document = self.request(
+            "GET", "/v1/audit", headers=self.bridge_headers()
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "unauthorized")
+
+        status, document = self.request(
+            "GET",
+            (
+                "/v1/audit?actor=operator-one&event=work.created"
+                f"&entity_type=work&entity_id={first.id}&limit=1"
+            ),
+            headers=self.operator_headers(),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(document["count"], 1)
+        self.assertEqual(document["items"][0]["actor"], "operator-one")
+        self.assertEqual(document["items"][0]["event"], "work.created")
+        self.assertEqual(document["items"][0]["entity_type"], "work")
+        self.assertEqual(document["items"][0]["entity_id"], first.id)
+
+        status, document = self.request(
+            "GET", "/v1/audit?limit=1001", headers=self.operator_headers()
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(document["error"]["code"], "invalid_limit")
 
     def test_bridge_token_is_scoped_to_context_and_hermes_ingress(self) -> None:
         item = WorkItem(title="Visible next task", status=WorkStatus.READY)
@@ -460,6 +577,110 @@ class APITests(unittest.TestCase):
                 "WHERE event_type = 'operator.work_authorized'"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_authority_bridge_proofs_are_exact_short_lived_and_single_use(self) -> None:
+        question = UserQuestion(question="Which release?")
+        self.store.create_question(question)
+        path = f"/v1/hermes/questions/{question.id}/answer"
+        valid_document = {"answer": "July"}
+        valid_body = json.dumps(valid_document).encode("utf-8")
+
+        status, document = self.request(
+            "POST",
+            path,
+            document=valid_document,
+            headers=self.bridge_headers(),
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "bridge_proof_required")
+
+        replay_headers = self.signed_bridge_headers(
+            "POST",
+            path,
+            valid_body,
+            "human.answer_question",
+            nonce="1" * 32,
+        )
+        status, document = self.request(
+            "POST",
+            path,
+            document={"answer": "August"},
+            headers=replay_headers,
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "bridge_proof_invalid")
+
+        status, answered = self.request(
+            "POST",
+            path,
+            document=valid_document,
+            headers=replay_headers,
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(answered["answer"], "July")
+
+        # The replay fence lives in SQLite, not the HTTP process. Restarting the
+        # service must not revive the still-fresh captured proof.
+        self.service.stop()
+        self.context = APIContext(
+            store=self.store,
+            api_token="operator-token",
+            bridge_token="bridge-token",
+            bridge_proof_secret=self.bridge_proof_secret,
+            allow_unsigned_webhooks=True,
+            action_stager=self.actions,
+        )
+        self.service = APIService("127.0.0.1", 0, self.context)
+        self.host, self.port = self.service.start()
+
+        status, document = self.request(
+            "POST",
+            path,
+            document=valid_document,
+            headers=replay_headers,
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(document["error"]["code"], "bridge_proof_replayed")
+
+        second = UserQuestion(question="Which customer?")
+        self.store.create_question(second)
+        second_path = f"/v1/hermes/questions/{second.id}/answer"
+        wrong_purpose = self.signed_bridge_headers(
+            "POST",
+            second_path,
+            valid_body,
+            "human.update_work",
+        )
+        status, document = self.request(
+            "POST",
+            second_path,
+            document=valid_document,
+            headers=wrong_purpose,
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "bridge_proof_invalid")
+
+        expired = self.signed_bridge_headers(
+            "POST",
+            second_path,
+            valid_body,
+            "human.answer_question",
+            timestamp=int(time.time()) - 3600,
+        )
+        status, document = self.request(
+            "POST",
+            second_path,
+            document=valid_document,
+            headers=expired,
+            bridge_proof=False,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(document["error"]["code"], "bridge_proof_expired")
 
     def test_bridge_authorization_requires_echo_of_exact_preview_shape(self) -> None:
         item = WorkItem(title="Preview exact executor scope")

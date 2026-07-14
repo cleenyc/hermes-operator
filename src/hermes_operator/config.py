@@ -72,6 +72,7 @@ class LLMConfig:
 @dataclass(slots=True)
 class HermesConfig:
     enabled: bool = False
+    active_isolation_acknowledged: bool = False
     binary: str | list[str] = "hermes"
     profile: str = "operator"
     board: str = "default"
@@ -91,8 +92,8 @@ class HermesConfig:
     control_timeout_seconds: int = 10
     require_policy_attestation: bool = True
     policy_attestation_ttl_seconds: int = 300
-    allowed_plugin_versions: list[str] = field(default_factory=lambda: ["1.5.0"])
-    allowed_policy_versions: list[str] = field(default_factory=lambda: ["6.0.0"])
+    allowed_plugin_versions: list[str] = field(default_factory=lambda: ["1.6.0"])
+    allowed_policy_versions: list[str] = field(default_factory=lambda: ["7.0.0"])
     allowed_policy_digests: list[str] = field(default_factory=list)
 
     def resolved_control_token(self) -> str:
@@ -140,6 +141,8 @@ class ServerConfig:
     api_token_env: str = "HERMES_OPERATOR_API_TOKEN"
     bridge_token: str = ""
     bridge_token_env: str = "HERMES_OPERATOR_BRIDGE_TOKEN"
+    bridge_proof_secret: str = ""
+    bridge_proof_secret_env: str = "HERMES_OPERATOR_BRIDGE_PROOF_SECRET"
     max_body_bytes: int = 1_048_576
     webhook_secrets: dict[str, str] = field(default_factory=dict)
     allow_unsigned_webhooks: bool = False
@@ -149,6 +152,11 @@ class ServerConfig:
 
     def resolved_bridge_token(self) -> str:
         return self.bridge_token or os.environ.get(self.bridge_token_env, "")
+
+    def resolved_bridge_proof_secret(self) -> str:
+        return self.bridge_proof_secret or os.environ.get(
+            self.bridge_proof_secret_env, ""
+        )
 
 
 @dataclass(slots=True)
@@ -415,6 +423,16 @@ def validate_config(config: AppConfig) -> None:
         config.hermes.command_timeout_seconds,
         "hermes.command_timeout_seconds",
     )
+    if not isinstance(config.hermes.active_isolation_acknowledged, bool):
+        raise ValueError("hermes.active_isolation_acknowledged must be a boolean")
+    if (
+        config.hermes.enabled
+        and config.operator.autonomy_mode == "active"
+        and not config.hermes.active_isolation_acknowledged
+    ):
+        raise ValueError(
+            "Active Hermes autonomy requires deployment acknowledgement that worker filesystem, credential, and egress isolation were reviewed"
+        )
     if isinstance(config.hermes.binary, list):
         if not config.hermes.binary or not all(
             isinstance(part, str) and part for part in config.hermes.binary
@@ -513,6 +531,10 @@ def validate_config(config: AppConfig) -> None:
             raise ValueError(
                 "Hermes policy attestation requires a configured bridge token"
             )
+        if not config.server.resolved_bridge_proof_secret():
+            raise ValueError(
+                "Hermes policy attestation requires a configured bridge proof secret"
+            )
         if not (
             config.hermes.allowed_plugin_versions
             and config.hermes.allowed_policy_versions
@@ -586,6 +608,24 @@ def validate_config(config: AppConfig) -> None:
         == config.server.resolved_bridge_token()
     ):
         raise ValueError("server API and Hermes bridge tokens must be distinct")
+    configured_server_secrets = [
+        value
+        for value in (
+            config.server.resolved_api_token(),
+            config.server.resolved_bridge_token(),
+            config.server.resolved_bridge_proof_secret(),
+        )
+        if value
+    ]
+    if len(configured_server_secrets) != len(set(configured_server_secrets)):
+        raise ValueError(
+            "server API, Hermes bridge, and bridge proof secrets must be distinct"
+        )
+    if (
+        config.server.resolved_bridge_proof_secret()
+        and len(config.server.resolved_bridge_proof_secret().encode("utf-8")) < 32
+    ):
+        raise ValueError("server bridge proof secret must contain at least 32 bytes")
     if (
         config.server.enabled
         and config.server.host not in {"127.0.0.1", "::1", "localhost"}
@@ -604,6 +644,7 @@ def validate_config(config: AppConfig) -> None:
     protected_env = {
         config.server.api_token_env,
         config.server.bridge_token_env,
+        config.server.bridge_proof_secret_env,
         config.policy.approval_secret_env,
         config.hermes.control_token_env,
     } - {""}
@@ -677,6 +718,10 @@ def validate_config(config: AppConfig) -> None:
     for value, field_name in (
         (config.server.api_token_env, "server.api_token_env"),
         (config.server.bridge_token_env, "server.bridge_token_env"),
+        (
+            config.server.bridge_proof_secret_env,
+            "server.bridge_proof_secret_env",
+        ),
         (config.policy.approval_secret_env, "policy.approval_secret_env"),
     ):
         if not isinstance(value, str) or _ENV_NAME_PATTERN.fullmatch(value) is None:

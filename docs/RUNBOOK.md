@@ -55,6 +55,7 @@ Service environment:
 OPENAI_API_KEY=replace-with-provider-key
 HERMES_OPERATOR_API_TOKEN=replace-with-random-admin-token
 HERMES_OPERATOR_BRIDGE_TOKEN=replace-with-different-random-bridge-token
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=replace-with-independent-32-byte-secret
 HERMES_KANBAN_CONTROL_TOKEN=replace-with-run-control-token
 ```
 
@@ -108,22 +109,23 @@ If a deployment also requires a hard no-outbound guarantee that is independent o
 the Hermes harness, apply the following infrastructure controls before changing from
 `shadow` to `internal`:
 
-1. Confirm the Hermes worker has only `HERMES_OPERATOR_BRIDGE_TOKEN`, never the admin token.
+1. Confirm the native plugin starts with only its scoped bridge token and independent proof secret, never the admin token, and diagnostics report that both were scrubbed before project subprocesses run.
 2. Remove outbound connector, mail-send, messaging, calendar-write, publishing, payment, repository-write, and cloud-write credentials.
 3. Remove authenticated browser sessions that can mutate external state.
 4. Run the worker in an operating-system or container sandbox with network egress disabled by default and filesystem access limited to its authorized workspace.
 5. Apply the same egress restriction to project-defined test and build scripts. Reviewed `local_test` and `local_build` command shapes can still execute arbitrary repository code.
 6. Allow only required model, operator API, artifact, read-only data, and internal execution endpoints through controlled policy.
 
-These controls are optional for the core integration, but credential and egress
-isolation are required if the deployment claims a hard no-outbound boundary that
-remains enforceable even when the Hermes process or plugin is compromised.
+These controls remain deployment-owned. Before selecting `active`, review them and set
+`hermes.active_isolation_acknowledged = true`; validation otherwise fails closed. The
+acknowledgement records that review and does not turn the plugin into an OS sandbox.
 
 ## Native plugin environment
 
 ```text
 HERMES_OPERATOR_URL=http://127.0.0.1:8787
 HERMES_OPERATOR_BRIDGE_TOKEN=replace-with-different-random-bridge-token
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=replace-with-independent-32-byte-secret
 HERMES_OPERATOR_PROFILE=operator
 HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS=120
 ```
@@ -134,6 +136,7 @@ Plugin registration sends a synchronous policy attestation and starts one daemon
 
 ```bash
 hermes-operator --config operator.toml doctor
+hermes-operator --config operator.toml doctor --live
 hermes-operator --config operator.toml status
 hermes-operator --config operator.toml event list --state dead_letter
 hermes-operator --config operator.toml next --limit 10
@@ -153,6 +156,8 @@ Review:
 - Fresh `operator` profile policy attestation exists before dispatch.
 
 The public `/health` route reports only minimal liveness. Use authenticated state, CLI status, and logs for details.
+
+Before unattended `active` operation, complete [Active Mode Acceptance](ACTIVE_MODE.md).
 
 ## Start, stop, and one cycle
 

@@ -118,6 +118,29 @@ class OperatorServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.errors, {})
         self.assertEqual(len(scripted.calls), 1)
 
+        independent = OperatorService(self.service.config)
+        durable = independent.health()
+        self.assertEqual(durable["cycle_count"], 2)
+        self.assertEqual(durable["last_cycle"]["id"], second.id)
+        self.assertFalse(durable["running"])
+
+    async def test_independent_health_reads_live_durable_leader_lease(self) -> None:
+        self.service._acquire_leader()
+        try:
+            independent = OperatorService(self.service.config)
+            health = independent.health()
+            self.assertTrue(health["running"])
+            self.assertEqual(health["status"], "running")
+            self.assertTrue(health["leader_lease"]["active"])
+        finally:
+            self.service.store.release_service_lease(
+                self.service._leader_name,
+                self.service._leader_owner,
+                epoch=self.service._leader_epoch,
+            )
+            self.service._leader_held = False
+            self.service._leader_epoch = None
+
     async def test_next_work_filters_dependencies_before_query_limit(self) -> None:
         blocker = WorkItem(
             title="Incomplete dependency",

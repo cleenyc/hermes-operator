@@ -2,6 +2,64 @@
 
 All notable project changes are recorded in this file.
 
+## [0.5.0] - 2026-07-14
+
+### Added
+
+- Added an active-mode acceptance gate that requires a deployment-owned isolation review
+  acknowledgement without claiming the plugin is an operating-system sandbox.
+- Added `doctor --live` with a real structured model request, every effective execution-profile
+  attestation, an authenticated read-only Kanban control probe, and installed native-job and
+  private-delivery checks.
+- Added durable service cycle health and leader-lease state so a separate CLI or API process can
+  report the active daemon truthfully.
+- Added bounded, filterable audit history through both the CLI and authenticated `/v1/audit` API.
+- Added deterministic assurance metadata that is protected, bound into authorization and dispatch
+  digests, and requires a named fixed check before consequential work can be authorized or pass.
+- Added exact bridge-operation HMAC proofs with distinct credentials, purpose and body binding,
+  expiry, and an atomic SQLite nonce fence that survives process restarts and concurrency.
+- Added explicit Hermes Cron desired-state reconciliation with `cron list --all`, reviewed edits,
+  paused and disabled job discovery, and v0.3/v0.4 upgrade guidance.
+- Added required source checks, reproducible complete-release builds, a pinned Hermes host lane,
+  and an advisory current-`main` semantic compatibility lane in CI.
+- Added active-mode deployment acceptance documentation and a reproducible complete archive that
+  includes both exact-version wheels.
+
+### Fixed
+
+- Removed priority from immutable execution and completion identity so ordinary reprioritization
+  cannot invalidate an otherwise unchanged authorized run.
+- Removed mutable parent titles from managed prompts while preserving digest-bound hierarchy IDs.
+- Completed the blocked-card lifecycle across exact question binding, operator answer, fresh
+  authorization, capacity reservation, same-card resume, verification, and terminal completion.
+- Ensured every quarantined event creates a durable non-executable review and pending question,
+  while expanded task-signal detection covers provider action items, subject and body variants,
+  bounded text, and quoted-content exclusions.
+- Corrected deduplication so stable provider identities remain idempotent while identity-free
+  observations are treated as distinct occurrences and pass-scoped create keys cannot collide.
+- Bound the canonical managed capability set into immutable execution contracts and rejected
+  recovered v0.3 active runs that lack a trustworthy contract.
+- Confined managed filesystem tools and artifact delivery to the canonical dispatcher workspace,
+  including alias, traversal, symlink, home-relative, Windows, media, vision, and video paths.
+- Scrubbed the bridge token and proof secret before project subprocesses can start, and blocked
+  terminal, process, and session reads whose current-run ownership cannot be proven.
+- Pinned active bridge activation to Hermes `0.18.2` by default. A deployment-owned reviewed-host
+  override permits another real-host-tested version but never bypasses semantic blockers.
+- Made `run-once` return nonzero on component failure, validated fixed command executables in
+  ordinary doctor, and made command model arguments safe when they contain literal JSON braces.
+- Added deterministic macOS temporary-path coverage and strict native control response validation.
+- Prefixed generated approval grant identifiers so every value is safe to pass through the
+  outbound broker command-line interface.
+
+### Changed
+
+- Updated the core to `0.5.0`, the native plugin to `1.6.0`, the policy contract to `7.0.0`,
+  and the database schema to version 14.
+- Kept Google OAuth, Gateway delivery, Hermes Cron, and vault-wide Obsidian access in their native
+  Hermes ownership boundary. The Operator verifies only the contracts it can observe directly.
+- Kept external send and publish enforcement as an explicit deployment and Hermes harness boundary;
+  the control-plane daemon still exposes no outbound execution route.
+
 ## [0.4.0] - 2026-07-14
 
 ### Added

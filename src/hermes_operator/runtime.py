@@ -13,6 +13,7 @@ from .models import utc_now
 
 ComponentCallback = Callable[[], Any | Awaitable[Any]]
 ErrorCallback = Callable[[str, BaseException], None]
+CycleCallback = Callable[["CycleResult"], Any | Awaitable[Any]]
 
 
 @dataclass(slots=True)
@@ -59,6 +60,7 @@ class AutonomousRuntime:
         tick_seconds: float = 30.0,
         reconciliation_seconds: float = 300.0,
         on_error: ErrorCallback | None = None,
+        on_cycle: CycleCallback | None = None,
     ):
         if tick_seconds <= 0:
             raise ValueError("tick_seconds must be positive")
@@ -68,6 +70,7 @@ class AutonomousRuntime:
         self.tick_seconds = float(tick_seconds)
         self.reconciliation_seconds = float(reconciliation_seconds)
         self.on_error = on_error
+        self.on_cycle = on_cycle
 
         self._state_lock = threading.Lock()
         self._pending_lock = threading.Lock()
@@ -240,6 +243,18 @@ class AutonomousRuntime:
                         except Exception:
                             pass
             result.finished_at = utc_now()
+            if self.on_cycle is not None:
+                try:
+                    await _invoke(self.on_cycle, result)
+                except Exception as error:
+                    result.errors["cycle_state"] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:2000]
+                    if self.on_error is not None:
+                        try:
+                            self.on_error("cycle_state", error)
+                        except Exception:
+                            pass
             with self._state_lock:
                 self._cycle_count += 1
                 self._last_cycle = result
@@ -289,8 +304,8 @@ class AutonomousRuntime:
                     pass
 
 
-async def _invoke(callback: ComponentCallback) -> Any:
-    value = callback()
+async def _invoke(callback: Callable[..., Any], *args: Any) -> Any:
+    value = callback(*args)
     if inspect.isawaitable(value):
         return await value
     return value

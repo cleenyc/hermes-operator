@@ -238,6 +238,79 @@ class HermesCLIAdapterTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer control-secret")
         self.assertEqual(timeout, 7)
 
+    def test_control_health_uses_authenticated_read_only_probe(self) -> None:
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return b'{"workers":[],"count":0,"checked_at":1770000000}'
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append((request, timeout))
+                return Response()
+
+        adapter = HermesCLIAdapter(
+            runner=FakeHermesRunner(),
+            control_base_url="http://127.0.0.1:8000",
+            control_token="control-secret",
+            control_timeout_seconds=7,
+        )
+        with patch(
+            "hermes_operator.adapters.hermes.urlrequest.build_opener",
+            return_value=Opener(),
+        ):
+            health = adapter.control_health()
+
+        self.assertTrue(health.available)
+        request, timeout = requests[0]
+        self.assertEqual(
+            request.full_url,
+            "http://127.0.0.1:8000/api/plugins/kanban/workers/active",
+        )
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer control-secret")
+        self.assertEqual(timeout, 7)
+
+    def test_control_health_rejects_unexpected_response_shape(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            @staticmethod
+            def read(_limit):
+                return b'{"workers":[],"count":1,"checked_at":1770000000}'
+
+        class Opener:
+            @staticmethod
+            def open(_request, timeout):
+                del timeout
+                return Response()
+
+        adapter = HermesCLIAdapter(
+            runner=FakeHermesRunner(),
+            control_base_url="http://127.0.0.1:8000",
+            control_token="control-secret",
+        )
+        with patch(
+            "hermes_operator.adapters.hermes.urlrequest.build_opener",
+            return_value=Opener(),
+        ):
+            health = adapter.control_health()
+
+        self.assertFalse(health.available)
+        self.assertIn("unexpected response", health.detail)
+
     def test_terminate_fails_closed_without_control_transport(self) -> None:
         runner = FakeHermesRunner()
         runner.task = {

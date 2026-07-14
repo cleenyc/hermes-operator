@@ -31,7 +31,7 @@ from . import schemas, tools
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.6.0"
 
 _active_refresher: PolicyAttestationRefresher | None = None
 _active_refresher_lock = Lock()
@@ -239,7 +239,16 @@ def register(ctx: Any) -> None:
     # every task-scoped capability.
     register_hook("pre_tool_call", guard)
     global _diagnostics
-    _diagnostics = diagnose_host(ctx, guard)
+    _diagnostics = diagnose_host(
+        ctx,
+        guard,
+        credentials_scrubbed=bool(
+            client is not None and client.config.credentials_scrubbed
+        ),
+        reviewed_host_override=bool(
+            client is not None and client.config.reviewed_host_override
+        ),
+    )
     if client is None:
         return
     activation_blockers = bridge_activation_blockers(_diagnostics)

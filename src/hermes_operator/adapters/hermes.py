@@ -476,7 +476,7 @@ class HermesCLIAdapter:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.control_token}",
                 "Content-Type": "application/json",
-                "User-Agent": "hermes-operator/0.1",
+                "User-Agent": "hermes-operator/0.5.0",
             },
             method="POST",
         )
@@ -498,6 +498,75 @@ class HermesCLIAdapter:
                 f"Hermes run termination is unavailable: {exc}"
             ) from exc
         return self.show_task(task_id)
+
+    def control_health(self) -> AdapterHealth:
+        """Probe the authenticated, read-only Kanban control surface."""
+
+        if not self.control_base_url or not self.control_token:
+            return AdapterHealth(
+                enabled=True,
+                available=False,
+                detail="Hermes Kanban control API is not configured",
+            )
+        endpoint = f"{self.control_base_url}/api/plugins/kanban/workers/active"
+        request = urlrequest.Request(
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.control_token}",
+                "User-Agent": "hermes-operator/0.5.0",
+            },
+            method="GET",
+        )
+        try:
+            opener = urlrequest.build_opener(_NoRedirect())
+            with opener.open(request, timeout=self.control_timeout_seconds) as response:
+                raw = response.read(262_145)
+                if len(raw) > 262_144:
+                    raise AdapterResponseError(
+                        "Hermes control health response exceeded size limit"
+                    )
+            document = json.loads(raw)
+            workers = document.get("workers") if isinstance(document, Mapping) else None
+            count = document.get("count") if isinstance(document, Mapping) else None
+            checked_at = (
+                document.get("checked_at") if isinstance(document, Mapping) else None
+            )
+            if (
+                not isinstance(document, Mapping)
+                or not isinstance(workers, list)
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count != len(workers)
+                or not isinstance(checked_at, int)
+                or isinstance(checked_at, bool)
+            ):
+                raise AdapterResponseError(
+                    "Hermes control health returned an unexpected response"
+                )
+        except urlerror.HTTPError as exc:
+            exc.read(2_048)
+            return AdapterHealth(
+                enabled=True,
+                available=False,
+                detail=f"Hermes control health returned HTTP {exc.code}",
+            )
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            return AdapterHealth(
+                enabled=True,
+                available=False,
+                detail=f"Hermes control health is unavailable: {exc}",
+            )
+        except AdapterResponseError as exc:
+            return AdapterHealth(enabled=True, available=False, detail=str(exc))
+        return AdapterHealth(
+            enabled=True,
+            available=True,
+            detail=(
+                "Authenticated Hermes Kanban control probe passed with "
+                f"{count} active workers"
+            ),
+        )
 
     def _active_run_id(self, task_id: str) -> str | None:
         payload = self._run_json([*self._kanban_argv("runs", task_id), "--json"])

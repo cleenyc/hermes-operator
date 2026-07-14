@@ -21,7 +21,10 @@ from hermes_operator.config import (  # noqa: E402
 )
 from hermes_operator.authority import execution_scope_binding  # noqa: E402
 from hermes_operator.db import SQLiteStore, StateConflict  # noqa: E402
-from hermes_operator.dispatcher import dispatch_contract_digest  # noqa: E402
+from hermes_operator.dispatcher import (  # noqa: E402
+    MANAGED_INTERNAL_CAPABILITIES,
+    dispatch_contract_digest,
+)
 from hermes_operator.llm import LLMResult, ScriptedLLM  # noqa: E402
 from hermes_operator.models import (  # noqa: E402
     Event,
@@ -37,6 +40,8 @@ from hermes_operator.supervisor import (  # noqa: E402
     PlanValidationError,
     Supervisor,
     _bounded_factor,
+    _sanitized_metadata,
+    _task_like_event,
 )
 
 
@@ -176,6 +181,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "skills": skills,
             "default_skills": list(self.config.hermes.default_skills),
             "goal_mode": goal_mode,
+            "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
+            "verification_requirement": item.metadata.get(
+                "verification_requirement",
+                "model_evidence",
+            ),
             "captured_at": "2026-07-13T00:00:00Z",
         }
 
@@ -184,6 +194,23 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 with self.assertRaises(PlanValidationError):
                     _bounded_factor(value)
+
+    def test_model_metadata_cannot_change_completion_assurance(self) -> None:
+        sanitized = _sanitized_metadata(
+            {
+                "verification_requirement": "model_evidence",
+                "verification_contract": {
+                    "artifacts": [],
+                    "checks": [],
+                },
+                "planner_annotation": "keep this ordinary metadata",
+            }
+        )
+
+        self.assertEqual(
+            sanitized,
+            {"planner_annotation": "keep this ordinary metadata"},
+        )
 
     async def test_claimed_event_cannot_be_processed_without_disposition(self) -> None:
         event_id, _ = self.store.enqueue_event(
@@ -326,6 +353,305 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(attention["questions"][0]["id"], question["id"])
 
+    async def test_every_quarantined_disposition_creates_durable_review(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.calendar",
+                event_type="calendar.event.updated",
+                payload={
+                    "account": "work",
+                    "calendar_id": "primary",
+                    "event_id": "event-id",
+                    "sequence": 7,
+                    "title": "Quarterly review",
+                    "start": "2026-07-15T14:00:00-04:00",
+                    "end": "2026-07-15T15:00:00-04:00",
+                    "timezone": "America/New_York",
+                    "organizer": "organizer@example.test",
+                    "attendees": ["operator@example.test"],
+                    "response_status": "accepted",
+                    "location": "Video call",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=quarantined_disposition(
+                event_id, "The planner could not classify this evidence"
+            )
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(len(result.created_work_ids), 1)
+        self.assertEqual(len(result.question_ids), 1)
+        review = self.store.get_work(result.created_work_ids[0])
+        self.assertEqual(review.source_event_id, event_id)
+        self.assertEqual(review.execution_mode, ExecutionMode.NONE)
+        self.assertEqual(
+            result.event_dispositions[0]["related_work_ids"], [review.id]
+        )
+
+    async def test_documented_calendar_fixture_can_be_non_actionable(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.calendar",
+                event_type="calendar.event.updated",
+                payload={
+                    "account": "work",
+                    "calendar_id": "primary",
+                    "event_id": "event-id",
+                    "sequence": 7,
+                    "title": "Quarterly review",
+                    "start": "2026-07-15T14:00:00-04:00",
+                    "end": "2026-07-15T15:00:00-04:00",
+                    "timezone": "America/New_York",
+                    "organizer": "organizer@example.test",
+                    "attendees": ["operator@example.test"],
+                    "response_status": "accepted",
+                    "location": "Video call",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "non_actionable",
+                    "reason": "No requested action or changed commitment",
+                }
+            ]
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(result.created_work_ids, [])
+        self.assertEqual(result.question_ids, [])
+        self.assertEqual(
+            result.event_dispositions[0]["disposition"], "non_actionable"
+        )
+
+    async def test_greeting_first_gmail_fixture_cannot_be_non_actionable(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.gmail",
+                event_type="gmail.message",
+                payload={
+                    "subject": "Quarterly deck",
+                    "body_text": "Hi Chris,\nCould you send the deck by Friday?",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "non_actionable",
+                    "reason": "No action detected",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(PlanValidationError, "Task-like event"):
+            await self._supervisor([plan]).run_pass(
+                trigger="event", events=events
+            )
+
+    async def test_greeting_first_gmail_fixture_quarantine_is_durable(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.gmail",
+                event_type="gmail.message",
+                payload={
+                    "subject": "Quarterly deck",
+                    "body_text": "Hi Chris,\nCould you send the deck by Friday?",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        result = await self._supervisor(
+            [
+                empty_plan(
+                    event_dispositions=quarantined_disposition(
+                        event_id, "Ownership and scope need confirmation"
+                    )
+                )
+            ]
+        ).run_pass(trigger="event", events=events)
+
+        self.assertEqual(len(result.created_work_ids), 1)
+        self.assertEqual(len(result.question_ids), 1)
+        self.assertEqual(
+            self.store.get_work(result.created_work_ids[0]).source_event_id,
+            event_id,
+        )
+
+    async def test_documented_meeting_fixture_cannot_be_non_actionable(self) -> None:
+        payload = {
+            "provider": "meeting-provider",
+            "meeting_id": "meeting-987654",
+            "title": "Project review",
+            "started_at": "2026-07-13T18:00:00Z",
+            "ended_at": "2026-07-13T18:45:00Z",
+            "participants": ["Chris", "Teammate"],
+            "transcript_version": 2,
+            "transcript_text": "Bounded transcript text or an approved reference",
+            "provider_action_items": [
+                {"text": "Prepare the revised estimate", "owner": "Chris"}
+            ],
+        }
+        events = self._claim(
+            Event(
+                source="google.meeting",
+                event_type="meeting.transcript.ready",
+                payload=payload,
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "non_actionable",
+                    "reason": "No action detected",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(PlanValidationError, "Task-like event"):
+            await self._supervisor([plan]).run_pass(
+                trigger="event", events=events
+            )
+
+    async def test_documented_meeting_fixture_quarantine_is_durable(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.meeting",
+                event_type="meeting.transcript.ready",
+                payload={
+                    "provider": "meeting-provider",
+                    "meeting_id": "meeting-987654",
+                    "title": "Project review",
+                    "started_at": "2026-07-13T18:00:00Z",
+                    "ended_at": "2026-07-13T18:45:00Z",
+                    "participants": ["Chris", "Teammate"],
+                    "transcript_version": 2,
+                    "transcript_text": (
+                        "Bounded transcript text or an approved reference"
+                    ),
+                    "provider_action_items": [
+                        {
+                            "text": "Prepare the revised estimate",
+                            "owner": "Chris",
+                        }
+                    ],
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        result = await self._supervisor(
+            [
+                empty_plan(
+                    event_dispositions=quarantined_disposition(
+                        event_id, "Action-item ownership needs confirmation"
+                    )
+                )
+            ]
+        ).run_pass(trigger="event", events=events)
+
+        self.assertEqual(len(result.created_work_ids), 1)
+        self.assertEqual(len(result.question_ids), 1)
+        disposition = result.event_dispositions[0]
+        self.assertEqual(
+            disposition["related_work_ids"], result.created_work_ids
+        )
+
+    async def test_provider_action_items_camel_case_is_a_task_signal(self) -> None:
+        events = self._claim(
+            Event(
+                source="google.meeting",
+                event_type="meeting.notes",
+                payload={
+                    "providerActionItems": [
+                        {"text": "Review the revised forecast", "owner": "Chris"}
+                    ]
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            event_dispositions=[
+                {
+                    "event_id": event_id,
+                    "disposition": "non_actionable",
+                    "reason": "No action detected",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(PlanValidationError, "Task-like event"):
+            await self._supervisor([plan]).run_pass(
+                trigger="event", events=events
+            )
+
+    def test_request_scan_is_bounded_and_quoted_header_aware(self) -> None:
+        self.assertTrue(
+            _task_like_event(
+                {
+                    "event_type": "gmail.message",
+                    "payload": {
+                        "body_text": (
+                            "From: sender@example.test\n"
+                            "Sent: Tuesday, July 14, 2026\n"
+                            "To: operator@example.test\n"
+                            "Subject: Quarterly deck\n"
+                            "Hello Chris,\n"
+                            "Would you review the final deck?"
+                        )
+                    },
+                }
+            )
+        )
+        self.assertFalse(
+            _task_like_event(
+                {
+                    "event_type": "gmail.message",
+                    "payload": {
+                        "body_text": (
+                            "FYI only\n"
+                            "On Monday, teammate@example.test wrote:\n"
+                            "> Could you review the final deck?"
+                        )
+                    },
+                }
+            )
+        )
+        self.assertFalse(
+            _task_like_event(
+                {
+                    "event_type": "gmail.message",
+                    "payload": {
+                        "body_text": "\n".join(
+                            ["FYI"] * 160 + ["Could you review the final deck?"]
+                        )
+                    },
+                }
+            )
+        )
+
     async def test_body_text_and_nested_action_items_are_durable_task_signals(self) -> None:
         body_event_id, _ = self.store.enqueue_event(
             Event(
@@ -457,6 +783,29 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(waiting.status, WorkStatus.WAITING_INPUT)
         self.assertFalse(
             question["blocking_work_bindings"][item.id]["execution_authorized"]
+        )
+        blocked_resume = question["blocking_work_bindings"][item.id][
+            "blocked_resume"
+        ]
+        self.assertEqual(
+            blocked_resume,
+            {
+                "schema": "hermes-operator.blocked-resume.v1",
+                "question_id": question["id"],
+                "work_id": item.id,
+                "blocked_event_id": event_id,
+                "blocked_run_id": "run-blocked",
+                "blocked_attempt": 1,
+                "hermes_task_id": "task-blocked",
+            },
+        )
+        self.assertEqual(
+            waiting.metadata["blocked_lifecycle"]["question_id"],
+            question["id"],
+        )
+        self.assertEqual(
+            waiting.metadata["blocked_lifecycle"]["answer_scope_revision"],
+            waiting.authorization_scope_revision,
         )
         self.assertFalse(waiting.metadata["governance"]["execution_authorized"])
         self.assertNotIn("dispatch_authorization", waiting.metadata)
@@ -1519,8 +1868,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "newer direct operator edit",
         )
         self.assertEqual(result.updated_work_ids, [])
-        self.assertEqual(len(result.question_ids), 1)
-        followup = self.store.get_question(result.question_ids[0])
+        self.assertEqual(len(result.question_ids), 2)
+        followup = next(
+            self.store.get_question(question_id)
+            for question_id in result.question_ids
+            if "reauthorize" in self.store.get_question(question_id)["question"]
+        )
         self.assertIn("reauthorize", followup["question"])
         self.assertIn("no mutation or dispatch was applied", followup["context"])
 
@@ -1884,8 +2237,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.dispatch_work_ids, [])
-        self.assertEqual(len(result.question_ids), 1)
-        followup = self.store.get_question(result.question_ids[0])
+        self.assertEqual(len(result.question_ids), 2)
+        followup = next(
+            self.store.get_question(question_id)
+            for question_id in result.question_ids
+            if "reauthorize" in self.store.get_question(question_id)["question"]
+        )
         self.assertIn("reauthorize", followup["question"])
         self.assertFalse(
             self.store.get_work(item.id).metadata["governance"][
@@ -1947,7 +2304,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.updated_work_ids, [])
         self.assertEqual(self.store.get_work(item.id).status, WorkStatus.WAITING_INPUT)
-        self.assertEqual(len(result.question_ids), 1)
+        self.assertEqual(len(result.question_ids), 2)
 
     async def test_question_answer_cannot_elevate_planning_only_work(self) -> None:
         item = WorkItem(
@@ -2048,6 +2405,34 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.memory_candidate_ids, second.memory_candidate_ids)
         self.assertEqual(len(self.store.list_questions()), 1)
         self.assertEqual(len(self.store.list_memory()), 1)
+
+    async def test_eventless_no_key_work_creates_are_occurrence_scoped(self) -> None:
+        plan = empty_plan(
+            work_operations=[
+                {
+                    "op": "create",
+                    "ref": "forecast-review",
+                    "title": "Review the forecast",
+                    "status": "triage",
+                }
+            ]
+        )
+        supervisor = self._supervisor([plan, plan])
+
+        first = await supervisor.run_pass(
+            trigger="reconciliation",
+            events=[],
+            force_without_events=True,
+        )
+        second = await supervisor.run_pass(
+            trigger="reconciliation",
+            events=[],
+            force_without_events=True,
+        )
+
+        self.assertEqual(len(first.created_work_ids), 1)
+        self.assertEqual(len(second.created_work_ids), 1)
+        self.assertNotEqual(first.created_work_ids, second.created_work_ids)
 
     async def test_eventless_created_prose_is_redacted_from_privileged_pass(self) -> None:
         injected = empty_plan(
@@ -2331,6 +2716,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "scope_revision": execution_contract["scope_revision"],
                     "work_version": execution_contract["work_version"],
                     "profile": execution_contract["profile"],
+                    "internal_capabilities": execution_contract[
+                        "internal_capabilities"
+                    ],
+                    "verification_requirement": execution_contract[
+                        "verification_requirement"
+                    ],
                 },
                 trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
                 provenance={"adapter": "hermes-kanban"},
@@ -2461,6 +2852,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "scope_revision": execution_contract["scope_revision"],
                     "work_version": execution_contract["work_version"],
                     "profile": execution_contract["profile"],
+                    "internal_capabilities": execution_contract[
+                        "internal_capabilities"
+                    ],
+                    "verification_requirement": execution_contract[
+                        "verification_requirement"
+                    ],
                     "result": {"tests": "passed"},
                 },
                 trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
@@ -2602,6 +2999,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "scope_revision": execution_contract["scope_revision"],
                     "work_version": execution_contract["work_version"],
                     "profile": execution_contract["profile"],
+                    "internal_capabilities": execution_contract[
+                        "internal_capabilities"
+                    ],
+                    "verification_requirement": execution_contract[
+                        "verification_requirement"
+                    ],
                 },
                 trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
                 provenance={"adapter": "hermes-kanban"},

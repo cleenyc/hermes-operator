@@ -183,6 +183,7 @@ enabled = false
 [server]
 enabled = true
 bridge_token = "bridge-secret"
+bridge_proof_secret = "proof-secret-that-is-at-least-32-bytes-long"
 
 [policy]
 external_actions_require_approval = true
@@ -206,6 +207,30 @@ external_actions_require_approval = true
             control_token="run-control-secret",
         )
         self.assertEqual(valid.hermes.default_assignee, "operator")
+
+        active_without_ack = active_template.replace(
+            'autonomy_mode = "internal"',
+            'autonomy_mode = "active"',
+        )
+        self.path.write_text(
+            active_without_ack.format(
+                assignee="operator",
+                control_url="http://127.0.0.1:8000",
+                control_token="run-control-secret",
+                digest="a" * 64,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "isolation were reviewed"):
+            load_config(self.path)
+        self.path.write_text(
+            self.path.read_text(encoding="utf-8").replace(
+                "enabled = true\nprofile = \"operator\"",
+                "enabled = true\nactive_isolation_acknowledged = true\nprofile = \"operator\"",
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(load_config(self.path).hermes.active_isolation_acknowledged)
         self.path.write_text(
             self.path.read_text(encoding="utf-8").replace(
                 "require_policy_attestation = true",

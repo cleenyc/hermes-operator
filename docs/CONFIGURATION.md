@@ -113,14 +113,15 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.5.0"]
-allowed_policy_versions = ["6.0.0"]
-allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
+allowed_plugin_versions = ["1.6.0"]
+allowed_policy_versions = ["7.0.0"]
+allowed_policy_digests = ["15f8e0a622abce0227c9b3f6b0168cf98bd17218933881b4d50f705edf2278d5"]
 ```
 
 | Field | Implemented meaning |
 | --- | --- |
 | `enabled` | Construct the CLI adapter and permit reconciliation and eligible dispatch |
+| `active_isolation_acknowledged` | Required for `active` mode; deployment-owner acknowledgement that worker OS/container filesystem, credential, and egress controls were reviewed. It is not a sandbox claim |
 | `binary` | Executable name or path, or a TOML argv array such as `["docker", "exec", "hermes", "hermes"]`; no shell is used |
 | `profile` | Passed to every CLI command as `-p PROFILE` |
 | `board` | Passed as `--board BOARD` |
@@ -181,7 +182,7 @@ reminder and pending-question delivery claims. It must be a positive integer.
 Hermes Cron still owns the polling cadence. A shorter Cron schedule can safely
 poll during the window without returning the same attention items each time.
 
-This is an implemented desired-state installer, not a provider placeholder. `native-jobs plan` shows the three fixed contracts; `native-jobs install --dry-run` shows the Hermes CLI calls; and `native-jobs install` creates missing jobs by stable name. The Google job uses Hermes' bundled `google-workspace` skill and account OAuth to read Gmail, Calendar, and meeting evidence into the scoped bridge. The reminder job atomically claims due reminders and pending questions for private delivery. The daily briefing combines ranked work with the bundled Obsidian skill when vault context is useful. OAuth, private delivery target, Gateway operation, and `OBSIDIAN_VAULT_PATH` remain deployment bindings.
+This is an implemented desired-state installer, not a provider placeholder. `native-jobs plan` shows the three fixed contracts; `native-jobs install --dry-run` shows the Hermes CLI calls; and `native-jobs install` creates missing jobs by stable name. `native-jobs install --dry-run --reconcile` previews deliberate edits, and the same command without `--dry-run` updates paused, disabled, or active managed jobs discovered with `hermes cron list --all`. Use reconciliation once when upgrading v0.3 or v0.4 native jobs. The Google job uses Hermes' bundled `google-workspace` skill and account OAuth to read Gmail, Calendar, and meeting evidence into the scoped bridge. The reminder job atomically claims due reminders and pending questions for private delivery. The daily briefing combines ranked work with the bundled Obsidian skill when vault context is useful. OAuth, private delivery target, Gateway operation, and `OBSIDIAN_VAULT_PATH` remain deployment bindings.
 
 See [Reminder and Attention Lifecycle](REMINDERS.md).
 
@@ -311,6 +312,7 @@ host = "${HERMES_OPERATOR_BIND_HOST:-127.0.0.1}"
 port = 8787
 api_token_env = "HERMES_OPERATOR_API_TOKEN"
 bridge_token_env = "HERMES_OPERATOR_BRIDGE_TOKEN"
+bridge_proof_secret_env = "HERMES_OPERATOR_BRIDGE_PROOF_SECRET"
 max_body_bytes = 1048576
 allow_unsigned_webhooks = false
 
@@ -326,11 +328,12 @@ calendar = "${CALENDAR_WEBHOOK_SECRET}"
 | `port` | TCP port from 1 to 65535 |
 | `api_token_env` | Environment variable containing the admin Bearer token |
 | `bridge_token_env` | Environment variable containing the scoped native-plugin Bearer token |
+| `bridge_proof_secret_env` | Environment variable containing the independent exact-operation HMAC secret, at least 32 bytes |
 | `max_body_bytes` | Maximum JSON POST body |
 | `allow_unsigned_webhooks` | Accept unconfigured unsigned sources as `untrusted`; development only |
 | `webhook_secrets` | Per-source HMAC secrets for generic intake; `operator`, `system`, and `hermes` are forbidden keys |
 
-Inline `api_token` and `bridge_token` values are accepted, but environment injection is safer. Nonempty admin and bridge tokens must be distinct. A non-loopback bind requires an admin token.
+Inline server secrets are accepted, but environment injection is safer. Admin, bridge, and proof secrets must be distinct. The plugin removes its bridge token and proof secret from `os.environ` immediately after loading them. Authority-bearing proofs bind purpose, method, endpoint, exact body, timestamp, and a durable single-use nonce. A non-loopback bind requires an admin token.
 
 The admin token can mutate operator state and review approvals. The bridge token is restricted to the explicit Hermes routes. It can read next work, questions, attention, and exact live task contracts; capture reversible work; submit version-fenced work updates; record exact operator answers and work authorization; ingest normalized Google evidence; claim private attention delivery; and post Hermes observations and policy attestations. Hermes-native confirmation gates authority-bearing conversational mutations before the plugin calls these routes. Accepted attestations update per-profile state and audit without entering the planner queue. The bridge cannot inspect approval content, approve an external action, fetch the admin status graph, or execute outbound delivery.
 
@@ -401,11 +404,13 @@ The connector and its mutation credentials can belong to a separate process iden
 | `OPENAI_API_KEY` | Default model credential variable |
 | `HERMES_OPERATOR_API_TOKEN` | Admin API credential |
 | `HERMES_OPERATOR_BRIDGE_TOKEN` | Scoped Hermes native-plugin credential |
+| `HERMES_OPERATOR_BRIDGE_PROOF_SECRET` | Independent native-plugin exact-operation proof secret |
 | `HERMES_OPERATOR_BIND_HOST` | Optional HTTP bind override used by the example and Compose |
 | `HERMES_OPERATOR_VAULT` | Late-bound Obsidian vault |
 | `HERMES_OPERATOR_APPROVAL_SECRET` | Reserved name, unused by core daemon |
 | `HERMES_OPERATOR_URL` | Native plugin control-plane URL |
 | `HERMES_OPERATOR_PROFILE` | Native plugin worker profile used in attestation |
+| `HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE` | Explicit deployment-owned override for a real-host-tested Hermes version other than pinned `0.18.2`; semantic gates still apply |
 | `HERMES_KANBAN_CONTROL_TOKEN` | Daemon-only credential for authenticated Hermes native run termination |
 | `HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS` | Native plugin heartbeat and hook refresh interval, 120 to 240 seconds |
 
@@ -417,4 +422,4 @@ See [Hermes Integration](HERMES_INTEGRATION.md) for all plugin settings.
 hermes-operator --config operator.toml doctor
 ```
 
-`doctor` loads and validates TOML, initializes SQLite, checks that a model and credential or command are configured, probes enabled Hermes and Obsidian adapters, and reports that the daemon has no outbound connectors. It does not inspect or invoke the separately configured broker, make a live model request, acquire the long-running leader lease, or prove network egress isolation.
+`doctor` loads and validates TOML, initializes SQLite, checks that a model and credential or command are configured, probes enabled Hermes and Obsidian adapters, and reports that the daemon has no outbound connectors. Add `--live` for an actual structured model request, all configured Hermes profile attestations, an authenticated read-only Kanban active-worker probe, and the active Hermes-native Cron jobs, scheduler or Gateway ticker, and private-delivery state when native automation is enabled. Google OAuth and native Obsidian vault access remain Hermes-owned deployment acceptance checks. Neither form inspects or invokes the separately configured broker, acquires the long-running leader lease, or proves network egress isolation.

@@ -22,6 +22,27 @@ jobs:
       - name: Run core and source-only plugin checks
         run: make check
 
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build and verify a reproducible complete release
+        shell: bash
+        run: |
+          set -euo pipefail
+          make release
+          test -f dist/hermes_operator-0.5.0-py3-none-any.whl
+          test -f dist/hermes_operator_plugin-1.6.0-py3-none-any.whl
+          first="$(sha256sum dist/hermes-operator-0.5.0-complete.tar.gz | cut -d ' ' -f 1)"
+          make release
+          second="$(sha256sum dist/hermes-operator-0.5.0-complete.tar.gz | cut -d ' ' -f 1)"
+          test "$first" = "$second"
+
   real-host:
     continue-on-error: ${{ matrix.experimental }}
     runs-on: ubuntu-latest
@@ -32,8 +53,10 @@ jobs:
         include:
           - hermes_ref: 9de9c25f620ff7f1ce0fd5457d596052d5159596
             experimental: false
+            enforce_pin: "1"
           - hermes_ref: main
             experimental: true
+            enforce_pin: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,6 +72,7 @@ jobs:
       - name: Exercise real host contracts
         env:
           HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION: "1"
+          HERMES_OPERATOR_REQUIRE_PINNED_HOST: ${{ matrix.enforce_pin }}
         run: >-
           python -m unittest discover
           -s integrations/hermes_operator_plugin/tests

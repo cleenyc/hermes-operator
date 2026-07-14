@@ -20,7 +20,7 @@ The daemon has no outbound connector and no outbound execution route. It may sta
 - Event authority isolation. A privileged event is processed alone, untrusted text is redacted from authority-bearing context, and specific event types grant only specific capabilities.
 - Optimistic version fences on model-requested work updates, links, questions, verification, and dispatch decisions.
 - Exact execution-scope authorization with an independent scope revision and SHA-256 binding over work semantics, hierarchy, schedule, verification contract, profile, effective skills, and goal mode. Priority-only changes do not invalidate approval; scope changes and dependency edges do.
-- Durable quarantine review: every task-like quarantined event creates a non-executable decision item and a pending human question instead of leaving the active workflow.
+- Durable quarantine review: every quarantined event creates a non-executable decision item and a pending human question instead of disappearing from the active workflow. Separate task-signal detection also prevents actionable evidence from being dismissed as non-actionable.
 - Per-question work bindings preserve answers while refusing stale mutation or resume authority and creating a durable reauthorization follow-up.
 - Deterministic priority scoring across impact, urgency, alignment, dependency value, due date, age, effort, confidence, risk, state, and operator priority.
 - Hermes Kanban dispatch through public CLI commands plus an authenticated run-control endpoint for terminating native compute. The adapter uses `create`, `show`, `list`, `comment`, `block`, `unblock`, and `runs`.
@@ -76,6 +76,7 @@ Set a real model in `operator.toml`, then inject secrets:
 export OPENAI_API_KEY="replace-with-provider-key"
 export HERMES_OPERATOR_API_TOKEN="replace-with-a-random-admin-token"
 hermes-operator --config operator.toml doctor
+hermes-operator --config operator.toml doctor --live
 hermes-operator --config operator.toml run-once
 hermes-operator --config operator.toml run
 ```
@@ -87,10 +88,11 @@ For the native Hermes bridge, use a different scoped credential and identify the
 ```bash
 export HERMES_OPERATOR_URL="http://127.0.0.1:8787"
 export HERMES_OPERATOR_BRIDGE_TOKEN="replace-with-a-different-random-bridge-token"
+export HERMES_OPERATOR_BRIDGE_PROOF_SECRET="replace-with-an-independent-32-byte-secret"
 export HERMES_OPERATOR_PROFILE="operator"
 ```
 
-The admin and bridge tokens must be distinct. The bridge token is limited to the explicit Hermes routes: content-free runtime counters, next work, questions, attention, exact live task contracts, conversational work capture and version-fenced updates, exact answers and authorization supplied through Hermes, normalized Google intake, lifecycle observations, compatibility diagnostics, and policy attestations. The plugin requires Hermes-native confirmation for authority-bearing conversational mutations. The bridge cannot inspect or approve external-action grants, fetch the admin status graph, or invoke the outbound broker.
+The admin token, bridge token, and proof secret must be distinct. Authority-bearing calls carry an exact, short-lived, replay-fenced HMAC proof after Hermes-native confirmation. The plugin loads both bridge secrets once and removes them from its process environment before project tools can spawn. The bridge cannot inspect or approve external-action grants, fetch the admin status graph, or invoke the outbound broker.
 
 After Google OAuth, Gateway, and a private delivery target are configured in Hermes, install the native loops:
 
@@ -99,6 +101,10 @@ hermes-operator --config operator.toml native-jobs plan
 hermes-operator --config operator.toml native-jobs install --dry-run
 hermes-operator --config operator.toml native-jobs install
 ```
+
+Use `native-jobs install --dry-run --reconcile` and then `--reconcile` when
+upgrading managed jobs from v0.3 or v0.4. This deliberately updates paused,
+disabled, or active jobs by stable name.
 
 ## First operations
 
@@ -169,7 +175,7 @@ attestation. Live model plans can issue at most
 | `internal` | Yes, within event authority | Yes, when every gate passes | No |
 | `active` | Yes, within event authority | Same implemented behavior as `internal` | No |
 
-`active` is an operational rollout marker in this release. It does not add capabilities beyond `internal` and does not relax the outbound boundary.
+`active` is an operational rollout marker in this release. It does not add capabilities beyond `internal` and does not relax the outbound boundary. It requires `hermes.active_isolation_acknowledged = true` after deployment-owned filesystem, credential, and egress controls are reviewed. See [Active Mode Acceptance](docs/ACTIVE_MODE.md).
 
 This table describes the daemon. The separate outbound broker remains disabled until it is configured and deliberately invoked after an exact approval.
 
@@ -180,6 +186,7 @@ The CLI adapter uses safe argv execution with `shell=False` and passes only a sm
 ```toml
 [hermes]
 enabled = true
+active_isolation_acknowledged = true
 binary = "/absolute/path/to/hermes"
 profile = "operator"
 board = "default"
@@ -196,9 +203,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.5.0"]
-allowed_policy_versions = ["6.0.0"]
-allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
+allowed_plugin_versions = ["1.6.0"]
+allowed_policy_versions = ["7.0.0"]
+allowed_policy_digests = ["15f8e0a622abce0227c9b3f6b0168cf98bd17218933881b4d50f705edf2278d5"]
 ```
 
 `profile`, `default_assignee`, `orchestrator_profile`, and entries in `allowed_profiles` form the effective execution-profile allowlist. Each selected profile installs the plugin with its own `HERMES_OPERATOR_PROFILE` value and must produce a fresh accepted attestation before receiving work. This supports multiple attested profiles without adding profile-specific capacity pools.
@@ -209,7 +216,7 @@ The plugin sends one synchronous attestation at registration, then starts one da
 
 When a Hermes card blocks for missing context, reconciliation closes that run attempt and releases its compute slot. After the operator answers a linked question and the work is freshly authorized, the dispatcher reserves a new slot. It reuses the old card and includes only currently bound answers when the immutable scope is unchanged; otherwise it creates a new card carrying the new scope. A failed independent verification always uses a new card and run attempt. Retries retain the original authorization root and cannot exceed `max_execution_attempts`.
 
-The task-scoped plugin guard is defense in depth for Operator-managed cards, not an end-to-end enforcement claim for the Hermes harness. Contract-authorized local tests and builds can invoke project-defined code, and unmanaged interactive or Cron sessions follow Hermes-native policy. Credential separation, operating-system isolation, and network controls are optional deployment hardening when a stronger boundary is required. See [Hermes Integration](docs/HERMES_INTEGRATION.md) and [Threat Model](docs/THREAT_MODEL.md).
+The task-scoped plugin guard is defense in depth for Operator-managed cards, not an end-to-end enforcement claim for the Hermes harness. Contract-authorized local tests and builds can invoke project-defined code, and unmanaged interactive or Cron sessions follow Hermes-native policy. Active mode requires a deployment-owned review and explicit acknowledgement of credential, filesystem, and egress controls. See [Hermes Integration](docs/HERMES_INTEGRATION.md) and [Threat Model](docs/THREAT_MODEL.md).
 
 ## Inbound surfaces
 

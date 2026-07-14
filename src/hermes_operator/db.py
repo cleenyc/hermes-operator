@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -31,9 +32,10 @@ from .models import (
     normalize_recurrence_rule,
     utc_now,
 )
+from .verifier import validate_work_verification_readiness
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
 
 
 class StateConflict(RuntimeError):
@@ -299,6 +301,14 @@ class SQLiteStore:
                     expires_at TEXT NOT NULL,
                     heartbeat_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS bridge_proof_nonces (
+                    nonce TEXT PRIMARY KEY,
+                    observed_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bridge_proof_nonces_expiry
+                    ON bridge_proof_nonces(expires_at);
 
                 CREATE TABLE IF NOT EXISTS audit_log (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -584,6 +594,111 @@ class SQLiteStore:
                 values,
             )
 
+    def list_audit(
+        self,
+        *,
+        actors: Sequence[str] | None = None,
+        events: Sequence[str] | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded newest-first view of the append-only audit log."""
+
+        bounded_limit = max(1, min(int(limit), 1000))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if actors:
+            normalized = [str(value) for value in actors if str(value)]
+            if normalized:
+                clauses.append(
+                    "actor IN (" + ",".join("?" for _ in normalized) + ")"
+                )
+                params.extend(normalized)
+        if events:
+            normalized = [str(value) for value in events if str(value)]
+            if normalized:
+                clauses.append(
+                    "event IN (" + ",".join("?" for _ in normalized) + ")"
+                )
+                params.extend(normalized)
+        if entity_type is not None:
+            clauses.append("entity_type = ?")
+            params.append(str(entity_type))
+        if entity_id is not None:
+            clauses.append("entity_id = ?")
+            params.append(str(entity_id))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT sequence, timestamp, actor, event, entity_type, entity_id, "
+                "data_json FROM audit_log"
+                + where
+                + " ORDER BY sequence DESC LIMIT ?",
+                (*params, bounded_limit),
+            ).fetchall()
+        return [
+            {
+                "sequence": int(row["sequence"]),
+                "timestamp": str(row["timestamp"]),
+                "actor": str(row["actor"]),
+                "event": str(row["event"]),
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "data": json.loads(row["data_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def consume_bridge_proof_nonce(
+        self,
+        nonce: str,
+        observed_at: float,
+        expires_at: float,
+    ) -> bool:
+        """Atomically consume one short-lived bridge proof nonce.
+
+        The primary key is the replay fence across threads, processes, and
+        restarts. Expired entries are removed in the same immediate
+        transaction before insertion, keeping retention bounded by the proof
+        validity window without creating a separate cleanup job.
+        """
+
+        if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+            raise ValueError("bridge proof nonce must be 32 lowercase hex characters")
+        for name, value in (
+            ("observed_at", observed_at),
+            ("expires_at", expires_at),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"{name} must be a nonnegative finite timestamp")
+        observed = float(observed_at)
+        expires = float(expires_at)
+        if expires <= observed:
+            raise ValueError("bridge proof nonce expiry must follow observation")
+        with self.connection() as connection:
+            self._begin_immediate(connection)
+            connection.execute(
+                "DELETE FROM bridge_proof_nonces WHERE nonce IN ("
+                "SELECT nonce FROM bridge_proof_nonces WHERE expires_at <= ? "
+                "ORDER BY expires_at ASC LIMIT 1024)",
+                (observed,),
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO bridge_proof_nonces(nonce, observed_at, expires_at) "
+                    "VALUES(?, ?, ?)",
+                    (nonce, observed, expires),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
     def enqueue_event(self, event: Event, *, actor: str = "ingress") -> tuple[str, bool]:
         scoped_prefix = f"v1:{event.source}:"
         if event.dedupe_key and event.dedupe_key.startswith(scoped_prefix):
@@ -591,15 +706,23 @@ class SQLiteStore:
         else:
             raw_dedupe = event.dedupe_key
         if not event.dedupe_key:
-            material = self._json(
-                {
-                    "source": event.source,
-                    "external_id": event.external_id,
-                    "event_type": event.event_type,
-                    "payload": event.payload,
-                }
-            )
-            raw_dedupe = hashlib.sha256(material.encode()).hexdigest()
+            if event.external_id:
+                # A provider identity remains retry-stable even when a caller
+                # omits a separate key. Provider revisions should continue to
+                # supply an explicit revision-aware dedupe key.
+                material = self._json(
+                    {
+                        "source": event.source,
+                        "external_id": event.external_id,
+                        "event_type": event.event_type,
+                        "payload": event.payload,
+                    }
+                )
+                raw_dedupe = hashlib.sha256(material.encode()).hexdigest()
+            else:
+                # No identity means a new occurrence, not a permanent claim
+                # that byte-identical manual requests are the same request.
+                raw_dedupe = f"occurrence:{event.id}"
         if not (event.dedupe_key and event.dedupe_key.startswith(scoped_prefix)):
             scoped_dedupe = scoped_prefix + hashlib.sha256(
                 str(raw_dedupe).encode("utf-8")
@@ -1693,6 +1816,8 @@ class SQLiteStore:
             content_scope_changed = content_scope_changed or (
                 normalized["metadata"].get("verification_contract")
                 != current.metadata.get("verification_contract")
+                or normalized["metadata"].get("verification_requirement")
+                != current.metadata.get("verification_requirement")
             )
         acknowledged_recurring = False
         if "execution_mode" in normalized:
@@ -2549,6 +2674,7 @@ class SQLiteStore:
                 raise StateConflict(
                     f"Work authorization scope changed concurrently: {work_id}"
                 )
+            validate_work_verification_readiness(item)
             binding = execution_scope_binding(
                 item,
                 profile=normalized_profile,
@@ -3722,6 +3848,29 @@ class SQLiteStore:
                 (name, owner, epoch, expires, now_text),
             )
             return epoch
+
+    def get_service_lease(self, name: str) -> dict[str, Any] | None:
+        """Return the durable lease and whether its heartbeat is still live."""
+
+        if not name:
+            raise ValueError("Lease name is required")
+        now_text = utc_now()
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT name, owner, epoch, expires_at, heartbeat_at "
+                "FROM service_leases WHERE name = ?",
+                (name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": str(row["name"]),
+            "owner": str(row["owner"]),
+            "epoch": int(row["epoch"]),
+            "expires_at": str(row["expires_at"]),
+            "heartbeat_at": str(row["heartbeat_at"]),
+            "active": str(row["expires_at"]) > now_text,
+        }
 
     def renew_service_lease(
         self,

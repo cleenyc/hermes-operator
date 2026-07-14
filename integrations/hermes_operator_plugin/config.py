@@ -70,15 +70,29 @@ class PluginConfig:
     timeout_seconds: float
     inject_context: bool
     emit_lifecycle: bool
+    proof_secret: str | None = None
+    credentials_scrubbed: bool = False
+    reviewed_host_override: bool = False
     attestation_refresh_seconds: float = DEFAULT_ATTEST_INTERVAL_SECONDS
     max_response_bytes: int = 262_144
 
     @classmethod
     def from_env(cls) -> "PluginConfig":
-        token = os.getenv("HERMES_OPERATOR_BRIDGE_TOKEN", "").strip() or None
+        # Load once into this private client object, then remove both authority
+        # credentials from the process environment before Hermes can spawn any
+        # project-controlled test, build, terminal, or delegated subprocess.
+        token = os.environ.pop("HERMES_OPERATOR_BRIDGE_TOKEN", "").strip() or None
+        proof_secret = (
+            os.environ.pop("HERMES_OPERATOR_BRIDGE_PROOF_SECRET", "").strip()
+            or None
+        )
         if token is None:
             raise ConfigurationError(
                 "HERMES_OPERATOR_BRIDGE_TOKEN is required; do not substitute an admin token"
+            )
+        if proof_secret is not None and len(proof_secret.encode("utf-8")) < 32:
+            raise ConfigurationError(
+                "HERMES_OPERATOR_BRIDGE_PROOF_SECRET must contain at least 32 bytes"
             )
         profile = os.getenv("HERMES_OPERATOR_PROFILE", "").strip()
         if not profile:
@@ -95,6 +109,12 @@ class PluginConfig:
                 os.getenv("HERMES_OPERATOR_URL", "http://127.0.0.1:8787")
             ),
             api_token=token,
+            proof_secret=proof_secret,
+            credentials_scrubbed=True,
+            reviewed_host_override=_flag(
+                "HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE",
+                False,
+            ),
             profile=profile,
             timeout_seconds=_bounded_float(
                 "HERMES_OPERATOR_TIMEOUT_SECONDS", 1.5, 0.1, 10.0

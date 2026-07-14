@@ -17,10 +17,10 @@ from .connectors import CommandInboundConnector, ObsidianInboxReader
 from .db import LeaseFenceLost, SQLiteStore, StateConflict
 from .dispatcher import HermesDispatcher
 from .llm import build_llm
-from .models import WorkStatus
+from .models import WorkStatus, utc_now
 from .prioritization import PriorityEngine
 from .projector import KnowledgeProjector
-from .runtime import AutonomousRuntime, RuntimeCallbacks
+from .runtime import AutonomousRuntime, CycleResult, RuntimeCallbacks
 from .supervisor import Supervisor
 
 
@@ -136,6 +136,7 @@ class OperatorService:
             tick_seconds=config.operator.tick_seconds,
             reconciliation_seconds=config.operator.reconciliation_seconds,
             on_error=self._record_error,
+            on_cycle=self._record_cycle,
         )
         self.api: APIService | None = None
         if config.server.enabled:
@@ -143,6 +144,9 @@ class OperatorService:
                 store=self.store,
                 api_token=config.server.resolved_api_token(),
                 bridge_token=config.server.resolved_bridge_token(),
+                bridge_proof_secret=(
+                    config.server.resolved_bridge_proof_secret()
+                ),
                 webhook_secrets=config.server.webhook_secrets,
                 allow_unsigned_webhooks=config.server.allow_unsigned_webhooks,
                 max_body_bytes=config.server.max_body_bytes,
@@ -170,6 +174,7 @@ class OperatorService:
                     config.hermes.default_skills
                 ),
                 authorization_goal_mode=config.hermes.goal_mode,
+                verification_config=config.verification,
             )
             self.api = APIService(config.server.host, config.server.port, context)
 
@@ -225,6 +230,7 @@ class OperatorService:
                     "instance_id": self.config.operator.instance_id,
                     "autonomy_mode": self.config.operator.autonomy_mode,
                     "started": True,
+                    "started_at": utc_now(),
                     "leader_owner": self._leader_owner,
                     "leader_epoch": self._leader_epoch,
                 },
@@ -250,6 +256,7 @@ class OperatorService:
                                 {
                                     **state,
                                     "started": False,
+                                    "stopped_at": utc_now(),
                                 },
                             )
                 except StateConflict:
@@ -493,7 +500,36 @@ class OperatorService:
         return self.priority.next_best(items, limit=limit, include_running=True)
 
     def health(self) -> dict[str, Any]:
-        result = self.runtime.health()
+        local = self.runtime.health()
+        lease = self.store.get_service_lease(self._leader_name)
+        durable = self.store.get_state("runtime.status", {})
+        service_state = self.store.get_state("service", {})
+        if not isinstance(durable, dict):
+            durable = {}
+        if not isinstance(service_state, dict):
+            service_state = {}
+        running = bool(lease and lease.get("active"))
+        last_cycle = local.get("last_cycle") or durable.get("last_cycle")
+        degraded = bool(
+            isinstance(last_cycle, dict) and last_cycle.get("errors")
+        )
+        result = {
+            "status": "degraded" if degraded else ("running" if running else "stopped"),
+            "running": running,
+            "stop_requested": (
+                local.get("stop_requested")
+                if local.get("running")
+                else False
+            ),
+            "cycle_count": max(
+                int(local.get("cycle_count", 0)),
+                int(durable.get("cycle_count", 0)),
+            ),
+            "started_at": service_state.get("started_at") or local.get("started_at"),
+            "stopped_at": service_state.get("stopped_at") or local.get("stopped_at"),
+            "last_cycle": last_cycle,
+            "leader_lease": lease,
+        }
         result.update(
             {
                 "instance_id": self.config.operator.instance_id,
@@ -520,6 +556,28 @@ class OperatorService:
             }
         )
         return result
+
+    def _record_cycle(self, result: CycleResult) -> None:
+        """Persist cycle health so another process can report truthful status."""
+
+        previous = self.store.get_state("runtime.status", {})
+        prior_count = (
+            int(previous.get("cycle_count", 0))
+            if isinstance(previous, dict)
+            else 0
+        )
+        with self.store.transaction():
+            self._assert_leader()
+            self.store.set_state(
+                "runtime.status",
+                {
+                    "cycle_count": prior_count + 1,
+                    "last_cycle": result.to_dict(),
+                    "leader_owner": self._leader_owner,
+                    "leader_epoch": self._leader_epoch,
+                    "updated_at": utc_now(),
+                },
+            )
 
     def _record_error(self, component: str, error: BaseException) -> None:
         logger.exception("Autonomy component %s failed", component, exc_info=error)

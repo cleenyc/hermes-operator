@@ -9,8 +9,8 @@ import tarfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.4.0"
-PLUGIN_VERSION = "1.5.0"
+VERSION = "0.5.0"
+PLUGIN_VERSION = "1.6.0"
 ARCHIVE_ROOT = f"hermes-operator-{VERSION}"
 OUTPUT = ROOT / "dist" / f"hermes-operator-{VERSION}-complete.tar.gz"
 EXPECTED_WHEELS = (
@@ -25,6 +25,7 @@ INCLUDE = (
     "Makefile",
     "pyproject.toml",
     "Dockerfile",
+    ".dockerignore",
     "compose.yaml",
     ".github",
     "config",

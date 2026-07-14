@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .models import TERMINAL_WORK_STATUSES, WorkItem
+from .verifier import work_verification_requirement
 
 
 def _effective_skills(
@@ -61,6 +62,7 @@ def execution_scope_document(
         "profile": str(profile).strip(),
         "effective_skills": _effective_skills(skills, default_skills),
         "goal_mode": bool(goal_mode),
+        "verification_requirement": work_verification_requirement(item),
         "verification_contract": verification_contract,
     }
 

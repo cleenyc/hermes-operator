@@ -32,6 +32,10 @@ pass_env = []
 
 [hermes]
 enabled = false
+# Required only for autonomy_mode = "active". Set true after deployment owners
+# review OS/container filesystem isolation, worker credentials, and network egress.
+# This acknowledges deployment controls; it does not claim this process is a sandbox.
+active_isolation_acknowledged = false
 binary = "hermes"
 profile = "operator"
 board = "default"
@@ -59,11 +63,11 @@ control_timeout_seconds = 10
 require_policy_attestation = true
 # The native plugin heartbeat defaults to 120 seconds. Keep this core TTL above it.
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.5.0"]
-allowed_policy_versions = ["6.0.0"]
+allowed_plugin_versions = ["1.6.0"]
+allowed_policy_versions = ["7.0.0"]
 # Exact SHA-256 of integrations/hermes_operator_plugin/policy.py in this release.
 # Recompute, review, and update this allowlist whenever that policy source changes.
-allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
+allowed_policy_digests = ["15f8e0a622abce0227c9b3f6b0168cf98bd17218933881b4d50f705edf2278d5"]
 
 [obsidian]
 enabled = false
@@ -95,6 +99,9 @@ port = 8787
 api_token_env = "HERMES_OPERATOR_API_TOKEN"
 # Scoped native-plugin credential. It must differ from the admin token.
 bridge_token_env = "HERMES_OPERATOR_BRIDGE_TOKEN"
+# Independent exact-operation proof secret (at least 32 bytes). The native plugin
+# removes both bridge credentials from its environment before project tools run.
+bridge_proof_secret_env = "HERMES_OPERATOR_BRIDGE_PROOF_SECRET"
 max_body_bytes = 1048576
 allow_unsigned_webhooks = false
 

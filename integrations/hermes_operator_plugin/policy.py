@@ -232,7 +232,7 @@ class TaskScopedPolicyGuard:
                 )
             )
 
-POLICY_VERSION = "6.0.0"
+POLICY_VERSION = "7.0.0"
 POLICY_MODE = "default_deny"
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -319,6 +319,25 @@ _TASK_SCOPED_CAPABILITY_TOOLS = {
     "patch": "local_write",
     "write_file": "local_write",
 }
+
+_TASK_SCOPED_READ_TOOLS = {
+    "read_file": "local_read",
+    "read_terminal": "local_read",
+    "search_files": "local_read",
+}
+
+_MANAGED_UNSCOPED_OBSERVATION_TOOLS = {
+    "read_terminal",
+    "session_search",
+    "video_analyze",
+    "vision_analyze",
+}
+
+_WORKSPACE_ENV = "HERMES_KANBAN_WORKSPACE"
+_PATCH_FILE_LINE = re.compile(
+    r"^\*\*\*\s+(?:Add|Delete|Update)\s+File:\s*(?P<path>.+?)\s*$"
+)
+_PATCH_MOVE_LINE = re.compile(r"^\*\*\*\s+Move\s+to:\s*(?P<path>.+?)\s*$")
 
 _COMMUNICATION_OBJECTS = {
     "chat",
@@ -512,7 +531,6 @@ _SAFE_TERMINAL_PROGRAMS = {
     "stat",
     "tail",
     "tree",
-    "uniq",
     "wc",
     "which",
 }
@@ -747,6 +765,12 @@ def evaluate_tool_call(
         )
     if name == "execute_code":
         return _execute_code_policy(args)
+    if current_task_id and name in _MANAGED_UNSCOPED_OBSERVATION_TOOLS:
+        return PolicyDecision(
+            True,
+            "authorization",
+            f"{name} has no provable current-workspace or current-run binding",
+        )
     if name == "delegate_task":
         if not _contract_has_capability(
             execution_contract, current_task_id, "delegate_task"
@@ -758,6 +782,12 @@ def evaluate_tool_call(
             )
         return _delegate_task_policy(args)
     if name == "process":
+        if current_task_id:
+            return PolicyDecision(
+                True,
+                "authorization",
+                "process output has no provable current-run ownership binding",
+            )
         action = _action(args)
         if action in {"kill", "terminate", "write"} or not action:
             return PolicyDecision(
@@ -878,12 +908,31 @@ def evaluate_tool_call(
     capability = _TASK_SCOPED_CAPABILITY_TOOLS.get(name)
     if capability:
         if _contract_has_capability(execution_contract, current_task_id, capability):
+            workspace_error = _file_tool_workspace_error(name, args)
+            if workspace_error:
+                return PolicyDecision(True, "authorization", workspace_error)
             return ALLOW
         return PolicyDecision(
             True,
             "authorization",
             f"{name} requires the live {capability} task capability",
         )
+
+    capability = _TASK_SCOPED_READ_TOOLS.get(name)
+    if capability:
+        if not _contract_has_capability(
+            execution_contract, current_task_id, capability
+        ):
+            return PolicyDecision(
+                True,
+                "authorization",
+                f"{name} requires the live {capability} task capability",
+            )
+        if name in {"read_file", "search_files"}:
+            workspace_error = _file_tool_workspace_error(name, args)
+            if workspace_error:
+                return PolicyDecision(True, "authorization", workspace_error)
+        return ALLOW
 
     if name in _EXPLICITLY_ALLOWED_TOOLS:
         return ALLOW
@@ -946,9 +995,15 @@ def _required_capability(tool_name: str, args: Mapping[str, Any]) -> str:
         return "__live_task__"
     if name in _TASK_SCOPED_CAPABILITY_TOOLS:
         return _TASK_SCOPED_CAPABILITY_TOOLS[name]
+    if name in _TASK_SCOPED_READ_TOOLS:
+        return _TASK_SCOPED_READ_TOOLS[name]
     if name == "terminal":
         command = _first_string(args, ("command", "cmd", "script"))
-        return _internal_command_capability(command) if command else ""
+        if not command:
+            return ""
+        if _is_safe_terminal_command(command):
+            return "local_read"
+        return _internal_command_capability(command)
     return ""
 
 
@@ -1369,10 +1424,6 @@ def _work_update_confirmation(
         return _blocked_response(
             PolicyDecision(True, "authorization", "work update identity or changes are invalid")
         )
-    status = _normalize_name(changes.get("status"))
-    sensitive = status in {"done", "cancelled", "archived"} or "parent_id" in changes
-    if not sensitive:
-        return None
     fields = sorted(str(key) for key in changes)
     try:
         encoded_changes = json.dumps(
@@ -1393,7 +1444,7 @@ def _work_update_confirmation(
     return {
         "action": "approve",
         "message": (
-            "Confirm this terminal or hierarchy-changing Operator work update: "
+            "Confirm this exact Operator work update: "
             f"{work_id.strip()} version {expected_version} ({', '.join(fields)})"
         ),
         "rule_key": (
@@ -1462,6 +1513,20 @@ def _terminal_policy(
         if pattern.search(command):
             return PolicyDecision(True, category, "terminal command can cause a prohibited side effect")
     if _is_safe_terminal_command(command):
+        if current_task_id and not _contract_has_capability(
+            execution_contract,
+            current_task_id,
+            "local_read",
+        ):
+            return PolicyDecision(
+                True,
+                "authorization",
+                "local inspection requires the live local_read task capability",
+            )
+        if current_task_id:
+            workspace_error = _terminal_workspace_error(command)
+            if workspace_error:
+                return PolicyDecision(True, "authorization", workspace_error)
         return ALLOW
     capability = _internal_command_capability(command)
     if capability and _contract_has_capability(
@@ -1469,6 +1534,9 @@ def _terminal_policy(
         current_task_id,
         capability,
     ):
+        workspace_error = _terminal_workspace_error(command)
+        if workspace_error:
+            return PolicyDecision(True, "authorization", workspace_error)
         return ALLOW
     if capability:
         return PolicyDecision(
@@ -1535,7 +1603,236 @@ def _safe_command_segment(tokens: Sequence[str]) -> bool:
         return False
     if program == "git":
         return _safe_git(arguments)
+    if program == "tree" and any(
+        value == "-o"
+        or value.startswith("-o")
+        or value.startswith("--output")
+        for value in arguments
+    ):
+        return False
+    if program == "diff" and any(value.startswith("--output") for value in arguments):
+        return False
     return True
+
+
+def _workspace_root() -> tuple[Path | None, str]:
+    """Return the dispatcher-owned workspace as one canonical directory."""
+
+    raw = os.getenv(_WORKSPACE_ENV, "").strip()
+    if not raw:
+        return None, f"{_WORKSPACE_ENV} is required for managed local work"
+    if "\x00" in raw or "\n" in raw or "\r" in raw:
+        return None, f"{_WORKSPACE_ENV} contains invalid characters"
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        return None, f"{_WORKSPACE_ENV} must be an absolute directory"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, f"{_WORKSPACE_ENV} cannot be resolved"
+    if not resolved.is_dir():
+        return None, f"{_WORKSPACE_ENV} must identify an existing directory"
+    return resolved, ""
+
+
+def _contained_workspace_path(
+    raw_path: Any,
+    *,
+    root: Path,
+    field: str,
+) -> tuple[Path | None, str]:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None, f"{field} must be one nonempty workspace path"
+    if any(character in raw_path for character in ("\x00", "\n", "\r")):
+        return None, f"{field} contains invalid characters"
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None, f"{field} escapes the authorized Hermes workspace"
+    return resolved, ""
+
+
+def _patch_paths(args: Mapping[str, Any]) -> tuple[list[str], str]:
+    mode = _normalize_name(args.get("mode") or "replace")
+    if mode == "replace":
+        value = args.get("path")
+        return ([value] if isinstance(value, str) and value.strip() else []), (
+            "patch replace mode requires one explicit path"
+            if not isinstance(value, str) or not value.strip()
+            else ""
+        )
+    if mode != "patch":
+        return [], "patch mode is not recognized"
+    body = args.get("patch")
+    if not isinstance(body, str) or not body.strip() or len(body) > 2_000_000:
+        return [], "patch mode requires one bounded V4A patch"
+    paths: list[str] = []
+    for line in body.splitlines():
+        match = _PATCH_FILE_LINE.fullmatch(line) or _PATCH_MOVE_LINE.fullmatch(line)
+        if match:
+            paths.append(match.group("path").strip())
+    if not paths:
+        return [], "patch mode must expose every target in V4A file headers"
+    return paths, ""
+
+
+def _file_tool_workspace_error(name: str, args: Mapping[str, Any]) -> str:
+    root, root_error = _workspace_root()
+    if root_error or root is None:
+        return root_error
+    if name == "search_files":
+        paths = [
+            value
+            for key, value in args.items()
+            if _normalize_name(key) in {"path", "directory", "root", "cwd"}
+        ] or ["."]
+    elif name in {"read_file", "write_file"}:
+        paths = [
+            value
+            for key, value in args.items()
+            if _normalize_name(key) in {"path", "file_path", "filename"}
+        ]
+        if len(paths) != 1:
+            return f"{name} requires exactly one explicit workspace path"
+    elif name == "patch":
+        paths, patch_error = _patch_paths(args)
+        if patch_error:
+            return patch_error
+    else:
+        return "local file tool is not covered by workspace policy"
+    for index, value in enumerate(paths):
+        _, path_error = _contained_workspace_path(
+            value,
+            root=root,
+            field=f"{name} path {index + 1}",
+        )
+        if path_error:
+            return path_error
+    return ""
+
+
+def _terminal_workspace_error(command: str) -> str:
+    """Conservatively bind managed terminal paths and cwd changes to the workspace."""
+
+    root, root_error = _workspace_root()
+    if root_error or root is None:
+        return root_error
+    segments = _command_segments(command)
+    if not segments:
+        return "terminal command cannot be safely parsed for workspace containment"
+    cwd = root
+    for segment in segments:
+        if not segment:
+            return "terminal command contains an empty segment"
+        program = segment[0].lower()
+        arguments = list(segment[1:])
+        if program == "cd":
+            if len(arguments) != 1:
+                return "managed cd requires one workspace-relative directory"
+            target, target_error = _contained_workspace_path(
+                arguments[0], root=cwd, field="terminal cwd"
+            )
+            if target_error or target is None:
+                return target_error
+            try:
+                target.relative_to(root)
+            except ValueError:
+                return "terminal cwd escapes the authorized Hermes workspace"
+            cwd = target
+            continue
+
+        lowered = [value.lower() for value in arguments]
+        if program == "tree" and any(
+            value == "-o"
+            or value.startswith("-o")
+            or value.startswith("--output")
+            for value in lowered
+        ):
+            return "tree output files are not allowed in managed inspection commands"
+        if program == "diff" and any(value.startswith("--output") for value in lowered):
+            return "diff output files are not allowed in managed inspection commands"
+        if program == "git" and any(
+            value == "-c"
+            or value.startswith("--config-env")
+            or value.startswith("--exec-path")
+            or value.startswith("--git-dir")
+            or value.startswith("--work-tree")
+            or value.startswith("--output")
+            or value in {"--ext-diff", "--textconv"}
+            for value in lowered
+        ):
+            return "git configuration, output, or external helpers are not allowed"
+        if program == "rg" and any(
+            value.startswith(("--pre", "--ignore-file", "--file"))
+            for value in lowered
+        ):
+            return "ripgrep helper and external pattern files are not allowed"
+        external_file_options = {
+            "date": ("--file", "-f"),
+            "diff": ("--from-file", "--to-file"),
+            "du": ("--files0-from",),
+            "grep": ("--exclude-from", "--include-from"),
+            "jq": ("--argfile", "--rawfile", "--slurpfile"),
+            "tree": ("--fromfile",),
+            "wc": ("--files0-from",),
+        }.get(program, ())
+        if any(
+            value == option or value.startswith(f"{option}=")
+            for value in lowered
+            for option in external_file_options
+        ):
+            return f"{program} external file options are not allowed"
+
+        for value in arguments:
+            if value.startswith("-"):
+                continue
+            path_candidate = Path(value).expanduser()
+            if path_candidate.is_absolute() or ".." in path_candidate.parts:
+                _, path_error = _contained_workspace_path(
+                    value, root=cwd, field="terminal argument"
+                )
+                if path_error:
+                    return path_error
+
+        path_values: list[str] = []
+        if program in {
+            "basename",
+            "cat",
+            "comm",
+            "cut",
+            "df",
+            "diff",
+            "dirname",
+            "du",
+            "file",
+            "head",
+            "ls",
+            "stat",
+            "tail",
+            "tree",
+            "wc",
+        }:
+            path_values = [value for value in arguments if not value.startswith("-")]
+        elif program == "jq":
+            values = [value for value in arguments if not value.startswith("-")]
+            path_values = values[1:]
+        elif program in {"grep", "rg"}:
+            values = [value for value in arguments if not value.startswith("-")]
+            path_values = values[1:]
+        elif program == "git" and "--" in arguments:
+            path_values = arguments[arguments.index("--") + 1 :]
+
+        for value in path_values:
+            _, path_error = _contained_workspace_path(
+                value, root=cwd, field=f"{program} path"
+            )
+            if path_error:
+                return path_error
+    return ""
 
 
 def _internal_command_capability(command: str) -> str:

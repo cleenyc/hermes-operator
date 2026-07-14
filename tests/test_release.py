@@ -70,14 +70,20 @@ class ReleaseConsistencyTests(unittest.TestCase):
         spec.loader.exec_module(module)
 
         self.assertEqual(module.VERSION, hermes_operator.__version__)
-        self.assertEqual(module.PLUGIN_VERSION, "1.5.0")
+        self.assertEqual(module.PLUGIN_VERSION, "1.6.0")
         self.assertEqual(
             set(module.EXPECTED_WHEELS),
             {
-                "hermes_operator-0.4.0-py3-none-any.whl",
-                "hermes_operator_plugin-1.5.0-py3-none-any.whl",
+                "hermes_operator-0.5.0-py3-none-any.whl",
+                "hermes_operator_plugin-1.6.0-py3-none-any.whl",
             },
         )
+        workflow = (
+            ROOT / ".github/workflows/hermes-compat.yml"
+        ).read_text(encoding="utf-8")
+        for wheel in module.EXPECTED_WHEELS:
+            self.assertIn(f"dist/{wheel}", workflow)
+        self.assertIn(f"hermes-operator-{module.VERSION}-complete.tar.gz", workflow)
         required = {
             "README.md",
             "AUTHORS.md",
@@ -86,11 +92,13 @@ class ReleaseConsistencyTests(unittest.TestCase):
             "Makefile",
             "pyproject.toml",
             "Dockerfile",
+            ".dockerignore",
             "compose.yaml",
             "config/operator.example.toml",
             "config/outbound.example.toml",
             "deploy/hermes-operator.service",
             "docs/API.md",
+            "docs/ACTIVE_MODE.md",
             "docs/CONFIGURATION.md",
             "docs/NATIVE_AUTOMATION.md",
             "docs/REMINDERS.md",

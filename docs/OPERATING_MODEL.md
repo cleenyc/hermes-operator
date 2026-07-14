@@ -81,7 +81,7 @@ pending -> processing -> processed
 
 Processing uses a unique claim token and expiry. The supervisor renews its claim after the model returns and before applying the plan. If the claim has been reclaimed, the pass fails without mutation.
 
-Every claimed event needs exactly one durable disposition: work recorded, question requested, execution reconciled, memory recorded, external action proposed, duplicate, non-actionable, or quarantined. Effect-bearing dispositions are checked against the effects that actually survived policy. Non-actionable and quarantine outcomes require a specific reason. Conservatively detected task signals, including request/task event types, structured action or deadline fields, and common imperative subjects, cannot be dismissed as non-actionable. If one is quarantined, the supervisor creates a deterministic `decision` item in `waiting_input` with `execution_mode = none`, preserves a bounded untrusted evidence preview, and creates a pending bound question for private attention delivery. A response that omits an event, duplicates a disposition, returns empty action arrays without a disposition, or tries to dismiss task-like intake fails and leaves the event retryable.
+Every claimed event needs exactly one durable disposition: work recorded, question requested, execution reconciled, memory recorded, external action proposed, duplicate, non-actionable, or quarantined. Effect-bearing dispositions are checked against the effects that actually survived policy. Non-actionable and quarantine outcomes require a specific reason. Conservatively detected task signals, including request/task event types, structured action or deadline fields, and common imperative subjects, cannot be dismissed as non-actionable. Any quarantined disposition creates a deterministic `decision` item in `waiting_input` with `execution_mode = none`, preserves a bounded untrusted evidence preview, and creates a pending bound question for private attention delivery. A response that omits an event, duplicates a disposition, returns empty action arrays without a disposition, or tries to dismiss task-like intake fails and leaves the event retryable.
 
 A validated plan, event dispositions, event consumption, finalized plan record, last-pass state, and completion audit commit in one immediate SQLite transaction. A late validation or version failure rolls back all plan effects.
 
@@ -139,7 +139,7 @@ Each live pass receives:
 
 The model returns one JSON plan. The supervisor rejects malformed operations, unknown references, invalid timestamps, terminal creates, unauthorized capabilities, out-of-date versions, unlisted profiles or skills, and unsupported action types. `operator.max_authorizations_per_pass` independently caps how many exact dispatch authorizations that pass may write.
 
-A stable semantic idempotency key prevents the same pass from recreating the same work. Reuse is accepted only when the stored pass, source event, plan reference, and full normalized creation-identity digest match. A collision cannot inherit existing update or execution authority.
+A supplied stable semantic idempotency key supports deliberate reuse across passes. When it is omitted, the generated identity is scoped to the triggering event batch or eventless pass, so a retry of one occurrence remains idempotent without suppressing a later identical manual request forever. Reuse is accepted only when the stored pass, source event, plan reference, and full normalized creation-identity digest match. A collision cannot inherit existing update or execution authority.
 
 Eventless reconciliation is deliberately non-authorizing. It may adjust numeric priority factors, create triage observations, or ask nonblocking questions. It cannot issue dispatch, add work links, apply broad updates, or stage external actions.
 
@@ -206,7 +206,12 @@ The plugin registers a local pre-tool guard before bridge startup. It then sends
 
 The example core TTL is 300 seconds. A missing, stale, wrong-profile, wrong-version, or wrong-digest attestation prevents new dispatch reservations. The daemon heartbeat keeps an otherwise idle healthy process fresh. Each accepted refresh updates authenticated profile state and audit directly; it does not queue planner work or wake an LLM pass. Refresh failure leaves installed bridge and guard behavior in place, while the core TTL eventually expires and blocks new reservations.
 
-The bridge uses `HERMES_OPERATOR_BRIDGE_TOKEN`, not the admin token. It can read next work, questions, attention, and the exact live task contract; capture reversible work; submit version-fenced updates; record exact answers and authorization supplied through Hermes; ingest normalized Google evidence; claim private attention delivery; and post observations and attestations. Authority-bearing conversational operations use Hermes-native confirmation. It cannot inspect or approve external-action grants, fetch the admin status graph, or execute outbound delivery.
+The bridge uses `HERMES_OPERATOR_BRIDGE_TOKEN`, not the admin token. Authority-bearing
+calls additionally use `HERMES_OPERATOR_BRIDGE_PROOF_SECRET` after Hermes-native
+confirmation. Each proof binds one exact operation and a nonce atomically consumed in
+SQLite; the plugin removes both secrets from its environment before project subprocesses
+run. The bridge cannot inspect or approve external-action grants, fetch the admin status
+graph, or execute outbound delivery.
 
 ## Parallel execution
 

@@ -7,6 +7,7 @@ turns a missing or mismatched host into a failure instead of a skip.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from importlib import import_module, metadata
 import inspect
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest.mock import patch
@@ -23,8 +25,12 @@ from unittest.mock import patch
 PLUGIN_PARENT = Path(__file__).resolve().parents[2]
 if str(PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_PARENT))
+CORE_SRC = Path(__file__).resolve().parents[3] / "src"
+if str(CORE_SRC) not in sys.path:
+    sys.path.insert(0, str(CORE_SRC))
 
 compatibility = import_module("hermes_operator_plugin.compatibility")
+plugin_config = import_module("hermes_operator_plugin.config")
 policy = import_module("hermes_operator_plugin.policy")
 
 
@@ -42,14 +48,23 @@ class PinnedHermesHostIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         installed = _installed_hermes_version()
         required = os.getenv("HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION") == "1"
-        if installed != compatibility.SUPPORTED_HERMES_VERSION:
+        pinned_required = os.getenv("HERMES_OPERATOR_REQUIRE_PINNED_HOST") == "1"
+        if installed is None:
             message = (
-                "real-host tests require hermes-agent=="
-                f"{compatibility.SUPPORTED_HERMES_VERSION}; found {installed or 'none'}"
+                "real-host tests require an installed hermes-agent host; found none"
             )
             if required:
                 raise AssertionError(message)
             raise unittest.SkipTest(message)
+        if pinned_required and installed != compatibility.SUPPORTED_HERMES_VERSION:
+            raise AssertionError(
+                "pinned real-host lane requires hermes-agent=="
+                f"{compatibility.SUPPORTED_HERMES_VERSION}; found {installed}"
+            )
+        if installed != compatibility.SUPPORTED_HERMES_VERSION and not required:
+            raise unittest.SkipTest(
+                "advisory non-pinned host semantics run only in the real-host CI lane"
+            )
 
     def test_real_dispatcher_marker_is_canonical_across_quiet_turn_uuid(self):
         turn_context = import_module("agent.turn_context")
@@ -128,6 +143,14 @@ class PinnedHermesHostIntegrationTests(unittest.TestCase):
                 ["chat", "-q", "work kanban task task-1"],
             )
             self.assertEqual(launch_environment["HERMES_KANBAN_TASK"], "task-1")
+            self.assertEqual(
+                Path(launch_environment["HERMES_KANBAN_WORKSPACE"]).resolve(),
+                workspace.resolve(),
+            )
+            self.assertEqual(
+                Path(popen.call_args.kwargs["cwd"]).resolve(),
+                workspace.resolve(),
+            )
             self.assertEqual(launch_environment["HERMES_PROFILE"], "operator")
 
         # Exercise the plugin through the real host's directive resolver with the same
@@ -167,14 +190,24 @@ class PinnedHermesHostIntegrationTests(unittest.TestCase):
             self.assertIsNone(native.action)
             self.assertEqual(approval.action, "approve")
 
-            with patch.dict(os.environ, launch_environment, clear=True):
-                quiet_turn_id = str(uuid.uuid4())
-                self.assertNotEqual(quiet_turn_id, task.id)
-                managed = host_plugins._get_pre_tool_call_directive_details(
-                    "terminal",
-                    {"command": "pytest -q"},
-                    task_id=quiet_turn_id,
-                )
+            with tempfile.TemporaryDirectory() as live_temporary:
+                live_root = Path(live_temporary)
+                live_workspace = live_root / "workspace"
+                live_workspace.mkdir()
+                live_environment = {
+                    **launch_environment,
+                    "HOME": str(live_root),
+                    "HERMES_HOME": str(live_root / "home"),
+                    "HERMES_KANBAN_WORKSPACE": str(live_workspace),
+                }
+                with patch.dict(os.environ, live_environment, clear=True):
+                    quiet_turn_id = str(uuid.uuid4())
+                    self.assertNotEqual(quiet_turn_id, task.id)
+                    managed = host_plugins._get_pre_tool_call_directive_details(
+                        "terminal",
+                        {"command": "pytest -q"},
+                        task_id=quiet_turn_id,
+                    )
             self.assertIsNone(managed.action)
             self.assertEqual(contract_lookups, ["task-1"])
         finally:
@@ -186,6 +219,101 @@ class PinnedHermesHostIntegrationTests(unittest.TestCase):
             compatibility._managed_worker_identity_semantics(),
             "dispatcher_environment",
         )
+        self.assertIn(
+            compatibility._completion_transport_semantics(),
+            {
+                "post_hook_prose_path_promotion",
+                "prehook_structured_and_post_hook_prose_path_promotion",
+                "prehook_structured_artifact_fields",
+                "none",
+            },
+        )
+
+    def test_real_cron_parser_accepts_operator_reconciliation_contract(self):
+        cron_parser = import_module("hermes_cli.subcommands.cron")
+        native = import_module("hermes_operator.native_automation")
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        cron_parser.build_cron_parser(subparsers, cmd_cron=lambda _args: 0)
+
+        listed = parser.parse_args(["cron", "list", "--all"])
+        self.assertEqual(listed.cron_command, "list")
+        self.assertTrue(listed.all)
+
+        manager = object.__new__(native.HermesNativeAutomationManager)
+        manager.binary = ("hermes",)
+        manager.profile = "operator"
+        job = native.NativeJobSpec(
+            name="Hermes Operator: due reminders",
+            schedule="every 15m",
+            prompt="Deliver private due reminders",
+            skills=(),
+            delivery="telegram:private-chat",
+        )
+        argv = manager._edit_argv(job)
+        parsed = parser.parse_args(argv[argv.index("cron") :])
+        self.assertEqual(parsed.cron_command, "edit")
+        self.assertEqual(parsed.job_id, job.name)
+        self.assertEqual(parsed.schedule, job.schedule)
+        self.assertEqual(parsed.prompt, job.prompt)
+        self.assertEqual(parsed.name, job.name)
+        self.assertEqual(parsed.deliver, job.delivery)
+        self.assertTrue(parsed.clear_skills)
+
+    def test_real_control_router_exposes_read_only_active_worker_probe(self):
+        plugin_api = import_module("plugins.kanban.dashboard.plugin_api")
+        routes = {
+            (route.path, frozenset(methods))
+            for route in plugin_api.router.routes
+            if (methods := getattr(route, "methods", None))
+        }
+        self.assertIn(("/workers/active", frozenset({"GET"})), routes)
+
+    def test_pinned_host_has_no_managed_bridge_activation_blocker(self):
+        guard = SimpleNamespace(expected_profile="operator")
+        context = SimpleNamespace(
+            profile_name="operator",
+            _manager=SimpleNamespace(_hooks={"pre_tool_call": [guard]}),
+        )
+        with patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            report = compatibility.diagnose_host(
+                context,
+                guard,
+                credentials_scrubbed=True,
+            )
+        self.assertTrue(report["supported_hermes_version_match"])
+        self.assertEqual(
+            report["managed_subprocess_secret_semantics"],
+            "plugin_environment_scrubbed",
+        )
+        self.assertEqual(compatibility.bridge_activation_blockers(report), ())
+
+    def test_plugin_scrubs_bridge_credentials_before_project_subprocesses(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_OPERATOR_BRIDGE_TOKEN": "scoped-bridge-token",
+                "HERMES_OPERATOR_BRIDGE_PROOF_SECRET": (
+                    "proof-secret-that-is-at-least-32-bytes-long"
+                ),
+                "HERMES_OPERATOR_PROFILE": "operator",
+            },
+            clear=True,
+        ):
+            config = plugin_config.PluginConfig.from_env()
+            self.assertTrue(config.credentials_scrubbed)
+            self.assertNotIn("HERMES_OPERATOR_BRIDGE_TOKEN", os.environ)
+            self.assertNotIn("HERMES_OPERATOR_BRIDGE_PROOF_SECRET", os.environ)
+            self.assertEqual(
+                compatibility._managed_subprocess_secret_semantics(
+                    credentials_scrubbed=config.credentials_scrubbed
+                ),
+                "plugin_environment_scrubbed",
+            )
 
     def test_real_host_blocks_completion_prose_before_artifact_promotion(self):
         host_plugins = import_module("hermes_cli.plugins")

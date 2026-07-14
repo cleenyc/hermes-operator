@@ -39,6 +39,33 @@ class SQLiteStoreTests(unittest.TestCase):
         self.store = SQLiteStore(Path(self.temporary.name) / "operator.db")
         self.store.initialize()
 
+    def test_audit_query_is_bounded_and_filterable(self) -> None:
+        self.store.audit(
+            "operator-test",
+            "work.reviewed",
+            entity_type="work",
+            entity_id="wrk_1",
+            data={"decision": "keep"},
+        )
+        self.store.audit(
+            "system",
+            "cycle.completed",
+            entity_type="runtime",
+            entity_id="cycle_1",
+        )
+
+        items = self.store.list_audit(
+            actors=["operator-test"],
+            events=["work.reviewed"],
+            entity_type="work",
+            entity_id="wrk_1",
+            limit=10,
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["actor"], "operator-test")
+        self.assertEqual(items[0]["data"], {"decision": "keep"})
+
     def test_events_are_deduplicated_claimed_and_completed(self) -> None:
         event = Event(
             source="gmail",
@@ -166,6 +193,28 @@ class SQLiteStoreTests(unittest.TestCase):
         self.assertTrue(gmail_created)
         self.assertTrue(calendar_created)
         self.assertNotEqual(gmail_id, calendar_id)
+
+    def test_no_identity_events_are_distinct_manual_occurrences(self) -> None:
+        first_id, first_created = self.store.enqueue_event(
+            Event(
+                source="operator",
+                event_type="operator.request",
+                payload={"request": "Review the forecast"},
+                trust_level=TrustLevel.OPERATOR,
+            )
+        )
+        second_id, second_created = self.store.enqueue_event(
+            Event(
+                source="operator",
+                event_type="operator.request",
+                payload={"request": "Review the forecast"},
+                trust_level=TrustLevel.OPERATOR,
+            )
+        )
+
+        self.assertTrue(first_created)
+        self.assertTrue(second_created)
+        self.assertNotEqual(first_id, second_id)
 
     def test_privileged_events_are_leased_without_untrusted_neighbors(self) -> None:
         operator_id, _ = self.store.enqueue_event(
@@ -747,6 +796,35 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertIn("authorization_conflict", outcomes)
             self.assertIsNone(event)
 
+    def test_deterministic_authorization_requires_a_named_check(self) -> None:
+        work = WorkItem(
+            title="Require deployment-owned completion evidence",
+            metadata={"verification_requirement": "deterministic_required"},
+        )
+        self.store.create_work(work)
+        displayed_digest = execution_scope_digest(
+            work,
+            profile="operator",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "deployment-owned named check",
+        ):
+            self.store.enqueue_work_authorization(
+                work.id,
+                expected_version=work.version,
+                expected_scope_revision=work.authorization_scope_revision,
+                expected_scope_digest=displayed_digest,
+                profile="operator",
+                skills=[],
+                default_skills=[],
+                goal_mode=False,
+                reason="Authorize only after deterministic assurance is configured",
+            )
+
+        self.assertEqual(self.store.claim_events("supervisor", 10, 60), [])
+
     def test_terminal_transition_revokes_authority_and_reopen_starts_fresh(self) -> None:
         work = WorkItem(
             title="Cancelable managed work",
@@ -1189,6 +1267,53 @@ class SQLiteStoreTests(unittest.TestCase):
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()["value"]
         self.assertEqual(version, "999")
+
+    def test_bridge_proof_nonce_consumption_survives_restart_and_expires(self) -> None:
+        nonce = "a" * 32
+        self.assertTrue(
+            self.store.consume_bridge_proof_nonce(nonce, 100.0, 190.0)
+        )
+        restarted = SQLiteStore(self.store.path)
+        restarted.initialize()
+        self.assertFalse(
+            restarted.consume_bridge_proof_nonce(nonce, 101.0, 191.0)
+        )
+
+        # Once the original proof cannot be valid, the same random value no
+        # longer represents a replay and the expiry cleanup can reclaim it.
+        self.assertTrue(
+            restarted.consume_bridge_proof_nonce(nonce, 191.0, 281.0)
+        )
+        with restarted.connection() as connection:
+            rows = connection.execute(
+                "SELECT nonce, observed_at, expires_at FROM bridge_proof_nonces"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["nonce"], nonce)
+        self.assertEqual(float(rows[0]["observed_at"]), 191.0)
+
+    def test_bridge_proof_nonce_is_single_consumer_under_concurrency(self) -> None:
+        barrier = threading.Barrier(4)
+        outcomes: list[bool] = []
+
+        def consume() -> None:
+            barrier.wait()
+            outcomes.append(
+                self.store.consume_bridge_proof_nonce(
+                    "b" * 32,
+                    200.0,
+                    290.0,
+                )
+            )
+
+        threads = [threading.Thread(target=consume) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(outcomes), [False, False, False, True])
 
     def test_legacy_blocked_run_is_closed_and_does_not_hold_capacity(self) -> None:
         work = WorkItem(title="Legacy execution")

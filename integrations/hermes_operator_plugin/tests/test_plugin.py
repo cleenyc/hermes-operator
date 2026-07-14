@@ -4,12 +4,14 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 from threading import Event, Thread
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest.mock import patch
@@ -87,6 +89,7 @@ def make_config(
     profile="test-profile",
     inject=True,
     emit=True,
+    proof_secret="proof-secret-that-is-at-least-32-bytes-long",
 ):
     return config_module.PluginConfig(
         base_url=base_url,
@@ -95,6 +98,7 @@ def make_config(
         timeout_seconds=1,
         inject_context=inject,
         emit_lifecycle=emit,
+        proof_secret=proof_secret,
     )
 
 
@@ -121,22 +125,32 @@ class ConfigTests(unittest.TestCase):
             {
                 "HERMES_OPERATOR_URL": "https://operator.internal.example/api/",
                 "HERMES_OPERATOR_BRIDGE_TOKEN": "secret",
+                "HERMES_OPERATOR_BRIDGE_PROOF_SECRET": "proof-secret-that-is-at-least-32-bytes-long",
                 "HERMES_OPERATOR_PROFILE": "research",
                 "HERMES_OPERATOR_TIMEOUT_SECONDS": "2.5",
                 "HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS": "180",
                 "HERMES_OPERATOR_INJECT_CONTEXT": "false",
                 "HERMES_OPERATOR_EMIT_LIFECYCLE": "0",
+                "HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE": "true",
             },
             clear=True,
         ):
             config = config_module.PluginConfig.from_env()
         self.assertEqual(config.base_url, "https://operator.internal.example/api")
         self.assertEqual(config.api_token, "secret")
+        self.assertEqual(
+            config.proof_secret,
+            "proof-secret-that-is-at-least-32-bytes-long",
+        )
+        self.assertTrue(config.credentials_scrubbed)
+        self.assertNotIn("HERMES_OPERATOR_BRIDGE_TOKEN", os.environ)
+        self.assertNotIn("HERMES_OPERATOR_BRIDGE_PROOF_SECRET", os.environ)
         self.assertEqual(config.profile, "research")
         self.assertEqual(config.timeout_seconds, 2.5)
         self.assertEqual(config.attestation_refresh_seconds, 180.0)
         self.assertFalse(config.inject_context)
         self.assertFalse(config.emit_lifecycle)
+        self.assertTrue(config.reviewed_host_override)
 
     def test_attestation_interval_rejects_unsafe_cadence(self):
         for interval in ("0", "119.99", "241", "not-a-number"):
@@ -542,6 +556,47 @@ class ClientTests(unittest.TestCase):
             if item["path"] == "/v1/hermes/work"
         )
         self.assertEqual(create_request["body"]["recurrence_rule"], "P1W")
+        authority_paths = {
+            "/v1/hermes/questions/q_1/answer": "human.answer_question",
+            "/v1/hermes/work/wrk_1/authorize": "human.authorize_work",
+            "/v1/hermes/work/wrk_1/update": "human.update_work",
+            "/v1/hermes/work/wrk_1/reminder": "human.resolve_reminder",
+        }
+        observed_nonces = set()
+        for recorded in RecordingHandler.requests:
+            endpoint = recorded["path"].split("?", 1)[0]
+            purpose = authority_paths.get(endpoint)
+            if purpose is None:
+                continue
+            headers = recorded["headers"]
+            nonce = headers["X-Hermes-Operator-Proof-Nonce"]
+            timestamp = headers["X-Hermes-Operator-Proof-Timestamp"]
+            encoded = json.dumps(
+                recorded["body"],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            canonical = "\n".join(
+                (
+                    "v1",
+                    timestamp,
+                    nonce,
+                    purpose,
+                    recorded["method"],
+                    endpoint,
+                    hashlib.sha256(encoded).hexdigest(),
+                )
+            ).encode("utf-8")
+            expected = hmac.new(
+                b"proof-secret-that-is-at-least-32-bytes-long",
+                canonical,
+                hashlib.sha256,
+            ).hexdigest()
+            self.assertTrue(
+                hmac.compare_digest(headers["X-Hermes-Operator-Proof"], expected)
+            )
+            observed_nonces.add(nonce)
+        self.assertEqual(len(observed_nonces), 5)
 
     def test_client_rejects_invalid_recurrence_before_transport(self):
         client = client_module.OperatorClient(make_config())
@@ -653,8 +708,8 @@ class ClientTests(unittest.TestCase):
         }
         payload = {
             "profile": "research",
-            "plugin_version": "1.5.0",
-            "policy_version": "6.0.0",
+            "plugin_version": "1.6.0",
+            "policy_version": "7.0.0",
             "policy_digest": "a" * 64,
             "guard_active": False,
             "policy_mode": "default_deny",
@@ -1410,30 +1465,111 @@ class PolicyTests(unittest.TestCase):
         self.assertBlocked("mcp_custom_do_thing", {}, "generic_mutation")
         self.assertBlocked("mcp_google_calendar_update_event", {}, "scheduling")
 
-    def test_read_only_internal_work_tools_remain_available(self):
-        for name in (
-            "read_file",
-            "search_files",
-            "web_search",
-            "kanban_list",
-            "kanban_show",
-            "operator_next_work",
-        ):
+    def test_read_only_local_tools_require_live_contract_and_workspace(self):
+        for name in ("web_search", "kanban_list", "kanban_show", "operator_next_work"):
             with self.subTest(name=name):
                 self.assertAllowed(name, {})
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"HERMES_KANBAN_WORKSPACE": temporary},
+            clear=False,
+        ):
+            for name, args in (
+                ("read_file", {"path": "README.md"}),
+                ("search_files", {"path": ".", "pattern": "scope"}),
+            ):
+                with self.subTest(name=name, contract="missing"):
+                    self.assertBlocked(name, args, "authorization")
+                with self.subTest(name=name, contract="valid"):
+                    decision = policy_module.evaluate_tool_call(
+                        name,
+                        args,
+                        current_task_id="task-1",
+                        execution_contract=self.contract(),
+                    )
+                    self.assertFalse(decision.blocked)
 
     def test_local_writes_require_current_task_contract(self):
-        for name in ("write_file", "patch"):
-            with self.subTest(name=name, contract="missing"):
-                self.assertBlocked(name, {}, "authorization")
-            with self.subTest(name=name, contract="valid"):
-                decision = policy_module.evaluate_tool_call(
-                    name,
-                    {},
-                    current_task_id="task-1",
-                    execution_contract=self.contract(),
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"HERMES_KANBAN_WORKSPACE": temporary},
+            clear=False,
+        ):
+            for name, args in (
+                ("write_file", {"path": "result.txt", "content": "ok"}),
+                ("patch", {"mode": "replace", "path": "result.txt"}),
+            ):
+                with self.subTest(name=name, contract="missing"):
+                    self.assertBlocked(name, args, "authorization")
+                with self.subTest(name=name, contract="valid"):
+                    decision = policy_module.evaluate_tool_call(
+                        name,
+                        args,
+                        current_task_id="task-1",
+                        execution_contract=self.contract(),
+                    )
+                    self.assertFalse(decision.blocked)
+
+    def test_local_capabilities_cannot_escape_dispatcher_workspace(self):
+        contract = self.contract()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            link = workspace / "escape"
+            link.symlink_to(outside, target_is_directory=True)
+            with patch.dict(
+                os.environ,
+                {"HERMES_KANBAN_WORKSPACE": str(workspace)},
+                clear=False,
+            ):
+                attacks = (
+                    ("read_file", {"path": str(outside / "secret.txt")}),
+                    ("read_file", {"path": "../outside/secret.txt"}),
+                    ("read_file", {"path": "escape/secret.txt"}),
+                    ("search_files", {"path": str(outside), "pattern": "secret"}),
+                    ("write_file", {"path": "../outside/overwrite.txt", "content": "x"}),
+                    ("patch", {"mode": "replace", "path": str(outside / "target")}),
+                    ("terminal", {"command": f"cat {outside / 'secret.txt'}"}),
+                    ("terminal", {"command": "rg secret ../outside"}),
+                    ("terminal", {"command": "tree --output=../outside/tree.txt"}),
+                    ("terminal", {"command": "tree -o../outside/tree.txt"}),
+                    ("terminal", {"command": "diff --output=../outside/diff.txt a b"}),
+                    ("terminal", {"command": "wc --files0-from=escape/list.txt"}),
+                    ("terminal", {"command": "uniq input.txt ../outside/output.txt"}),
+                    ("terminal", {"command": "git -c core.pager=cat status"}),
+                    ("read_terminal", {"terminal_id": "other-session"}),
+                    ("process", {"action": "log", "session_id": "other-run"}),
+                    ("session_search", {"query": "credentials"}),
+                    ("vision_analyze", {"path": str(outside / "screen.png")}),
+                    ("video_analyze", {"path": str(outside / "meeting.mp4")}),
                 )
-                self.assertFalse(decision.blocked)
+                for name, args in attacks:
+                    with self.subTest(name=name, args=args):
+                        decision = policy_module.evaluate_tool_call(
+                            name,
+                            args,
+                            current_task_id="task-1",
+                            execution_contract=contract,
+                        )
+                        self.assertTrue(decision.blocked)
+                        self.assertIn(decision.category, {"authorization", "generic_mutation"})
+
+                for name, args in (
+                    ("read_file", {"path": "notes/context.md"}),
+                    ("write_file", {"path": "build/result.txt", "content": "ok"}),
+                    ("terminal", {"command": "cat notes/context.md"}),
+                ):
+                    with self.subTest(name=name, args=args, disposition="inside"):
+                        decision = policy_module.evaluate_tool_call(
+                            name,
+                            args,
+                            current_task_id="task-1",
+                            execution_contract=contract,
+                        )
+                        self.assertFalse(decision.blocked)
 
     def test_unreviewed_kanban_names_do_not_bypass_default_deny(self):
         for name, category in (
@@ -1595,7 +1731,14 @@ class PolicyTests(unittest.TestCase):
             lambda task_id: calls.append(task_id) or self.contract(task_id),
             expected_profile="test-profile",
         )
-        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "task-1"}, clear=True):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {
+                "HERMES_KANBAN_TASK": "task-1",
+                "HERMES_KANBAN_WORKSPACE": temporary,
+            },
+            clear=True,
+        ):
             missing_hook_id = guard("terminal", {"command": "pytest -q"})
             quiet_turn_uuid = guard(
                 "terminal",
@@ -1789,7 +1932,8 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(answer["action"], "approve")
         self.assertEqual(authorize["action"], "approve")
         self.assertIn("version 3", authorize["message"])
-        self.assertIsNone(reversible)
+        self.assertEqual(reversible["action"], "approve")
+        self.assertNotEqual(reversible["rule_key"], terminal["rule_key"])
         self.assertEqual(terminal["action"], "approve")
 
     def test_native_authorization_approval_key_binds_version_and_execution_shape(self):
@@ -2100,24 +2244,31 @@ class PolicyTests(unittest.TestCase):
             ("tsc --noEmit", "local_test"),
             ("tsc", "local_build"),
         )
-        for command, capability in commands:
-            with self.subTest(command=command, disposition="allow"):
-                decision = policy_module.evaluate_tool_call(
-                    "terminal",
-                    {"command": command},
-                    current_task_id="task-1",
-                    execution_contract=contract,
-                )
-                self.assertFalse(decision.blocked)
-            with self.subTest(command=command, disposition="wrong_capability"):
-                wrong = "local_build" if capability == "local_test" else "local_test"
-                decision = policy_module.evaluate_tool_call(
-                    "terminal",
-                    {"command": command},
-                    current_task_id="task-1",
-                    execution_contract=self.contract(capabilities=[wrong]),
-                )
-                self.assertTrue(decision.blocked)
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "project").mkdir()
+            with patch.dict(
+                os.environ,
+                {"HERMES_KANBAN_WORKSPACE": temporary},
+                clear=False,
+            ):
+                for command, capability in commands:
+                    with self.subTest(command=command, disposition="allow"):
+                        decision = policy_module.evaluate_tool_call(
+                            "terminal",
+                            {"command": command},
+                            current_task_id="task-1",
+                            execution_contract=contract,
+                        )
+                        self.assertFalse(decision.blocked)
+                    with self.subTest(command=command, disposition="wrong_capability"):
+                        wrong = "local_build" if capability == "local_test" else "local_test"
+                        decision = policy_module.evaluate_tool_call(
+                            "terminal",
+                            {"command": command},
+                            current_task_id="task-1",
+                            execution_contract=self.contract(capabilities=[wrong]),
+                        )
+                        self.assertTrue(decision.blocked)
 
     def test_authorized_contract_never_overrides_external_or_destructive_denials(self):
         contract = self.contract()
@@ -2300,40 +2451,127 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_managed_activation_requires_positive_semantic_evidence(self):
         unknown = {
+            "supported_hermes_version_match": None,
+            "reviewed_host_override": False,
             "configured_profile_match": None,
             "pre_tool_directive_semantics": "unknown",
             "guard_hook_position": None,
             "managed_worker_identity_semantics": "unknown",
+            "managed_subprocess_secret_semantics": "unknown",
+            "completion_artifact_transport_semantics": "unknown",
         }
         self.assertEqual(
             compatibility_module.bridge_activation_blockers(unknown),
             (
+                "hermes_version_unverified",
                 "active_profile_unverified",
                 "pre_tool_directive_semantics_unverified",
                 "managed_worker_identity_unverified",
+                "managed_subprocess_secret_filter_unverified",
+                "completion_artifact_transport_unverified",
             ),
         )
 
         compatible = {
+            "supported_hermes_version_match": True,
+            "reviewed_host_override": False,
             "configured_profile_match": True,
             "pre_tool_directive_semantics": "first_valid",
             "guard_hook_position": 1,
             "managed_worker_identity_semantics": "dispatcher_environment",
-            "supported_hermes_version_match": False,
+            "managed_subprocess_secret_semantics": "protected",
+            "completion_artifact_transport_semantics": "post_hook_prose_path_promotion",
         }
         self.assertEqual(
             compatibility_module.bridge_activation_blockers(compatible), ()
         )
 
         both = {
+            "supported_hermes_version_match": True,
+            "reviewed_host_override": False,
             "configured_profile_match": False,
             "pre_tool_directive_semantics": "first_valid",
             "guard_hook_position": None,
             "managed_worker_identity_semantics": "dispatcher_environment",
+            "managed_subprocess_secret_semantics": "protected",
+            "completion_artifact_transport_semantics": "none",
         }
         self.assertEqual(
             compatibility_module.bridge_activation_blockers(both),
             ("active_profile_mismatch", "operator_guard_not_first"),
+        )
+
+        mismatched = {
+            **compatible,
+            "supported_hermes_version_match": False,
+        }
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(mismatched),
+            ("hermes_version_unsupported",),
+        )
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(
+                {**mismatched, "reviewed_host_override": True}
+            ),
+            (),
+        )
+
+    def test_managed_subprocess_credentials_require_both_exact_strip_entries(self):
+        def _make_run_env():
+            return _ALWAYS_STRIP_KEYS  # noqa: F821 - semantic source fixture
+
+        required = {
+            "HERMES_OPERATOR_BRIDGE_TOKEN",
+            "HERMES_OPERATOR_BRIDGE_PROOF_SECRET",
+        }
+        local = SimpleNamespace(
+            _ALWAYS_STRIP_KEYS=set(required),
+            _HERMES_PROVIDER_ENV_BLOCKLIST=set(),
+            _make_run_env=_make_run_env,
+        )
+        passthrough = SimpleNamespace(is_env_passthrough=lambda _name: False)
+
+        def load(name):
+            return {
+                "tools.environments.local": local,
+                "tools.env_passthrough": passthrough,
+            }[name]
+
+        with patch.object(compatibility_module, "import_module", side_effect=load):
+            self.assertEqual(
+                compatibility_module._managed_subprocess_secret_semantics(),
+                "protected",
+            )
+            local._ALWAYS_STRIP_KEYS.remove("HERMES_OPERATOR_BRIDGE_PROOF_SECRET")
+            self.assertEqual(
+                compatibility_module._managed_subprocess_secret_semantics(),
+                "exposed",
+            )
+
+    def test_unrecognized_or_structured_artifact_transport_blocks_activation(self):
+        base = {
+            "supported_hermes_version_match": True,
+            "reviewed_host_override": False,
+            "configured_profile_match": True,
+            "pre_tool_directive_semantics": "first_valid",
+            "guard_hook_position": 1,
+            "managed_worker_identity_semantics": "dispatcher_environment",
+            "managed_subprocess_secret_semantics": "protected",
+        }
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(
+                {**base, "completion_artifact_transport_semantics": "unknown"}
+            ),
+            ("completion_artifact_transport_unverified",),
+        )
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(
+                {
+                    **base,
+                    "completion_artifact_transport_semantics": "structured_artifact_transport",
+                }
+            ),
+            ("completion_artifact_transport_unsupported",),
         )
 
 
@@ -2345,17 +2583,38 @@ class RegistrationTests(unittest.TestCase):
         self._pre_tool_semantics = patch.object(
             compatibility_module, "_pre_tool_semantics", return_value="first_valid"
         )
+        self._distribution_version = patch.object(
+            compatibility_module,
+            "_distribution_version",
+            return_value=compatibility_module.SUPPORTED_HERMES_VERSION,
+        )
         self._worker_identity_semantics = patch.object(
             compatibility_module,
             "_managed_worker_identity_semantics",
             return_value="dispatcher_environment",
         )
+        self._worker_secret_semantics = patch.object(
+            compatibility_module,
+            "_managed_subprocess_secret_semantics",
+            return_value="protected",
+        )
+        self._artifact_transport_semantics = patch.object(
+            compatibility_module,
+            "_completion_transport_semantics",
+            return_value="post_hook_prose_path_promotion",
+        )
+        self._distribution_version.start()
         self._pre_tool_semantics.start()
         self._worker_identity_semantics.start()
+        self._worker_secret_semantics.start()
+        self._artifact_transport_semantics.start()
 
     def tearDown(self):
+        self._artifact_transport_semantics.stop()
+        self._worker_secret_semantics.stop()
         self._worker_identity_semantics.stop()
         self._pre_tool_semantics.stop()
+        self._distribution_version.stop()
         plugin._stop_active_refresher()
         plugin._client.cache_clear()
         plugin._emitter.cache_clear()
@@ -2447,15 +2706,17 @@ class RegistrationTests(unittest.TestCase):
             ("POST", "/v1/events/hermes"): (202, acknowledgement),
             ("GET", "/v1/hermes/execution-contract"): (200, contract),
         }
-        with server(routes) as url:
+        with server(routes) as url, tempfile.TemporaryDirectory() as workspace:
             with patch.dict(
                 os.environ,
                 {
                     "HERMES_OPERATOR_URL": url,
                     "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+                    "HERMES_OPERATOR_BRIDGE_PROOF_SECRET": "proof-secret-that-is-at-least-32-bytes-long",
                     "HERMES_OPERATOR_PROFILE": "default",
                     "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
                     "HERMES_KANBAN_TASK": "task-1",
+                    "HERMES_KANBAN_WORKSPACE": workspace,
                 },
                 clear=True,
             ):
@@ -2570,6 +2831,7 @@ class RegistrationTests(unittest.TestCase):
                 {
                     "HERMES_OPERATOR_URL": url,
                     "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+                    "HERMES_OPERATOR_BRIDGE_PROOF_SECRET": "proof-secret-that-is-at-least-32-bytes-long",
                     "HERMES_OPERATOR_PROFILE": "research",
                     "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
                 },
@@ -2688,6 +2950,54 @@ class RegistrationTests(unittest.TestCase):
             compatibility_module.bridge_activation_blockers(plugin._diagnostics),
             ("managed_worker_identity_unverified",),
         )
+
+    def test_unpinned_host_requires_explicit_reviewed_override(self):
+        environment = {
+            "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+            "HERMES_OPERATOR_PROFILE": "default",
+            "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            compatibility_module,
+            "_distribution_version",
+            return_value="0.19.0",
+        ), patch.object(
+            client_module.OperatorClient,
+            "attest_policy",
+        ) as attest, patch.object(
+            client_module.OperatorClient,
+            "revoke_policy",
+        ) as revoke:
+            ctx = FakeContext()
+            plugin.register(ctx)
+        self.assertEqual(ctx.tools, [])
+        attest.assert_not_called()
+        revoke.assert_called_once()
+        self.assertIn(
+            "hermes_version_unsupported",
+            compatibility_module.bridge_activation_blockers(plugin._diagnostics),
+        )
+
+        plugin._client.cache_clear()
+        plugin._emitter.cache_clear()
+        with patch.dict(
+            os.environ,
+            {**environment, "HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE": "true"},
+            clear=True,
+        ), patch.object(
+            compatibility_module,
+            "_distribution_version",
+            return_value="0.19.0",
+        ), patch.object(
+            client_module.OperatorClient,
+            "attest_policy",
+            return_value={"accepted": True},
+        ) as attest:
+            reviewed = FakeContext()
+            plugin.register(reviewed)
+        self.assertEqual(len(reviewed.tools), 13)
+        attest.assert_called_once()
+        self.assertTrue(plugin._diagnostics["reviewed_host_override"])
 
     def test_first_valid_semantics_allow_guard_when_first(self):
         with patch.dict(

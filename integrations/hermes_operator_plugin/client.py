@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import re
+import secrets
+import time
 from typing import Any, Mapping
 from urllib import error, parse, request
 
@@ -181,7 +184,12 @@ class OperatorClient:
         question_id = _required_identity(question_id, "question_id")
         answer = _bounded_text(answer, "answer", 20_000, required=True)
         path = f"/v1/hermes/questions/{parse.quote(question_id, safe='')}/answer"
-        data = self._request("POST", path, {"answer": answer}).data
+        data = self._request(
+            "POST",
+            path,
+            {"answer": answer},
+            proof_purpose="human.answer_question",
+        ).data
         if (
             not isinstance(data, Mapping)
             or data.get("id") != question_id
@@ -356,7 +364,12 @@ class OperatorClient:
                 raise ValueError("goal_mode must be a boolean")
             body["goal_mode"] = goal_mode
         path = f"/v1/hermes/work/{parse.quote(work_id, safe='')}/authorize"
-        data = self._request("POST", path, body).data
+        data = self._request(
+            "POST",
+            path,
+            body,
+            proof_purpose="human.authorize_work",
+        ).data
         expected_keys = {
             "authorization_scope_digest",
             "authorization_scope_revision",
@@ -415,6 +428,7 @@ class OperatorClient:
             "POST",
             path,
             {"expected_version": expected_version, "changes": normalized_changes},
+            proof_purpose="human.update_work",
         ).data
         work = data.get("work") if isinstance(data, Mapping) else None
         if (
@@ -455,7 +469,12 @@ class OperatorClient:
         elif until is not None:
             raise ValueError("until is accepted only for snooze")
         path = f"/v1/hermes/work/{parse.quote(work_id, safe='')}/reminder"
-        data = self._request("POST", path, body).data
+        data = self._request(
+            "POST",
+            path,
+            body,
+            proof_purpose="human.resolve_reminder",
+        ).data
         work = data.get("work") if isinstance(data, Mapping) else None
         if (
             not isinstance(work, Mapping)
@@ -721,7 +740,12 @@ class OperatorClient:
                 "trust": "authenticated_untrusted",
             },
         }
-        response = self._request("POST", "/v1/events/hermes", body).data
+        response = self._request(
+            "POST",
+            "/v1/events/hermes",
+            body,
+            proof_purpose="policy.attest",
+        ).data
         if (
             not isinstance(response, Mapping)
             or not isinstance(response.get("event_id"), str)
@@ -800,7 +824,12 @@ class OperatorClient:
                 "trust": "authenticated_untrusted",
             },
         }
-        response = self._request("POST", "/v1/events/hermes", body).data
+        response = self._request(
+            "POST",
+            "/v1/events/hermes",
+            body,
+            proof_purpose="policy.revoke",
+        ).data
         if (
             not isinstance(response, Mapping)
             or not isinstance(response.get("event_id"), str)
@@ -813,7 +842,14 @@ class OperatorClient:
             )
         return response
 
-    def _request(self, method: str, path: str, body: Any = None) -> Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        proof_purpose: str | None = None,
+    ) -> Response:
         endpoint = path.split("?", 1)[0]
         allowed = {
             ("GET", "/v1/hermes/status"),
@@ -855,7 +891,7 @@ class OperatorClient:
         encoded = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "hermes-operator-plugin/1.5.0",
+            "User-Agent": "hermes-operator-plugin/1.6.0",
         }
         if body is not None:
             encoded = json.dumps(
@@ -864,6 +900,15 @@ class OperatorClient:
             headers["Content-Type"] = "application/json"
         if self.config.api_token:
             headers["Authorization"] = f"Bearer {self.config.api_token}"
+        if proof_purpose is not None:
+            headers.update(
+                self._proof_headers(
+                    normalized_method,
+                    endpoint,
+                    encoded or b"",
+                    proof_purpose,
+                )
+            )
 
         req = request.Request(
             f"{self.config.base_url}{path}",
@@ -883,6 +928,35 @@ class OperatorClient:
             raise OperatorUnavailable(f"operator returned HTTP {exc.code}") from exc
         except (error.URLError, TimeoutError, OSError) as exc:
             raise OperatorUnavailable(f"operator is unavailable: {exc}") from exc
+
+    def _proof_headers(
+        self,
+        method: str,
+        endpoint: str,
+        encoded_body: bytes,
+        purpose: str,
+    ) -> dict[str, str]:
+        secret = self.config.proof_secret
+        if not secret:
+            raise OperatorUnavailable(
+                "operator bridge proof secret is required for this authority-bearing request"
+            )
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{1,63}", purpose):
+            raise ValueError("bridge proof purpose is invalid")
+        timestamp = str(int(time.time()))
+        nonce = secrets.token_hex(16)
+        body_digest = hashlib.sha256(encoded_body).hexdigest()
+        canonical = "\n".join(
+            ("v1", timestamp, nonce, purpose, method, endpoint, body_digest)
+        ).encode("utf-8")
+        signature = hmac.new(
+            secret.encode("utf-8"), canonical, hashlib.sha256
+        ).hexdigest()
+        return {
+            "X-Hermes-Operator-Proof": signature,
+            "X-Hermes-Operator-Proof-Nonce": nonce,
+            "X-Hermes-Operator-Proof-Timestamp": timestamp,
+        }
 
 
 def _decode_json(raw: bytes) -> Any:

@@ -139,7 +139,7 @@ Controls:
 
 - Governance must explicitly authorize execution.
 - Authorization carries exact work ID, selected allowlisted profile, skills, goal mode, issuer, issue time, `not_before`, `review_after`, durable lifetime, authorization root, attempt budget, and contract digest.
-- Contract digest binds kind, title, description, parent, criteria, timing, operator priority, profile, effective skills including defaults, and goal mode.
+- Contract digest binds kind, title, description, parent ID, criteria, timing, recurrence, profile, effective skills including defaults, goal mode, the canonical internal-capability set, verification requirement, and verification contract. Runtime state and priority are deliberately excluded.
 - Supervisor authorization includes pass ID and finalized plan digest.
 - Dispatcher re-reads and revalidates work after atomic reservation.
 - Reservation stores the work version and contract digest.
@@ -243,6 +243,8 @@ Threat: a worker or connector receives operator mutation authority.
 Controls:
 
 - Admin and bridge tokens are separate configuration fields and equal values are rejected.
+- Authority-bearing bridge operations also require an independent exact-body HMAC; its nonce is durably and atomically single-use across process restarts.
+- The plugin removes bridge and proof credentials from its environment before project terminal, test, build, or delegated subprocesses can run.
 - Bridge token is confined to explicit Hermes routes for context, attention, exact task contracts, reversible work capture, version-fenced work updates, exact operator answers and authorization, normalized Google intake, compatibility evidence, and lifecycle observations.
 - Authority-bearing conversational bridge calls are gated by Hermes-native confirmation outside managed worker cards.
 - Approval, memory, work, status, ingest, wake, and question-answer routes require admin authority.
@@ -266,7 +268,7 @@ Controls:
 - `hermes-outbound-broker` is an optional disabled-by-default path requiring a separate TOML file, exact action ID, exact grant ID, and a deployment-fixed connector.
 - Connector argv cannot be supplied by model output; input and output are strict and byte bounded, and its environment includes only a minimal safe base plus explicitly named values.
 
-Residual risk: a broker crash after a connector side effect but before result recording produces an unknown outcome. The consumed grant prevents silent replay. An independently credentialed worker is outside the daemon boundary; deployments needing stronger isolation can add credential and egress controls.
+Residual risk: a broker crash after a connector side effect but before result recording produces an unknown outcome. The consumed grant prevents silent replay. Plugin policy is not an OS sandbox. Active mode therefore requires deployment-owner acknowledgement that worker filesystem, credential, and egress isolation was reviewed; browser and web reads remain governed by that egress policy.
 
 ### Approval content substitution
 

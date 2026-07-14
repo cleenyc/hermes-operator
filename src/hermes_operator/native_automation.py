@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping, Sequence
 
-from .adapters.base import AdapterCommandError, AdapterUnavailableError
+from .adapters.base import (
+    AdapterCommandError,
+    AdapterResponseError,
+    AdapterUnavailableError,
+)
 from .config import AppConfig
 
 
@@ -29,6 +34,9 @@ _SAFE_ENV_NAMES = {
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
 }
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_JOB_STATE = re.compile(r"\[(active|paused|completed|disabled)\]", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +149,8 @@ class HermesNativeAutomationManager:
 
     This adapter never edits Hermes' job files and never imports Hermes Python
     modules. An explicit install command is required because OAuth and delivery
-    targets are deployment-owned. Existing jobs with the stable managed names
-    are left untouched; operators use native ``hermes cron edit`` for changes.
+    targets are deployment-owned. Existing jobs are changed only when the
+    operator explicitly requests reconciliation.
     """
 
     def __init__(
@@ -181,35 +189,193 @@ class HermesNativeAutomationManager:
             },
         }
 
-    def install(self, *, dry_run: bool = False) -> dict[str, Any]:
+    def status(self) -> dict[str, Any]:
+        """Read whether every desired managed job and scheduler are active."""
+
+        if not self.config.native_automation.enabled:
+            return {
+                "ok": True,
+                "enabled": False,
+                "installed": [],
+                "missing": [],
+                "private_delivery": False,
+                "detail": "Hermes native automation is disabled",
+            }
+        help_text = self._run([*self._prefix(), "cron", "--help"])
+        if "list" not in help_text or "status" not in help_text:
+            raise AdapterUnavailableError(
+                "Hermes Cron does not expose the required list and status commands"
+            )
+        existing = self._run([*self._prefix(), "cron", "list", "--all"])
+        scheduler = self._run([*self._prefix(), "cron", "status"])
+        records = self._job_records(existing)
+        jobs = desired_native_jobs(self.config)
+        installed = [job.name for job in jobs if job.name in records]
+        missing = [job.name for job in jobs if job.name not in records]
+        duplicates = [
+            job.name
+            for job in jobs
+            if int(records.get(job.name, {}).get("instances", 0)) > 1
+        ]
+        inactive = [
+            job.name
+            for job in jobs
+            if records.get(job.name, {}).get("state") != "active"
+            and job.name in records
+        ]
+        delivery_mismatch = [
+            job.name
+            for job in jobs
+            if job.name in records
+            and job.delivery not in records[job.name].get("delivery", ())
+        ]
+        delivery = self.config.native_automation.delivery.strip().lower()
+        private_delivery = bool(delivery and delivery != "local")
+        normalized_scheduler = _ANSI_ESCAPE.sub("", scheduler).lower()
+        scheduler_ok = (
+            "cron jobs will fire automatically" in normalized_scheduler
+            or "jobs fire via the managed scheduler" in normalized_scheduler
+        ) and not any(
+            marker in normalized_scheduler
+            for marker in (
+                "will not fire",
+                "won't fire",
+                "stalled",
+                "may not be firing",
+                "ticks may be failing",
+            )
+        )
+        ok = (
+            not missing
+            and not duplicates
+            and not inactive
+            and not delivery_mismatch
+            and private_delivery
+            and scheduler_ok
+        )
+        detail = (
+            "All managed jobs, private delivery, and Hermes Cron are active"
+            if ok
+            else "Managed jobs, private delivery, or Hermes Cron are not ready"
+        )
+        return {
+            "ok": ok,
+            "enabled": True,
+            "installed": installed,
+            "missing": missing,
+            "duplicates": duplicates,
+            "inactive": inactive,
+            "delivery_mismatch": delivery_mismatch,
+            "private_delivery": private_delivery,
+            "delivery": self.config.native_automation.delivery,
+            "scheduler_ok": scheduler_ok,
+            "detail": detail,
+        }
+
+    @staticmethod
+    def _job_records(output: str) -> dict[str, dict[str, Any]]:
+        """Parse the stable human-readable fields emitted by ``cron list --all``."""
+
+        records: dict[str, dict[str, Any]] = {}
+        current: dict[str, Any] | None = None
+
+        def store_current() -> None:
+            if current is None or not current.get("name"):
+                return
+            name = str(current["name"])
+            if name in records:
+                records[name]["instances"] = int(
+                    records[name].get("instances", 1)
+                ) + 1
+                return
+            current["instances"] = 1
+            records[name] = current
+
+        for raw_line in _ANSI_ESCAPE.sub("", output).splitlines():
+            line = raw_line.strip()
+            state = _JOB_STATE.search(line)
+            if state is not None:
+                store_current()
+                current = {
+                    "state": state.group(1).lower(),
+                    "delivery": (),
+                }
+                continue
+            if current is None:
+                continue
+            if line.startswith("Name:"):
+                current["name"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Deliver:"):
+                current["delivery"] = tuple(
+                    value.strip()
+                    for value in line.split(":", 1)[1].split(",")
+                    if value.strip()
+                )
+        store_current()
+        return records
+
+    def install(
+        self,
+        *,
+        dry_run: bool = False,
+        reconcile: bool = False,
+    ) -> dict[str, Any]:
         if not self.config.native_automation.enabled:
             raise ValueError("native_automation.enabled must be true before installation")
         help_text = self._run([*self._prefix(), "cron", "--help"])
-        if "create" not in help_text or "list" not in help_text:
+        required_commands = {"create", "list"}
+        if reconcile:
+            required_commands.add("edit")
+        if any(command not in help_text for command in required_commands):
             raise AdapterUnavailableError(
-                "Hermes Cron does not expose the required create and list commands"
+                "Hermes Cron does not expose required commands: "
+                + ", ".join(sorted(required_commands))
             )
-        existing = self._run([*self._prefix(), "cron", "list"])
+        # --all is required so a paused or disabled older managed job is
+        # reconciled instead of being silently duplicated.
+        existing = self._run([*self._prefix(), "cron", "list", "--all"])
+        records = self._job_records(existing)
+        duplicate_names = sorted(
+            job.name
+            for job in desired_native_jobs(self.config)
+            if int(records.get(job.name, {}).get("instances", 0)) > 1
+        )
+        if duplicate_names:
+            raise AdapterResponseError(
+                "Hermes Cron has duplicate managed job names; resolve them before "
+                "installation: " + ", ".join(duplicate_names)
+            )
         installed: list[str] = []
+        updated: list[str] = []
         skipped: list[str] = []
         commands: list[list[str]] = []
         for job in desired_native_jobs(self.config):
-            argv = self._create_argv(job)
-            commands.append(argv)
-            if job.name in existing:
+            if job.name in records:
+                if reconcile:
+                    argv = self._edit_argv(job)
+                    commands.append(argv)
+                    if not dry_run:
+                        self._run(argv)
+                    updated.append(job.name)
+                    continue
                 skipped.append(job.name)
                 continue
+            argv = self._create_argv(job)
+            commands.append(argv)
             if not dry_run:
                 self._run(argv)
             installed.append(job.name)
         return {
             "dry_run": dry_run,
+            "reconcile": reconcile,
             "installed": installed,
+            "updated": updated,
             "skipped": skipped,
             "commands": commands,
             "note": (
                 "Enable Hermes cron mirror delivery globally or edit jobs with "
-                "attach_to_session when continuable replies are desired."
+                "attach_to_session when continuable replies are desired. Use "
+                "--reconcile only after reviewing the desired managed prompts."
             ),
         }
 
@@ -233,6 +399,28 @@ class HermesNativeAutomationManager:
         ]
         for skill in job.skills:
             argv.extend(("--skill", skill))
+        return argv
+
+    def _edit_argv(self, job: NativeJobSpec) -> list[str]:
+        argv = [
+            *self._prefix(),
+            "cron",
+            "edit",
+            job.name,
+            "--schedule",
+            job.schedule,
+            "--prompt",
+            job.prompt,
+            "--name",
+            job.name,
+            "--deliver",
+            job.delivery,
+        ]
+        if job.skills:
+            for skill in job.skills:
+                argv.extend(("--skill", skill))
+        else:
+            argv.append("--clear-skills")
         return argv
 
     def _run(self, argv: Sequence[str]) -> str:

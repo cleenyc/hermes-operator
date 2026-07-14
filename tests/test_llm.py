@@ -68,6 +68,24 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
 
 
 class CommandLLMIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_substitutes_only_documented_model_token(self) -> None:
+        script = (
+            "import json; print(json.dumps("
+            '{"model":"{model}","literal":{"nested":True}}))'
+        )
+        planner = CommandLLM(
+            LLMConfig(
+                provider="command",
+                model="test-model",
+                command=[sys.executable, "-c", script],
+            )
+        )
+
+        result = await planner.generate_json(system="policy", user="input")
+
+        self.assertEqual(result.data["model"], "test-model")
+        self.assertEqual(result.data["literal"], {"nested": True})
+
     async def test_command_receives_only_safe_and_explicit_environment(self) -> None:
         script = (
             "import json,os,sys;json.load(sys.stdin);"

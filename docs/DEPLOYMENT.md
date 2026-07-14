@@ -101,6 +101,7 @@ For the operator service:
 OPENAI_API_KEY=replace-with-provider-key
 HERMES_OPERATOR_API_TOKEN=replace-with-random-admin-token
 HERMES_OPERATOR_BRIDGE_TOKEN=replace-with-different-random-bridge-token
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=replace-with-independent-32-byte-secret
 HERMES_KANBAN_CONTROL_TOKEN=replace-with-run-control-token
 HERMES_OPERATOR_BIND_HOST=127.0.0.1
 ```
@@ -112,6 +113,7 @@ For the Hermes native plugin:
 ```text
 HERMES_OPERATOR_URL=http://127.0.0.1:8787
 HERMES_OPERATOR_BRIDGE_TOKEN=replace-with-different-random-bridge-token
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=replace-with-independent-32-byte-secret
 HERMES_OPERATOR_PROFILE=operator
 HERMES_OPERATOR_ATTEST_INTERVAL_SECONDS=120
 ```
@@ -125,17 +127,20 @@ The two API credentials have different authority:
 | Credential | Intended holder | Capability |
 | --- | --- | --- |
 | Admin token | Operator CLI/UI or trusted administration client | Read canonical work and approvals, ingest operator events, answer questions, approve or deny actions, and review memory |
-| Bridge token | Native Hermes plugin only | Use explicit context, attention, conversational-management, Google-ingress, exact task-contract, lifecycle, compatibility, and attestation routes; no approval inspection or external execution |
+| Bridge token and proof secret | Native Hermes plugin only | Read routes use the scoped token; authority-bearing calls also require an exact short-lived, durably replay-fenced proof. Both are removed from the plugin process environment before project subprocesses run |
 | Run-control token | Hermes Operator daemon only | Authenticate native Hermes run termination; never passed to the worker |
 | Webhook HMAC secret | One inbound reader | Deliver authenticated but untrusted events for one source |
 
 Use TLS termination or a private authenticated network when traffic leaves loopback. The built-in server speaks plain HTTP.
 
-## Managed-card scope and optional worker hardening
+## Managed-card scope and deployment-owned worker hardening
 
 The daemon contains no outbound connector and no execute route. The plugin adds strict task-scoped policy on Operator-managed cards. Interactive and Cron sessions outside those cards retain Hermes-native behavior, and identifiable mutations use the native confirmation gate. A Hermes worker may still have terminals, interpreters, browsers, custom plugins, MCP tools, or ambient cloud credentials, so this project does not claim host-wide or end-to-end mediation. In particular, contract-authorized `local_test` and `local_build` commands can invoke project-defined scripts that execute arbitrary repository code.
 
-When a deployment needs a harder worker boundary, optional controls include:
+Before selecting `active`, review the following controls and set
+`hermes.active_isolation_acknowledged = true`. Configuration otherwise fails closed.
+The acknowledgement records deployment review and does not claim the plugin is an
+operating-system sandbox:
 
 1. Give the Hermes worker only the scoped bridge token and minimum read or internal-work credentials.
 2. Do not give it the admin token, approval secret, email-send credential, calendar-write credential, messaging credential, publishing credential, repository-write credential, payment credential, or a browser session that can mutate external state.
@@ -154,9 +159,9 @@ The example allows:
 ```toml
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.5.0"]
-allowed_policy_versions = ["6.0.0"]
-allowed_policy_digests = ["e1f6f56429df64374f9c8b32682a773706b2e35cf5711753904149e503fc31a0"]
+allowed_plugin_versions = ["1.6.0"]
+allowed_policy_versions = ["7.0.0"]
+allowed_policy_digests = ["15f8e0a622abce0227c9b3f6b0168cf98bd17218933881b4d50f705edf2278d5"]
 ```
 
 The plugin performs a synchronous startup attestation and starts one process-scoped daemon heartbeat that attempts refresh every 120 seconds by default. Normal hooks share the same lock and rate limiter. Core dispatch validates freshness, profile, active default-deny guard, plugin version, policy version, and source digest. The dispatch reservation also binds the exact attestation state digest used for its decision. Enabling Hermes with required attestation also requires the built-in HTTP server and a nonempty bridge token; configuration fails closed otherwise.
@@ -197,6 +202,17 @@ hermes-operator --config operator.toml native-jobs plan
 hermes-operator --config operator.toml native-jobs install --dry-run
 hermes-operator --config operator.toml native-jobs install
 ```
+
+When upgrading managed jobs created by v0.3 or v0.4, preview and apply the current
+desired contract explicitly:
+
+```bash
+hermes-operator --config operator.toml native-jobs install --dry-run --reconcile
+hermes-operator --config operator.toml native-jobs install --reconcile
+```
+
+The manager uses `hermes cron list --all`, so paused and disabled jobs are updated
+by stable name instead of duplicated.
 
 The Google job reads Gmail, Calendar, and meeting evidence through Hermes and records normalized revisions with the plugin. The reminder job privately delivers one atomic claim of due reminders and pending questions. The daily briefing combines current priorities with optional Hermes-native Obsidian context. Run Hermes Gateway continuously and configure a private delivery target. These jobs are the implemented default path, not provider placeholders.
 

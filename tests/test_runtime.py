@@ -21,6 +21,20 @@ async def wait_until(predicate, timeout: float = 1.0) -> None:
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cycle_callback_receives_completed_result(self) -> None:
+        persisted: list[dict[str, object]] = []
+        runtime = AutonomousRuntime(
+            RuntimeCallbacks(process_events=lambda: None),
+            on_cycle=lambda result: persisted.append(result.to_dict()),
+        )
+
+        result = await runtime.run_once(reason="persist-health")
+
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["id"], result.id)
+        self.assertIsNotNone(persisted[0]["finished_at"])
+        self.assertEqual(persisted[0]["errors"], {})
+
     async def test_observation_runs_before_reconciliation_and_event_processing(self) -> None:
         calls: list[str] = []
         runtime = AutonomousRuntime(

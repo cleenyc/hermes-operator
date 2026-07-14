@@ -15,6 +15,7 @@ Configure distinct values:
 ```text
 HERMES_OPERATOR_API_TOKEN=<admin-token>
 HERMES_OPERATOR_BRIDGE_TOKEN=<different-bridge-token>
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=<independent-secret-at-least-32-bytes>
 ```
 
 Send either as:
@@ -28,10 +29,15 @@ Authority is intentionally different:
 | Credential | Access |
 | --- | --- |
 | Admin token | Operator reads and mutations, approval and memory review, operator ingest, wake, and fallback delivery to unconfigured event sources |
-| Bridge token | The scoped read and mutation contracts under `/v1/hermes/*`, plus `GET /v1/next`, `GET /v1/questions`, and `POST /v1/events/hermes`; see the endpoint matrix |
+| Bridge token | Scoped read and intake contracts. Authority-bearing mutations additionally require the proof below |
+| Bridge proof secret | HMAC for one exact confirmed answer, authorization, work update, reminder action, attestation, or revocation |
 | Source HMAC | One configured generic webhook source only |
 
-The server rejects equal nonempty admin and bridge tokens. Never put the admin token in the Hermes worker or an inbound reader.
+The server rejects equal admin, bridge, and proof secrets. Proofs bind the purpose,
+method, endpoint, exact body, timestamp, and nonce. Nonces are atomically consumed in
+SQLite and remain unavailable across HTTP restarts. The plugin removes both bridge
+credentials from its environment before project subprocesses run. Never put the admin
+token in the Hermes worker or an inbound reader.
 
 `GET /health` is public. If neither reader token is configured, `/v1/next` and `/v1/questions` are locally readable. Admin endpoints still fail with `503 operator_auth_unconfigured`. A non-loopback bind requires an admin token.
 
@@ -44,6 +50,7 @@ Use TLS termination or a private authenticated network beyond loopback. The buil
 | `GET` | `/health` | None | Minimal process liveness |
 | `GET` | `/v1/status` | Admin | Canonical state snapshot |
 | `GET` | `/v1/work` | Admin | Work query |
+| `GET` | `/v1/audit` | Admin | Bounded, filterable append-only operator history |
 | `GET` | `/v1/next` | Admin or bridge | Ranked next work |
 | `GET` | `/v1/questions` | Admin or bridge | Questions by status |
 | `GET` | `/v1/hermes/status` | Bridge | Content-free runtime and operational counters |
@@ -111,6 +118,19 @@ curl -sS \
 
 The bridge token is intentionally limited to the explicit Hermes routes in the matrix. It can read context and content-free status; capture reversible work; claim private attention; submit version-fenced work updates; record exact answers and authorization supplied through Hermes; ingest normalized Google revisions; and post lifecycle, compatibility, and attestation evidence. The plugin uses Hermes-native confirmation for authority-bearing conversational mutations. The bridge cannot fetch the admin work graph or status snapshot, inspect or approve external-action grants, review memory, or execute outbound delivery.
 
+## Audit history
+
+`GET /v1/audit` requires the admin token and returns newest-first append-only audit
+records. It accepts repeated or comma-separated `actor` and `event` filters, one
+`entity_type`, one `entity_id`, and `limit` from 1 to 1000. The default limit is 200.
+The bridge token cannot read this endpoint.
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $HERMES_OPERATOR_API_TOKEN" \
+  "http://127.0.0.1:8787/v1/audit?entity_type=work&entity_id=WORK_ID&limit=100"
+```
+
 For `POST /v1/work/links`, `blocker --blocks--> affected` is execution-equivalent to `affected --depends_on--> blocker`. Eligibility, run reservation and commit, dependency reopen protection, and mixed-cycle detection enforce both forms. Parent status remains explicit; derived rollup progress and health update automatically.
 
 ## Generic external webhook
@@ -131,7 +151,7 @@ The source path segment must use 1 to 64 letters, numbers, dots, underscores, or
 }
 ```
 
-`event_type` and object-valued `payload` are required. `external_id` and `dedupe_key` are optional. Deduplication is scoped by source.
+`event_type` and object-valued `payload` are required. `external_id` and `dedupe_key` are optional. Deduplication is scoped by source. An event with neither identity is treated as a new occurrence, so repeated manual requests are not suppressed indefinitely; provider readers should always supply a stable, revision-aware key.
 
 For a configured source secret, sign the exact request bytes:
 
@@ -220,8 +240,8 @@ An event whose `event_type` is `policy.attested` has a stricter fixed contract. 
 ```json
 {
   "profile": "operator",
-  "plugin_version": "1.5.0",
-  "policy_version": "6.0.0",
+  "plugin_version": "1.6.0",
+  "policy_version": "7.0.0",
   "policy_digest": "64-lowercase-hex-characters",
   "guard_active": true,
   "policy_mode": "default_deny",

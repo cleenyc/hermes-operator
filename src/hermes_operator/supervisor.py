@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
@@ -19,7 +20,7 @@ from .authority import (
 )
 from .config import AppConfig
 from .db import LeaseFenceLost, NotFound, SQLiteStore, StateConflict
-from .dispatcher import dispatch_contract_digest
+from .dispatcher import MANAGED_INTERNAL_CAPABILITIES, dispatch_contract_digest
 from .llm import LLMResult, PlannerLLM
 from .models import (
     Event,
@@ -38,9 +39,13 @@ from .prioritization import PriorityEngine
 from .prompts import SUPERVISOR_SYSTEM_PROMPT
 from .verifier import (
     ArtifactVerifier,
+    VERIFICATION_REQUIREMENT_DETERMINISTIC,
+    VERIFICATION_REQUIREMENTS,
     bind_verification_report,
     validate_bound_verification_report,
+    validate_work_verification_readiness,
     verification_input_digest,
+    work_verification_requirement,
 )
 
 
@@ -59,6 +64,7 @@ _PROTECTED_METADATA_KEYS = {
     "last_verification",
     "governance",
     "verification_contract",
+    "verification_requirement",
 }
 
 
@@ -270,12 +276,18 @@ def _task_like_event(event: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
 
+    def normalized_signal_key(value: Any) -> str:
+        # Provider payloads commonly mix snake_case, kebab-case, and camelCase.
+        # Normalize all three before applying the deterministic safety guard.
+        camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+        return re.sub(r"[^a-z0-9]+", "_", camel_split.casefold()).strip("_")
+
     def nested_action_items(value: Any, *, depth: int = 0) -> bool:
         if depth > 5:
             return False
         if isinstance(value, dict):
-            for key, nested in value.items():
-                normalized = str(key).casefold().replace("-", "_")
+            for key, nested in list(value.items())[:128]:
+                normalized = normalized_signal_key(key)
                 if normalized in {
                     "action_item",
                     "action_items",
@@ -283,7 +295,19 @@ def _task_like_event(event: dict[str, Any]) -> bool:
                     "assigned_tasks",
                     "follow_ups",
                     "followups",
+                    "provider_action_item",
+                    "provider_action_items",
                     "todos",
+                } or normalized.endswith(("_action_item", "_action_items")):
+                    if nested not in (None, False, "", [], {}):
+                        return True
+                if normalized in {
+                    "action_required",
+                    "requires_action",
+                    "task",
+                    "todo",
+                    "due_at",
+                    "deadline",
                 } and nested not in (None, False, "", [], {}):
                     return True
                 if isinstance(nested, (dict, list)) and nested_action_items(
@@ -298,18 +322,6 @@ def _task_like_event(event: dict[str, Any]) -> bool:
         return False
 
     if nested_action_items(payload):
-        return True
-    if any(
-        key in payload and payload.get(key) not in (None, False, "", [], {})
-        for key in (
-            "action_required",
-            "requires_action",
-            "task",
-            "todo",
-            "due_at",
-            "deadline",
-        )
-    ):
         return True
     if event_type in {
         "calendar.observed",
@@ -340,6 +352,37 @@ def _task_like_event(event: dict[str, Any]) -> bool:
         "would you ",
         "i need you to ",
     )
+
+    salutation = re.compile(
+        r"^(?:hi|hello|hey|dear|good\s+(?:morning|afternoon|evening))"
+        r"(?:\s+[^,:!\n]{1,80})?\s*[,!:]\s*",
+        re.IGNORECASE,
+    )
+    quoted_header = re.compile(
+        r"^(?:from|sent|date|to|cc|bcc|subject|reply-to):\s*",
+        re.IGNORECASE,
+    )
+
+    def contains_bounded_request(value: str) -> bool:
+        # Inspect only the beginning of the current message. Quoted lines are
+        # excluded so an old request in reply history does not become a new one.
+        bounded = value[:12_000]
+        for raw_line in bounded.splitlines()[:160]:
+            line = raw_line.strip()
+            if not line or line.startswith(">"):
+                continue
+            folded = line.casefold()
+            if quoted_header.match(line):
+                continue
+            if folded.startswith(("-----original message-----", "begin forwarded message:")):
+                continue
+            if folded.startswith("on ") and folded.endswith(" wrote:"):
+                continue
+            candidate = salutation.sub("", line, count=1).strip().casefold()
+            if candidate.startswith(command_starts):
+                return True
+        return False
+
     for field in (
         "subject",
         "title",
@@ -352,7 +395,7 @@ def _task_like_event(event: dict[str, Any]) -> bool:
         "content",
     ):
         text = payload.get(field)
-        if isinstance(text, str) and text.strip().casefold().startswith(command_starts):
+        if isinstance(text, str) and contains_bounded_request(text):
             return True
     return False
 
@@ -779,6 +822,12 @@ class Supervisor:
         contract_skills = execution_contract.get("skills")
         contract_default_skills = execution_contract.get("default_skills")
         contract_goal_mode = execution_contract.get("goal_mode")
+        contract_internal_capabilities = execution_contract.get(
+            "internal_capabilities"
+        )
+        contract_verification_requirement = execution_contract.get(
+            "verification_requirement"
+        )
         if (
             execution_contract.get("schema")
             != "hermes-operator.run-execution-contract.v1"
@@ -799,6 +848,9 @@ class Supervisor:
             or not isinstance(contract_default_skills, list)
             or not all(isinstance(value, str) for value in contract_default_skills)
             or not isinstance(contract_goal_mode, bool)
+            or contract_internal_capabilities
+            != list(MANAGED_INTERNAL_CAPABILITIES)
+            or contract_verification_requirement not in VERIFICATION_REQUIREMENTS
         ):
             raise PlanValidationError(
                 f"Verification evidence has a malformed execution contract for {work_id}"
@@ -809,6 +861,10 @@ class Supervisor:
             "scope_revision": payload.get("scope_revision"),
             "work_version": payload.get("work_version"),
             "profile": payload.get("profile"),
+            "internal_capabilities": payload.get("internal_capabilities"),
+            "verification_requirement": payload.get(
+                "verification_requirement"
+            ),
         }
         expected_event_contract = {
             "dispatch_contract_digest": contract_dispatch_digest,
@@ -816,6 +872,8 @@ class Supervisor:
             "scope_revision": contract_scope_revision,
             "work_version": contract_work_version,
             "profile": contract_profile,
+            "internal_capabilities": contract_internal_capabilities,
+            "verification_requirement": contract_verification_requirement,
         }
         if event_contract != expected_event_contract:
             raise PlanValidationError(
@@ -841,6 +899,8 @@ class Supervisor:
             or current_dispatch_digest != contract_dispatch_digest
             or work.version < contract_work_version
             or str(work.assignee or "") != contract_profile
+            or work_verification_requirement(work)
+            != contract_verification_requirement
         ):
             raise PlanValidationError(
                 f"Completion evidence belongs to a stale execution scope for {work_id}"
@@ -865,6 +925,8 @@ class Supervisor:
             "profile": contract_profile,
             "execution_scope_digest": contract_scope_digest,
             "dispatch_contract_digest": contract_dispatch_digest,
+            "internal_capabilities": contract_internal_capabilities,
+            "verification_requirement": contract_verification_requirement,
             "hermes_task_id": hermes_task_id,
             "run_id": completion_run_id,
             "attempt": completion_attempt,
@@ -1797,6 +1859,11 @@ class Supervisor:
                 "hermes_task_id": str(payload.get("hermes_task_id", "")),
                 "run_id": str(payload.get("run_id", "")),
                 "attempt": payload.get("attempt"),
+                "question_id": question_id,
+                # The explicit block revocation below advances the authority
+                # generation exactly once.  Any later scope mutation makes the
+                # answer stale and prevents reuse of the old Hermes card.
+                "answer_scope_revision": work.authorization_scope_revision + 1,
                 "recorded_at": utc_now(),
             }
             work = self.store.update_work(
@@ -1817,6 +1884,18 @@ class Supervisor:
             ensure_ascii=True,
             default=str,
         )[:2_000]
+        blocked_binding = self._question_binding_for_work(
+            work, execution_authorized=False
+        )
+        blocked_binding["blocked_resume"] = {
+            "schema": "hermes-operator.blocked-resume.v1",
+            "question_id": question_id,
+            "work_id": work.id,
+            "blocked_event_id": str(event["id"]),
+            "blocked_run_id": run_id,
+            "blocked_attempt": attempt,
+            "hermes_task_id": str(payload.get("hermes_task_id", "")),
+        }
         self.store.create_question(
             UserQuestion(
                 id=question_id,
@@ -1832,11 +1911,7 @@ class Supervisor:
                 ),
                 urgency=max(0.7, work.urgency),
                 blocking_work_ids=[work.id],
-                blocking_work_bindings={
-                    work.id: self._question_binding_for_work(
-                        work, execution_authorized=False
-                    )
-                },
+                blocking_work_bindings={work.id: blocked_binding},
             ),
             actor=self.worker_id,
         )
@@ -2198,31 +2273,30 @@ class Supervisor:
                 raise PlanValidationError(
                     f"Task-like event {event_id} cannot be dismissed as non-actionable"
                 )
-            if outcome == "quarantined" and _task_like_event(event):
+            if outcome == "quarantined":
+                review_effect: tuple[str, str] | None = None
                 if _completion_event(event):
-                    review_work_id, review_question_id = (
-                        self._ensure_completion_followup(
-                            event=event,
-                            reason=str(disposition["reason"]).strip(),
-                            result=result,
-                        )
-                    )
-                elif _blocked_lifecycle_event(event):
-                    review_work_id, review_question_id = (
-                        self._ensure_blocked_lifecycle_question(
-                            event=event,
-                            result=result,
-                        )
-                    )
-                else:
-                    review_work_id, review_question_id = self._ensure_quarantine_review(
+                    review_effect = self._ensure_completion_followup(
                         event=event,
                         reason=str(disposition["reason"]).strip(),
                         result=result,
                     )
-                related_work_ids.add(review_work_id)
-                if review_question_id not in related_question_ids:
-                    related_question_ids.append(review_question_id)
+                elif _blocked_lifecycle_event(event):
+                    review_effect = self._ensure_blocked_lifecycle_question(
+                        event=event,
+                        result=result,
+                    )
+                else:
+                    review_effect = self._ensure_quarantine_review(
+                        event=event,
+                        reason=str(disposition["reason"]).strip(),
+                        result=result,
+                    )
+                if review_effect is not None:
+                    review_work_id, review_question_id = review_effect
+                    related_work_ids.add(review_work_id)
+                    if review_question_id not in related_question_ids:
+                        related_question_ids.append(review_question_id)
             resolved_dispositions.append(
                 {
                     "event_id": event_id,
@@ -2408,6 +2482,10 @@ class Supervisor:
                     "parent_id": operation.get("parent_id"),
                     "parent_ref": operation.get("parent_ref"),
                     "source_event_id": operation.get("source_event_id") if events else None,
+                    # Without a caller-supplied semantic key, idempotency is
+                    # occurrence-scoped. The pass ID is stable for retries of
+                    # one event batch and fresh for each eventless request.
+                    "occurrence_pass_id": pass_id,
                 }
                 semantic_key = supplied_key or json.dumps(
                     fallback_material,
@@ -3234,12 +3312,22 @@ class Supervisor:
                     f"Deterministic verification report is stale or invalid for {work_id}: {error}"
                 ) from error
             verdict = requested_verdict
-            if (
-                requested_verdict == "passed"
-                and deterministic.get("applicable") is True
-                and deterministic.get("passed") is not True
-            ):
-                verdict = "failed"
+            verification_requirement = work_verification_requirement(work)
+            if requested_verdict == "passed":
+                deterministic_applicable = (
+                    deterministic.get("applicable") is True
+                )
+                deterministic_passed = deterministic.get("passed") is True
+                if (
+                    verification_requirement
+                    == VERIFICATION_REQUIREMENT_DETERMINISTIC
+                    and not (
+                        deterministic_applicable and deterministic_passed
+                    )
+                ):
+                    verdict = "failed"
+                elif deterministic_applicable and not deterministic_passed:
+                    verdict = "failed"
             criteria_results = verification.get("criteria_results", [])
             if not isinstance(criteria_results, list):
                 raise PlanValidationError("criteria_results must be a list")
@@ -3270,6 +3358,7 @@ class Supervisor:
                 "supervisor_pass": pass_id,
                 "plan_digest": plan_digest,
                 "evidence_fingerprint": evidence_fingerprint,
+                "verification_requirement": verification_requirement,
                 "deterministic": deterministic,
             }
             if verdict == "passed":
@@ -3394,6 +3483,15 @@ class Supervisor:
                     entity_id=work_id,
                 )
                 continue
+            try:
+                validate_work_verification_readiness(
+                    work,
+                    self.config.verification,
+                )
+            except ValueError as error:
+                raise PlanValidationError(
+                    f"Work {work_id} verification assurance is not ready: {error}"
+                ) from error
             dispatch_source_id = _optional_text(dispatch.get("source_event_id"))
             dispatch_source = event_by_id.get(dispatch_source_id or "")
             candidate_profile = (

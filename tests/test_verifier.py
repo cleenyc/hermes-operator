@@ -23,7 +23,10 @@ from hermes_operator.config import (  # noqa: E402
 )
 from hermes_operator.authority import execution_scope_digest  # noqa: E402
 from hermes_operator.db import SQLiteStore  # noqa: E402
-from hermes_operator.dispatcher import dispatch_contract_digest  # noqa: E402
+from hermes_operator.dispatcher import (  # noqa: E402
+    MANAGED_INTERNAL_CAPABILITIES,
+    dispatch_contract_digest,
+)
 from hermes_operator.llm import ScriptedLLM  # noqa: E402
 from hermes_operator.models import (  # noqa: E402
     Event,
@@ -327,6 +330,11 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
                 "skills": skills,
                 "default_skills": list(self.config.hermes.default_skills),
                 "goal_mode": goal_mode,
+                "internal_capabilities": list(MANAGED_INTERNAL_CAPABILITIES),
+                "verification_requirement": item.metadata.get(
+                    "verification_requirement",
+                    "model_evidence",
+                ),
                 "captured_at": "2026-07-15T00:00:00+00:00",
             },
             "completion": completion,
@@ -341,6 +349,10 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             "scope_revision": contract["scope_revision"],
             "work_version": contract["work_version"],
             "profile": contract["profile"],
+            "internal_capabilities": contract["internal_capabilities"],
+            "verification_requirement": contract[
+                "verification_requirement"
+            ],
         }
 
     async def test_failed_artifact_gate_overrides_model_passed_verdict(self) -> None:
@@ -463,6 +475,118 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verification["verdict"], "failed")
         self.assertFalse(verification["deterministic"]["passed"])
 
+    async def test_required_deterministic_report_cannot_be_non_applicable(self) -> None:
+        item = WorkItem(
+            title="Never accept an inapplicable required check",
+            status=WorkStatus.REVIEW,
+            assignee="operator",
+            hermes_task_id="task-required-check",
+            acceptance_criteria=["The deployment check passes"],
+            metadata={
+                "verification_requirement": "deterministic_required",
+                "hermes": {
+                    "completion_fingerprint": "required-check-evidence",
+                    "completion_run_id": "",
+                    "completion_attempt": 1,
+                },
+                "governance": {
+                    "source_trust": "operator",
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                },
+            },
+        )
+        self.store.create_work(item)
+        run = RunRecord(
+            work_item_id=item.id,
+            runner="hermes-kanban",
+            external_run_id="task-required-check",
+            status="completed",
+            result=self._immutable_run_result(
+                item,
+                {"updated_at": "required-check-evidence"},
+            ),
+        )
+        item.metadata["hermes"]["completion_run_id"] = run.id
+        self.store.update_work(
+            item.id,
+            {"metadata": item.metadata},
+            expected_version=item.version,
+        )
+        self.store.create_run(run)
+        event = Event(
+            source="hermes",
+            external_id="task-required-check",
+            event_type="execution.completed",
+            payload={
+                "work_id": item.id,
+                "hermes_task_id": "task-required-check",
+                "run_id": run.id,
+                "attempt": 1,
+                "evidence_fingerprint": "required-check-evidence",
+                **self._completion_contract_payload(run),
+            },
+            trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            provenance={"adapter": "hermes-kanban"},
+        )
+        self.store.enqueue_event(event)
+        events = self.store.claim_events("required-verifier", 1, 60)
+        PriorityEngine().rescore_store(self.store)
+        current = self.store.get_work(item.id)
+        plan = {
+            "summary": "Assessed the required deterministic completion",
+            "observations": [],
+            "event_dispositions": [
+                {
+                    "event_id": event.id,
+                    "disposition": "execution_reconciled",
+                    "reason": "The required report was assessed",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [
+                {
+                    "work_id": item.id,
+                    "expected_version": current.version,
+                    "verdict": "passed",
+                    "confidence": 0.99,
+                    "summary": "The model requested completion",
+                    "criteria_results": [
+                        {
+                            "criterion": "The deployment check passes",
+                            "passed": True,
+                            "evidence": "The worker claimed success",
+                        }
+                    ],
+                }
+            ],
+            "external_action_proposals": [],
+        }
+
+        result = await Supervisor(
+            config=self.config,
+            store=self.store,
+            llm=ScriptedLLM([plan]),
+            priority_engine=PriorityEngine(),
+        ).run_pass(trigger="event", events=events)
+
+        completed = self.store.get_work(item.id)
+        self.assertEqual(completed.status, WorkStatus.BLOCKED)
+        self.assertEqual(result.verified_work_ids, [])
+        verification = completed.metadata["last_verification"]
+        self.assertEqual(
+            verification["verification_requirement"],
+            "deterministic_required",
+        )
+        self.assertFalse(verification["deterministic"]["applicable"])
+        self.assertTrue(verification["deterministic"]["passed"])
+        self.assertEqual(verification["verdict"], "failed")
+
     async def test_check_runs_once_without_blocking_lease_or_api_writer(self) -> None:
         check = VerificationCheckConfig(
             name="unit",
@@ -478,6 +602,7 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
             hermes_task_id="task-nonblocking",
             acceptance_criteria=["The fixed check passes"],
             metadata={
+                "verification_requirement": "deterministic_required",
                 "verification_contract": {
                     "artifacts": [],
                     "checks": ["unit"],
@@ -641,6 +766,12 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(deterministic["checks"]), 1)
         self.assertIn("completion_binding_digest", deterministic["binding"])
+        self.assertEqual(
+            self.store.get_work(item.id).metadata["last_verification"][
+                "verification_requirement"
+            ],
+            "deterministic_required",
+        )
 
 
 if __name__ == "__main__":

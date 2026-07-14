@@ -9,9 +9,9 @@ live execution contract for the current Hermes task.
 
 The pinned real-host compatibility target for this release is Hermes Agent
 `0.18.2`, tag `v2026.7.7.2`, commit
-`9de9c25f620ff7f1ce0fd5457d596052d5159596`. The version is diagnostic rather than
-an exact activation lock: another build may activate only when the required profile,
-dispatcher identity, and pre-tool directive semantics are positively verified. The
+`9de9c25f620ff7f1ce0fd5457d596052d5159596`. It is the exact activation target by
+default. Another build requires a deployment-owned reviewed-host override and must
+still pass every profile, dispatcher, credential, artifact, and hook semantic gate. The
 optional real-host test becomes mandatory when
 `HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION=1` is set.
 Release CI runs that test suite against the pinned commit as a required check and against
@@ -31,11 +31,14 @@ environment variables:
 ```text
 HERMES_OPERATOR_URL=https://operator.internal
 HERMES_OPERATOR_BRIDGE_TOKEN=<dedicated bridge token>
+HERMES_OPERATOR_BRIDGE_PROOF_SECRET=<independent secret of at least 32 bytes>
 HERMES_OPERATOR_PROFILE=operator
 ```
 
 Loopback HTTP is supported for same-host development. Remote bridge URLs must
-use HTTPS. The bridge token must be distinct from the operator admin token.
+use HTTPS. The admin token, bridge token, and proof secret must be distinct. The
+plugin removes both bridge credentials from its environment after loading them;
+authority-bearing requests use exact, short-lived, durably replay-fenced proofs.
 
 For Operator-managed Kanban cards, the plugin blocks external communication and
 publication tools, completion artifact delivery, native Kanban fanout, non-durable
@@ -59,6 +62,11 @@ profile, dispatcher ownership of `HERMES_KANBAN_TASK`, first-valid pre-tool dire
 semantics, or first-position Operator guard cannot be positively verified. The guard
 itself stays installed in fail-closed policy-only mode, and the plugin publishes a
 best-effort negative policy event so the control plane can revoke stale positive state.
+
+Activation is pinned to Hermes `0.18.2`. A deployment that has run and reviewed the
+real-host contract on another release may set
+`HERMES_OPERATOR_REVIEWED_HOST_OVERRIDE=true`; this bypasses only the version pin,
+never an unknown or incompatible semantic probe.
 
 Managed completions reject explicit artifacts, artifact-like metadata, and every
 absolute, drive-letter, or `~`-relative local path embedded in `summary` or `result`,

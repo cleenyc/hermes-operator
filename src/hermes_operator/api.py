@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from . import __version__ as PACKAGE_VERSION
 from .approvals import ApprovalStateError, ExternalActionStager
 from .authority import execution_scope_binding, execution_scope_document
+from .config import VerificationConfig
 from .db import NotFound, SQLiteStore, StateConflict
 from .inbound import (
     InboundValidationError,
@@ -26,6 +28,7 @@ from .inbound import (
 )
 from .models import QuestionStatus, WorkItem, WorkRelation, WorkStatus, utc_now
 from .models import Event, ExecutionMode, TrustLevel, WorkKind
+from .verifier import validate_work_verification_readiness
 
 
 WakeCallback = Callable[[str], None]
@@ -34,6 +37,7 @@ NextProvider = Callable[[int], Sequence[WorkItem | Mapping[str, Any]]]
 ExecutionContractProvider = Callable[[str], Mapping[str, Any]]
 DelegationClaimProvider = Callable[[str, int], Mapping[str, Any]]
 RESERVED_WEBHOOK_SOURCES = frozenset({"operator", "system", "hermes"})
+BRIDGE_PROOF_MAX_AGE_SECONDS = 90
 
 
 @dataclass(slots=True)
@@ -41,6 +45,7 @@ class APIContext:
     store: SQLiteStore
     api_token: str = ""
     bridge_token: str = ""
+    bridge_proof_secret: str = ""
     webhook_secrets: Mapping[str, str] = field(default_factory=dict)
     max_body_bytes: int = 1_048_576
     wake: WakeCallback | None = None
@@ -54,6 +59,7 @@ class APIContext:
     authorization_profile: str = "operator"
     authorization_default_skills: Sequence[str] = field(default_factory=tuple)
     authorization_goal_mode: bool = False
+    verification_config: VerificationConfig = field(default_factory=VerificationConfig)
 
     def __post_init__(self) -> None:
         if self.max_body_bytes < 1:
@@ -70,6 +76,24 @@ class APIContext:
             and hmac.compare_digest(self.api_token, self.bridge_token)
         ):
             raise ValueError("Operator and Hermes bridge tokens must be distinct")
+        configured_secrets = [
+            value
+            for value in (
+                self.api_token,
+                self.bridge_token,
+                self.bridge_proof_secret,
+            )
+            if value
+        ]
+        if len(configured_secrets) != len(set(configured_secrets)):
+            raise ValueError(
+                "Operator, Hermes bridge, and bridge proof secrets must be distinct"
+            )
+        if (
+            self.bridge_proof_secret
+            and len(self.bridge_proof_secret.encode("utf-8")) < 32
+        ):
+            raise ValueError("Hermes bridge proof secret must contain at least 32 bytes")
         if self.authorization_profile and not self.authorization_profile.strip():
             raise ValueError("authorization_profile must be empty or nonempty text")
         if not all(
@@ -745,6 +769,38 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 return
+            if path == "/v1/audit":
+                self._require_operator(mutation=True)
+                allowed = {
+                    "actor",
+                    "event",
+                    "entity_type",
+                    "entity_id",
+                    "limit",
+                }
+                if set(query) - allowed:
+                    raise ValueError(
+                        "audit accepts actor, event, entity_type, entity_id, and limit"
+                    )
+                entity_types = query.get("entity_type", [])
+                entity_ids = query.get("entity_id", [])
+                if len(entity_types) > 1 or len(entity_ids) > 1:
+                    raise ValueError(
+                        "entity_type and entity_id may each be supplied once"
+                    )
+                limit = self._query_limit(query, default=200, maximum=1000)
+                items = context.store.list_audit(
+                    actors=_split_query_values(query.get("actor", [])) or None,
+                    events=_split_query_values(query.get("event", [])) or None,
+                    entity_type=entity_types[0] if entity_types else None,
+                    entity_id=entity_ids[0] if entity_ids else None,
+                    limit=limit,
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"items": items, "count": len(items)},
+                )
+                return
             if path == "/v1/memory":
                 self._require_operator(mutation=True)
                 limit = self._query_limit(query, default=200, maximum=1000)
@@ -1008,7 +1064,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 ).strip("/")
                 if not question_id or "/" in question_id:
                     raise APIError(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found")
-                _, document = self._read_json()
+                raw, document = self._read_json()
+                self._require_bridge_proof(raw, "human.answer_question", path)
                 if set(document) != {"answer"} or not isinstance(
                     document.get("answer"), str
                 ):
@@ -1033,7 +1090,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 ).strip("/")
                 if not work_id or "/" in work_id:
                     raise APIError(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found")
-                _, document = self._read_json()
+                raw, document = self._read_json()
+                self._require_bridge_proof(raw, "human.update_work", path)
                 if set(document) != {"expected_version", "changes"}:
                     raise ValueError("update requires expected_version and changes")
                 expected_version = document.get("expected_version")
@@ -1080,7 +1138,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 ).strip("/")
                 if not work_id or "/" in work_id:
                     raise APIError(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found")
-                _, document = self._read_json()
+                raw, document = self._read_json()
+                self._require_bridge_proof(raw, "human.resolve_reminder", path)
                 allowed = {"expected_version", "action", "until"}
                 if set(document) - allowed or not {
                     "expected_version",
@@ -1128,7 +1187,8 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 ).strip("/")
                 if not work_id or "/" in work_id:
                     raise APIError(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found")
-                _, document = self._read_json(allow_empty=True)
+                raw, document = self._read_json(allow_empty=True)
+                self._require_bridge_proof(raw, "human.authorize_work", path)
                 allowed = {
                     "expected_version",
                     "expected_scope_revision",
@@ -1194,6 +1254,10 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     raise ValueError("skills must be a list of nonempty strings")
                 if not isinstance(goal_mode, bool):
                     raise ValueError("goal_mode must be a boolean")
+                validate_work_verification_readiness(
+                    item,
+                    context.verification_config,
+                )
                 result = context.store.enqueue_work_authorization(
                     work_id,
                     expected_version=expected_version,
@@ -1335,6 +1399,7 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                             "policy_attestation_auth_required",
                             "Policy attestation requires the scoped Hermes bridge token",
                         )
+                    self._require_bridge_proof(raw, "policy.attest", path)
                     attestation = _validated_policy_attestation(document)
                 elif document.get("event_type") == "policy.revoked":
                     if source != "hermes" or not bridge_authenticated:
@@ -1343,6 +1408,7 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                             "policy_attestation_auth_required",
                             "Policy revocation requires the scoped Hermes bridge token",
                         )
+                    self._require_bridge_proof(raw, "policy.revoke", path)
                     revocation = _validated_policy_revocation(document)
                 normalized = normalize_external_event(
                     source,
@@ -1720,6 +1786,79 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     HTTPStatus.UNAUTHORIZED,
                     "unauthorized",
                     "The scoped Hermes bridge token is required",
+                )
+
+        def _require_bridge_proof(
+            self,
+            raw_body: bytes,
+            purpose: str,
+            endpoint: str,
+        ) -> None:
+            """Consume one exact short-lived proof from the trusted plugin path."""
+
+            secret = context.bridge_proof_secret
+            if not secret:
+                raise APIError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "bridge_proof_unconfigured",
+                    "Hermes authority-bearing bridge proof is not configured",
+                )
+            timestamp_text = self.headers.get(
+                "X-Hermes-Operator-Proof-Timestamp", ""
+            ).strip()
+            nonce = self.headers.get(
+                "X-Hermes-Operator-Proof-Nonce", ""
+            ).strip()
+            supplied = self.headers.get("X-Hermes-Operator-Proof", "").strip()
+            if (
+                not timestamp_text.isdigit()
+                or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+                or re.fullmatch(r"[0-9a-f]{64}", supplied) is None
+            ):
+                raise APIError(
+                    HTTPStatus.UNAUTHORIZED,
+                    "bridge_proof_required",
+                    "A valid exact Hermes bridge proof is required",
+                )
+            timestamp = int(timestamp_text)
+            now = time.time()
+            if abs(now - timestamp) > BRIDGE_PROOF_MAX_AGE_SECONDS:
+                raise APIError(
+                    HTTPStatus.UNAUTHORIZED,
+                    "bridge_proof_expired",
+                    "The Hermes bridge proof is outside its validity window",
+                )
+            body_digest = hashlib.sha256(raw_body).hexdigest()
+            canonical = "\n".join(
+                (
+                    "v1",
+                    timestamp_text,
+                    nonce,
+                    purpose,
+                    self.command.upper(),
+                    endpoint,
+                    body_digest,
+                )
+            ).encode("utf-8")
+            expected = hmac.new(
+                secret.encode("utf-8"), canonical, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(supplied, expected):
+                raise APIError(
+                    HTTPStatus.UNAUTHORIZED,
+                    "bridge_proof_invalid",
+                    "The Hermes bridge proof does not bind this exact operation",
+                )
+            consumed = context.store.consume_bridge_proof_nonce(
+                nonce,
+                now,
+                max(now + 1.0, timestamp + BRIDGE_PROOF_MAX_AGE_SECONDS),
+            )
+            if not consumed:
+                raise APIError(
+                    HTTPStatus.CONFLICT,
+                    "bridge_proof_replayed",
+                    "The Hermes bridge proof has already been consumed",
                 )
 
         def _wake(self, reason: str) -> None:
