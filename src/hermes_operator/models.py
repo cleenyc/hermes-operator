@@ -226,6 +226,7 @@ class WorkItem:
     due_at: str | None = None
     scheduled_at: str | None = None
     recurrence_rule: str | None = None
+    reminder_snoozed_until: str | None = None
     reminder_last_delivered_at: str | None = None
     reminder_last_acknowledged_at: str | None = None
     reminder_delivery_count: int = 0
@@ -236,6 +237,7 @@ class WorkItem:
     metadata: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: new_id("wrk"))
     version: int = 1
+    authorization_scope_revision: int = 1
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     completed_at: str | None = None
@@ -271,6 +273,7 @@ class WorkItem:
             due_at=row["due_at"],
             scheduled_at=row["scheduled_at"],
             recurrence_rule=row["recurrence_rule"],
+            reminder_snoozed_until=row["reminder_snoozed_until"],
             reminder_last_delivered_at=row["reminder_last_delivered_at"],
             reminder_last_acknowledged_at=row["reminder_last_acknowledged_at"],
             reminder_delivery_count=int(row["reminder_delivery_count"]),
@@ -280,6 +283,7 @@ class WorkItem:
             acceptance_criteria=json.loads(row["acceptance_criteria_json"] or "[]"),
             metadata=json.loads(row["metadata_json"] or "{}"),
             version=row["version"],
+            authorization_scope_revision=int(row["authorization_scope_revision"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
@@ -292,6 +296,7 @@ class UserQuestion:
     context: str = ""
     urgency: float = 0.5
     blocking_work_ids: list[str] = field(default_factory=list)
+    blocking_work_bindings: dict[str, dict[str, Any]] = field(default_factory=dict)
     id: str = field(default_factory=lambda: new_id("qst"))
     status: QuestionStatus = QuestionStatus.PENDING
     answer: str | None = None

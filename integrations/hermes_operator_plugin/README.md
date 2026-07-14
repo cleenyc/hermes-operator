@@ -7,6 +7,22 @@ default-deny pre-tool guard.
 The guard permits internal work only when the control plane returns an exact
 live execution contract for the current Hermes task.
 
+The pinned real-host compatibility target for this release is Hermes Agent
+`0.18.2`, tag `v2026.7.7.2`, commit
+`9de9c25f620ff7f1ce0fd5457d596052d5159596`. Other versions are reported in
+diagnostics and may work, but should be pilot-tested before unattended use. The
+optional real-host test becomes mandatory when
+`HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION=1` is set.
+Release CI runs that test suite against the pinned commit as a required check and against
+current Hermes `main` as an advisory compatibility signal.
+
+Run the pinned host lane in an isolated environment with:
+
+```text
+python -m pip install -r tests/hermes-host-requirements.txt
+HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION=1 python -m unittest discover -s tests -v
+```
+
 Install the wheel in the same Python environment as Hermes, register the
 plugin using the normal Hermes plugin mechanism, and configure these required
 environment variables:
@@ -31,16 +47,38 @@ repository code. Deployments that require a hard boundary independent of Hermes 
 add operating-system or container filesystem scoping, credential isolation, and
 network egress controls without changing this plugin.
 
+`HERMES_KANBAN_TASK`, which Hermes sets only for dispatcher-spawned workers, is
+the authoritative managed-card marker. Ordinary interactive and Cron turns remain
+native even though Hermes gives each one an ephemeral UUID and forwards that UUID
+to hooks. If the managed marker exists, the hook task ID must match it exactly.
+
+Bridge attestation and all Operator tools remain disabled when the active Hermes
+profile is known to differ from `HERMES_OPERATOR_PROFILE`. They also remain disabled
+when Hermes is known to use first-valid pre-tool directives and another hook precedes
+the Operator guard. The guard itself stays installed in fail-closed policy-only mode.
+
+Managed completions reject explicit artifacts, artifact-like metadata, and Hermes
+worker-workspace paths embedded in `summary` or `result`. There is intentionally no
+environment flag that declares a private artifact sink: the current pre-tool hook does
+not receive an authenticated notification-recipient identity, so it cannot prove the
+configured label is the actual destination. Deliver files from an interactive Hermes
+turn using native approval.
+
 `/operator` supports direct task capture, reminder capture, question answers, exact
 work authorization, completion, snoozing, priorities, due reminders, and compatibility
 diagnostics. Model-facing answer, authorization, terminal-status, hierarchy, cron, and
 external Google mutations require Hermes native approval.
+Authorization is version-fenced: use
+`/operator authorize <work-id> <version> [reason]`. Model-facing authorization may
+also bind an exact profile, skills list, and goal mode. Hermes approval cache keys
+include the work version and execution shape.
 
 Hermes' managed attention cron calls `operator_claim_attention` once per delivery turn.
 That atomic claim returns due reminders and pending questions together and applies the
 core redelivery window. `operator_due_reminders` is preview-only. Reminder creation and
 updates accept fixed ISO-8601 recurrence rules (`PTnM`, `PTnH`, `PnD`, or `PnW`), and
-`/operator snooze` moves the reminder's `due_at` value.
+`/operator snooze` uses the dedicated reminder lifecycle route. It records a temporary
+delivery override without moving the recurring reminder's `due_at` schedule anchor.
 
 See the main project documentation for installation, deployment, policy pins,
 and the full threat model.

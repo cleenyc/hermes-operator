@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,30 @@ class TaskScopedPolicyGuard:
         """Expose non-secret configured identity to compatibility diagnostics."""
 
         return self._expected_profile
+
+    def activate_bridge(
+        self,
+        authorization_lookup: AuthorizationLookup,
+        delegation_claim: DelegationClaim,
+    ) -> None:
+        """Enable contract-backed worker actions after host attestation gates pass.
+
+        The guard is registered before Hermes compatibility can be observed.  Keeping
+        these callbacks unset until profile and hook-order checks pass makes
+        "policy-only mode" real: an incompatible host cannot use the bridge merely
+        because its model-facing Operator tools were withheld.
+        """
+
+        if not callable(authorization_lookup) or not callable(delegation_claim):
+            raise TypeError("bridge callbacks must be callable")
+        self._authorization_lookup = authorization_lookup
+        self._delegation_claim = delegation_claim
+
+    def deactivate_bridge(self) -> None:
+        """Return the already-registered guard to fail-closed policy-only mode."""
+
+        self._authorization_lookup = None
+        self._delegation_claim = None
 
     def __call__(
         self,
@@ -206,7 +231,7 @@ class TaskScopedPolicyGuard:
                 )
             )
 
-POLICY_VERSION = "4.0.0"
+POLICY_VERSION = "5.0.0"
 POLICY_MODE = "default_deny"
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -925,19 +950,29 @@ def _required_capability(tool_name: str, args: Mapping[str, Any]) -> str:
 
 
 def _current_task_identity(hook_task_id: str) -> tuple[str, str]:
-    if hook_task_id not in (None, "") and not isinstance(hook_task_id, str):
-        return "", "pre_tool_call task_id must be a string"
-    hook_identity = str(hook_task_id or "").strip()
+    """Return a managed-worker identity only when Hermes marks the process as one.
+
+    Current Hermes assigns every ordinary interactive and Cron turn an ephemeral UUID
+    and forwards it as the hook ``task_id``.  That value isolates the turn but does not
+    make it an Operator-managed Kanban worker.  The dispatcher-controlled
+    ``HERMES_KANBAN_TASK`` environment marker is authoritative.  When it exists, the
+    hook identity must be the same valid task id; when it does not, the turn is native
+    regardless of the ordinary Hermes UUID.
+    """
+
     environment_identity = os.getenv("HERMES_KANBAN_TASK", "").strip()
-    for source, value in (
-        ("pre_tool_call task_id", hook_identity),
-        ("HERMES_KANBAN_TASK", environment_identity),
-    ):
-        if value and not _TASK_ID_PATTERN.fullmatch(value):
-            return "", f"{source} is not a valid Hermes task identity"
-    if hook_identity and environment_identity and hook_identity != environment_identity:
+    if not environment_identity:
+        return "", ""
+    if not _TASK_ID_PATTERN.fullmatch(environment_identity):
+        return "", "HERMES_KANBAN_TASK is not a valid Hermes task identity"
+    if not isinstance(hook_task_id, str):
+        return "", "pre_tool_call task_id must be a string for a managed worker"
+    hook_identity = hook_task_id.strip()
+    if not _TASK_ID_PATTERN.fullmatch(hook_identity):
+        return "", "pre_tool_call task_id is not a valid Hermes task identity"
+    if hook_identity != environment_identity:
         return "", "pre_tool_call task_id does not match HERMES_KANBAN_TASK"
-    return hook_identity or environment_identity, ""
+    return environment_identity, ""
 
 
 def _lookup_execution_contract(
@@ -1039,13 +1074,54 @@ def _kanban_completion_artifact_error(args: Mapping[str, Any]) -> str:
     artifacts = args.get("artifacts")
     if artifacts not in (None, "", [], ()):
         return "Operator-managed completion cannot attach or deliver artifact paths"
+    for key in ("summary", "result"):
+        value = args.get(key)
+        if value is not None and not isinstance(value, str):
+            return (
+                "Operator-managed completion summary and result must be strings "
+                "so artifact paths can be evaluated before Hermes transforms them"
+            )
     metadata = args.get("metadata")
-    if not isinstance(metadata, Mapping):
-        return ""
-    for key in metadata:
-        normalized = _normalize_name(key)
-        if normalized in {"artifact", "artifacts", "attachment", "attachments"}:
-            return "Operator-managed completion metadata cannot attach or deliver files"
+    if isinstance(metadata, Mapping):
+        for key in metadata:
+            normalized = _normalize_name(key)
+            if normalized in {"artifact", "artifacts", "attachment", "attachments"}:
+                return "Operator-managed completion metadata cannot attach or deliver files"
+
+    # Newer Hermes hosts discover existing files named in completion prose after
+    # pre_tool_call hooks have returned, then promote them into notification
+    # attachments.  Block the exact dispatcher-provided workspace prefix here so
+    # that post-hook transformation cannot bypass the managed-card boundary.  We
+    # intentionally do not offer an allow flag: the hook receives no authenticated
+    # notification-recipient identity and therefore cannot prove a configured sink
+    # is the actual destination.  Files can still be delivered from an interactive
+    # Hermes turn after native approval.
+    prose = "\n".join(
+        value for key in ("summary", "result")
+        if isinstance((value := args.get(key)), str) and value
+    )
+    if prose:
+        workspace_candidates: list[str] = []
+        workspace = os.getenv("HERMES_KANBAN_WORKSPACE", "").strip()
+        if workspace:
+            workspace_candidates.append(workspace)
+        workspaces_root = os.getenv("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+        task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+        if workspaces_root and task_id:
+            workspace_candidates.append(str(Path(workspaces_root) / task_id))
+        for candidate in workspace_candidates:
+            path = Path(candidate).expanduser()
+            if not path.is_absolute():
+                continue
+            prefix = str(path).rstrip("/\\")
+            if prefix and re.search(
+                re.escape(prefix) + r"(?:[/\\][^\s`\"'<>]+)", prose
+            ):
+                return (
+                    "Operator-managed completion prose cannot name files in the "
+                    "Hermes worker workspace because Hermes may promote them to "
+                    "notification attachments"
+                )
     return ""
 
 
@@ -1077,12 +1153,101 @@ def _human_confirmation(
                 f"{identity_key} must be one exact safe identifier",
             )
         ) or {}
-    label = "answer this Operator question" if tool_name == "operator_answer_question" else "authorize this exact Operator work item"
-    return {
-        "action": "approve",
-        "message": f"Confirm that you want Hermes to {label}: {identity.strip()}",
-        "rule_key": f"{tool_name}:{identity.strip()}",
-    }
+    if tool_name == "operator_answer_question":
+        answer = args.get("answer")
+        if not isinstance(answer, str) or not answer.strip() or len(answer) > 20_000:
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "question approval requires one exact nonempty bounded answer",
+                )
+            ) or {}
+        answer_digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+        return {
+            "action": "approve",
+            "message": (
+                "Confirm that you want Hermes to submit this exact answer to "
+                f"Operator question {identity.strip()}"
+            ),
+            "rule_key": f"{tool_name}:{identity.strip()}:{answer_digest[:16]}",
+        }
+    if tool_name == "operator_authorize_work":
+        expected_version = args.get("expected_version")
+        profile = args.get("profile")
+        skills = args.get("skills")
+        goal_mode = args.get("goal_mode")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+            or (
+                profile is not None
+                and (
+                    not isinstance(profile, str)
+                    or not profile.strip()
+                    or len(profile) > 128
+                )
+            )
+            or (
+                skills is not None
+                and (
+                    not isinstance(skills, list)
+                    or len(skills) > 64
+                    or any(
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or len(value) > 128
+                        for value in skills
+                    )
+                )
+            )
+            or (goal_mode is not None and not isinstance(goal_mode, bool))
+        ):
+            return _blocked_response(
+                PolicyDecision(
+                    True,
+                    "authorization",
+                    "work authorization requires an exact positive version and valid execution parameters",
+                )
+            ) or {}
+        execution_shape = {
+            "goal_mode": goal_mode,
+            "profile": profile.strip() if isinstance(profile, str) else None,
+            "skills": [value.strip() for value in skills] if isinstance(skills, list) else None,
+            "work_id": identity.strip(),
+            "work_version": expected_version,
+        }
+        shape_digest = hashlib.sha256(
+            json.dumps(
+                execution_shape,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        overrides: list[str] = []
+        if execution_shape["profile"] is not None:
+            overrides.append(f"profile={execution_shape['profile']}")
+        if execution_shape["skills"] is not None:
+            overrides.append(f"skills={','.join(execution_shape['skills']) or 'none'}")
+        if execution_shape["goal_mode"] is not None:
+            overrides.append(f"goal_mode={str(execution_shape['goal_mode']).lower()}")
+        suffix = f" ({'; '.join(overrides)})" if overrides else ""
+        return {
+            "action": "approve",
+            "message": (
+                "Confirm that you want Hermes to authorize this exact Operator work "
+                f"scope: {identity.strip()} version {expected_version}{suffix}"
+            ),
+            "rule_key": (
+                f"{tool_name}:{identity.strip()}:v{expected_version}:"
+                f"{shape_digest[:16]}"
+            ),
+        }
+    return _blocked_response(
+        PolicyDecision(True, "authorization", "unknown confirmation tool")
+    ) or {}
 
 
 def _work_update_confirmation(
@@ -1093,10 +1258,14 @@ def _work_update_confirmation(
             PolicyDecision(True, "authorization", "work update arguments are malformed")
         )
     work_id = args.get("work_id")
+    expected_version = args.get("expected_version")
     changes = args.get("changes")
     if (
         not isinstance(work_id, str)
         or not _TASK_ID_PATTERN.fullmatch(work_id.strip())
+        or not isinstance(expected_version, int)
+        or isinstance(expected_version, bool)
+        or expected_version < 1
         or not isinstance(changes, Mapping)
         or not changes
     ):
@@ -1108,13 +1277,32 @@ def _work_update_confirmation(
     if not sensitive:
         return None
     fields = sorted(str(key) for key in changes)
+    try:
+        encoded_changes = json.dumps(
+            changes,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return _blocked_response(
+            PolicyDecision(
+                True,
+                "authorization",
+                "work update changes cannot be bound to an exact approval",
+            )
+        )
+    changes_digest = hashlib.sha256(encoded_changes).hexdigest()
     return {
         "action": "approve",
         "message": (
             "Confirm this terminal or hierarchy-changing Operator work update: "
-            f"{work_id.strip()} ({', '.join(fields)})"
+            f"{work_id.strip()} version {expected_version} ({', '.join(fields)})"
         ),
-        "rule_key": f"operator_update_work:{work_id.strip()}:{status or 'parent'}",
+        "rule_key": (
+            f"operator_update_work:{work_id.strip()}:v{expected_version}:"
+            f"{changes_digest[:16]}"
+        ),
     }
 
 

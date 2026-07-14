@@ -185,7 +185,8 @@ Controls:
 - Passing requires specific evidence and confidence of at least `0.75`.
 - Native artifact declarations and protected verification contracts are checked by a deterministic, model-free gate. Paths are confined to configured roots; traversal, symlinks, special files, missing content, type or digest mismatches, and byte/count overruns fail closed.
 - Canonical contracts may name only deployment-approved fixed-argv checks with bounded cwd, environment, timeout, and output. Worker evidence cannot select a check.
-- An applicable deterministic failure overrides a model's passed verdict after exact card, run, attempt, and fingerprint binding.
+- Filesystem hashing and fixed checks execute once outside SQLite write transactions. Their report is bound to work version, execution scope, card, run, attempt, fingerprint, canonical result, verification inputs, and artifact digests before fast transactional application.
+- An applicable deterministic failure overrides a model's passed verdict after exact binding validation.
 - Failed verification is persisted and the same evidence cannot automatically regress it to review.
 
 Residual risk: existence, hashing, and a successful configured check do not prove arbitrary semantic correctness. A compromised worker may also influence project-defined test scripts. Keep verifier commands deployment-owned, run them under a restricted identity, and use human review for consequential or subjective output.

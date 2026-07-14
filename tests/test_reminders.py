@@ -85,9 +85,41 @@ class ReminderLifecycleTests(unittest.TestCase):
             until=until,
         )
 
-        self.assertEqual(snoozed.due_at, until)
+        self.assertEqual(snoozed.due_at, "2020-01-01T09:00:00Z")
+        self.assertEqual(snoozed.reminder_snoozed_until, until)
         self.assertIsNone(snoozed.reminder_last_delivered_at)
         self.assertEqual(self.store.claim_due_reminders(), [])
+
+    def test_snooze_does_not_shift_the_recurring_schedule(self) -> None:
+        original_due = "2026-07-14T09:00:00Z"
+        reminder = WorkItem(
+            title="Daily review",
+            kind=WorkKind.REMINDER,
+            status=WorkStatus.READY,
+            due_at=original_due,
+            recurrence_rule="P1D",
+        )
+        self.store.create_work(reminder)
+        snooze_until = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+
+        snoozed = self.store.resolve_reminder(
+            reminder.id,
+            action="snooze",
+            expected_version=reminder.version,
+            until=snooze_until,
+        )
+        completed = self.store.resolve_reminder(
+            reminder.id,
+            action="complete",
+            expected_version=snoozed.version,
+        )
+
+        self.assertEqual(snoozed.due_at, original_due)
+        self.assertEqual(snoozed.reminder_snoozed_until, snooze_until)
+        self.assertIsNone(completed.reminder_snoozed_until)
+        next_due = datetime.fromisoformat(completed.due_at.replace("Z", "+00:00"))
+        self.assertEqual(next_due.hour, 9)
+        self.assertGreater(next_due, datetime.now(UTC))
 
     def test_complete_rolls_recurring_reminder_and_finishes_one_shot(self) -> None:
         recurring = WorkItem(

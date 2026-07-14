@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.coverage
+build
+dist
+data
+*.db
+*.db-shm
+*.db-wal
+.env
+operator.toml

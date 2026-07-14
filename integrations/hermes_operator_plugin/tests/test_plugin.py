@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from threading import Event, Thread
 import unittest
 from unittest.mock import patch
@@ -354,11 +355,31 @@ class ClientTests(unittest.TestCase):
             ),
             ("POST", "/v1/hermes/work/wrk_1/authorize"): (
                 202,
-                {"work_id": "wrk_1", "event_id": "evt_2", "created": True},
+                {
+                    "work_id": "wrk_1",
+                    "work_version": 1,
+                    "authorization_scope_revision": 1,
+                    "authorization_scope_digest": "b" * 64,
+                    "profile": "test-profile",
+                    "skills": ["operator-workflow"],
+                    "goal_mode": False,
+                    "event_id": "evt_2",
+                    "created": True,
+                },
             ),
             ("POST", "/v1/hermes/work/wrk_1/update"): (
                 200,
                 {"work": {"id": "wrk_1", "version": 2, "priority": 8}},
+            ),
+            ("POST", "/v1/hermes/work/wrk_1/reminder"): (
+                200,
+                {
+                    "work": {
+                        "id": "wrk_1",
+                        "version": 2,
+                        "reminder_snoozed_until": "2026-07-21T09:00:00+00:00",
+                    }
+                },
             ),
             ("POST", "/v1/hermes/inbound"): (
                 202,
@@ -379,11 +400,29 @@ class ClientTests(unittest.TestCase):
                 "wrk_1",
             )
             self.assertEqual(client.answer_question("q_1", "Blue")["status"], "answered")
-            self.assertTrue(client.authorize_work("wrk_1")["created"])
+            self.assertTrue(
+                client.authorize_work(
+                    "wrk_1",
+                    1,
+                    "Approved scope",
+                    profile="test-profile",
+                    skills=["operator-workflow"],
+                    goal_mode=False,
+                )["created"]
+            )
             self.assertEqual(client.update_work("wrk_1", 1, {"priority": 8})["work"]["version"], 2)
             self.assertEqual(
                 client.update_work("wrk_1", 1, {"recurrence_rule": "pt2h"})["work"]["version"],
                 2,
+            )
+            self.assertEqual(
+                client.resolve_reminder(
+                    "wrk_1",
+                    1,
+                    "snooze",
+                    until="2026-07-21T09:00:00+00:00",
+                )["work"]["reminder_snoozed_until"],
+                "2026-07-21T09:00:00+00:00",
             )
             self.assertEqual(
                 client.ingest_inbound(
@@ -403,7 +442,35 @@ class ClientTests(unittest.TestCase):
             for item in RecordingHandler.requests
             if item["path"] == "/v1/hermes/attention/claim"
         )
+        authorization_request = next(
+            item
+            for item in RecordingHandler.requests
+            if item["path"] == "/v1/hermes/work/wrk_1/authorize"
+        )
+        self.assertEqual(
+            authorization_request["body"],
+            {
+                "expected_version": 1,
+                "reason": "Approved scope",
+                "profile": "test-profile",
+                "skills": ["operator-workflow"],
+                "goal_mode": False,
+            },
+        )
         self.assertEqual(claim_request["body"], {"limit": 12})
+        reminder_request = next(
+            item
+            for item in RecordingHandler.requests
+            if item["path"] == "/v1/hermes/work/wrk_1/reminder"
+        )
+        self.assertEqual(
+            reminder_request["body"],
+            {
+                "expected_version": 1,
+                "action": "snooze",
+                "until": "2026-07-21T09:00:00+00:00",
+            },
+        )
         create_request = next(
             item
             for item in RecordingHandler.requests
@@ -424,6 +491,16 @@ class ClientTests(unittest.TestCase):
                     )
         with self.assertRaises(ValueError):
             client.create_work(title="Not reminder", recurrence_rule="P1D")
+
+    def test_client_rejects_unversioned_or_malformed_authorization(self):
+        client = client_module.OperatorClient(make_config())
+        for version in (0, -1, True, "1"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                client.authorize_work("wrk_1", version)
+        with self.assertRaises(ValueError):
+            client.authorize_work("wrk_1", 1, skills=[""])
+        with self.assertRaises(ValueError):
+            client.authorize_work("wrk_1", 1, goal_mode="false")
 
     def test_lifecycle_envelope_is_internal_and_deduplicated(self):
         routes = {
@@ -605,13 +682,78 @@ class ToolAndContextTests(unittest.TestCase):
         self.assertEqual(client.calls[0], ("claim", 7))
         self.assertEqual(client.calls[1][1]["recurrence_rule"], "P1W")
 
-    def test_snooze_command_updates_due_at(self):
+    def test_authorize_handler_and_command_forward_exact_scope(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def authorize_work(
+                self,
+                work_id,
+                expected_version,
+                reason,
+                *,
+                profile=None,
+                skills=None,
+                goal_mode=None,
+            ):
+                self.calls.append(
+                    (
+                        work_id,
+                        expected_version,
+                        reason,
+                        profile,
+                        skills,
+                        goal_mode,
+                    )
+                )
+                return {"work_id": work_id, "work_version": expected_version}
+
+        client = Client()
+        result = json.loads(
+            tools_module.authorize_work(
+                client,
+                {
+                    "work_id": "wrk_1",
+                    "expected_version": 4,
+                    "reason": "Scope reviewed",
+                    "profile": "research",
+                    "skills": ["operator-workflow"],
+                    "goal_mode": True,
+                },
+            )
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            client.calls[0],
+            (
+                "wrk_1",
+                4,
+                "Scope reviewed",
+                "research",
+                ["operator-workflow"],
+                True,
+            ),
+        )
+        with patch.object(plugin, "_client", return_value=client):
+            command = json.loads(
+                plugin._command("authorize wrk_2 7 approved after review")
+            )
+        self.assertTrue(command["success"])
+        self.assertEqual(
+            client.calls[1],
+            ("wrk_2", 7, "approved after review", None, None, None),
+        )
+
+    def test_snooze_command_uses_reminder_lifecycle_without_moving_schedule(self):
         class Client:
             def __init__(self):
                 self.args = None
 
-            def update_work(self, work_id, expected_version, changes):
-                self.args = (work_id, expected_version, changes)
+            def resolve_reminder(
+                self, work_id, expected_version, action, *, until=None
+            ):
+                self.args = (work_id, expected_version, action, until)
                 return {"work": {"id": work_id, "version": expected_version + 1}}
 
         client = Client()
@@ -627,7 +769,8 @@ class ToolAndContextTests(unittest.TestCase):
             (
                 "wrk_1",
                 3,
-                {"due_at": "2026-07-21T09:00:00+00:00"},
+                "snooze",
+                "2026-07-21T09:00:00+00:00",
             ),
         )
 
@@ -1250,13 +1393,46 @@ class PolicyTests(unittest.TestCase):
     def test_non_kanban_sessions_defer_to_native_hermes_approval(self):
         guard = policy_module.TaskScopedPolicyGuard(delegation_mode="background")
         with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(guard("delegate_task", {"goal": "Research"}))
-            self.assertIsNone(guard("mcp_google_gmail_search", {"query": "is:unread"}))
-            self.assertIsNone(guard("obsidian_write_note", {"path": "Daily.md"}))
-            cron = guard("cronjob", {"action": "create"})
-            send = guard("mcp_google_gmail_send_email", {"to": "a@example.com"})
+            # Hermes 0.18.2 creates and propagates a UUID for ordinary turns even
+            # though they are not dispatcher-spawned Kanban workers.
+            ordinary_turn_id = "8b5ebaca-e7bd-44bb-896f-61dcbb518f89"
+            self.assertIsNone(
+                guard("delegate_task", {"goal": "Research"}, task_id=ordinary_turn_id)
+            )
+            self.assertIsNone(
+                guard(
+                    "mcp_google_gmail_search",
+                    {"query": "is:unread"},
+                    task_id=ordinary_turn_id,
+                )
+            )
+            self.assertIsNone(
+                guard(
+                    "obsidian_write_note",
+                    {"path": "Daily.md"},
+                    task_id=ordinary_turn_id,
+                )
+            )
+            cron = guard("cronjob", {"action": "create"}, task_id=ordinary_turn_id)
+            send = guard(
+                "mcp_google_gmail_send_email",
+                {"to": "a@example.com"},
+                task_id=ordinary_turn_id,
+            )
         self.assertEqual(cron["action"], "approve")
         self.assertEqual(send["action"], "approve")
+
+    def test_managed_marker_requires_an_exact_hook_identity(self):
+        guard = policy_module.TaskScopedPolicyGuard()
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "task-1"}, clear=True):
+            missing = guard("read_file", {"path": "README.md"})
+            mismatch = guard(
+                "read_file", {"path": "README.md"}, task_id="ordinary-turn-uuid"
+            )
+            malformed = guard("read_file", {"path": "README.md"}, task_id=123)
+        for result in (missing, mismatch, malformed):
+            self.assertEqual(result["action"], "block")
+            self.assertIn("identity", result["message"])
 
     def test_operator_managed_completion_rejects_artifact_delivery_fields(self):
         contract = self.contract()
@@ -1264,6 +1440,8 @@ class PolicyTests(unittest.TestCase):
             {"task_id": "task-1", "artifacts": ["report.pdf"]},
             {"task_id": "task-1", "metadata": {"artifacts": ["report.pdf"]}},
             {"task_id": "task-1", "metadata": {"attachments": ["report.pdf"]}},
+            {"task_id": "task-1", "summary": ["/tmp/report.pdf"]},
+            {"task_id": "task-1", "result": {"path": "/tmp/report.pdf"}},
         ):
             with self.subTest(args=args):
                 decision = policy_module.evaluate_tool_call(
@@ -1275,13 +1453,75 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(decision.blocked)
                 self.assertEqual(decision.category, "sharing")
 
+    def test_managed_completion_rejects_workspace_paths_in_prose(self):
+        contract = self.contract()
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "task-1"
+            workspace.mkdir()
+            artifact = workspace / "report.pdf"
+            artifact.write_bytes(b"report")
+            base_env = {
+                "HERMES_KANBAN_TASK": "task-1",
+                "HERMES_KANBAN_WORKSPACE": str(workspace),
+                "HERMES_KANBAN_WORKSPACES_ROOT": root,
+            }
+            for field in ("summary", "result"):
+                with self.subTest(field=field), patch.dict(
+                    os.environ, base_env, clear=True
+                ):
+                    decision = policy_module.evaluate_tool_call(
+                        "kanban_complete",
+                        {"task_id": "task-1", field: f"Created {artifact}."},
+                        current_task_id="task-1",
+                        execution_contract=contract,
+                    )
+                self.assertTrue(decision.blocked)
+                self.assertEqual(decision.category, "sharing")
+                self.assertIn("notification attachments", decision.detail)
+
+            # A user-set label cannot silently authorize delivery because Hermes does
+            # not provide the authenticated notification recipient to this hook.
+            with patch.dict(
+                os.environ,
+                {**base_env, "HERMES_OPERATOR_PRIVATE_ARTIFACT_SINK": "private-chat"},
+                clear=True,
+            ):
+                still_blocked = policy_module.evaluate_tool_call(
+                    "kanban_complete",
+                    {"task_id": "task-1", "summary": str(artifact)},
+                    current_task_id="task-1",
+                    execution_contract=contract,
+                )
+            self.assertTrue(still_blocked.blocked)
+
+    def test_managed_completion_allows_non_workspace_prose_paths(self):
+        contract = self.contract()
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ,
+            {
+                "HERMES_KANBAN_TASK": "task-1",
+                "HERMES_KANBAN_WORKSPACE": str(Path(root) / "task-1"),
+            },
+            clear=True,
+        ):
+            decision = policy_module.evaluate_tool_call(
+                "kanban_complete",
+                {"task_id": "task-1", "summary": "Reviewed /docs/architecture.md"},
+                current_task_id="task-1",
+                execution_contract=contract,
+            )
+        self.assertFalse(decision.blocked)
+
     def test_conversational_answer_authorize_and_terminal_update_use_native_approval(self):
         guard = policy_module.TaskScopedPolicyGuard()
         with patch.dict(os.environ, {}, clear=True):
             answer = guard(
                 "operator_answer_question", {"question_id": "q_1", "answer": "Blue"}
             )
-            authorize = guard("operator_authorize_work", {"work_id": "wrk_1"})
+            authorize = guard(
+                "operator_authorize_work",
+                {"work_id": "wrk_1", "expected_version": 3},
+            )
             reversible = guard(
                 "operator_update_work",
                 {"work_id": "wrk_1", "expected_version": 1, "changes": {"priority": 9}},
@@ -1292,8 +1532,78 @@ class PolicyTests(unittest.TestCase):
             )
         self.assertEqual(answer["action"], "approve")
         self.assertEqual(authorize["action"], "approve")
+        self.assertIn("version 3", authorize["message"])
         self.assertIsNone(reversible)
         self.assertEqual(terminal["action"], "approve")
+
+    def test_native_authorization_approval_key_binds_version_and_execution_shape(self):
+        guard = policy_module.TaskScopedPolicyGuard()
+        with patch.dict(os.environ, {}, clear=True):
+            version_three = guard(
+                "operator_authorize_work",
+                {"work_id": "wrk_1", "expected_version": 3},
+                task_id="ordinary-turn-1",
+            )
+            version_four = guard(
+                "operator_authorize_work",
+                {"work_id": "wrk_1", "expected_version": 4},
+                task_id="ordinary-turn-2",
+            )
+            profile_override = guard(
+                "operator_authorize_work",
+                {
+                    "work_id": "wrk_1",
+                    "expected_version": 3,
+                    "profile": "research",
+                    "skills": ["operator-workflow"],
+                    "goal_mode": True,
+                },
+                task_id="ordinary-turn-3",
+            )
+            missing_version = guard(
+                "operator_authorize_work",
+                {"work_id": "wrk_1"},
+                task_id="ordinary-turn-4",
+            )
+        self.assertNotEqual(version_three["rule_key"], version_four["rule_key"])
+        self.assertNotEqual(version_three["rule_key"], profile_override["rule_key"])
+        self.assertIn("profile=research", profile_override["message"])
+        self.assertEqual(missing_version["action"], "block")
+
+    def test_native_question_and_sensitive_update_approval_keys_bind_exact_input(self):
+        guard = policy_module.TaskScopedPolicyGuard()
+        with patch.dict(os.environ, {}, clear=True):
+            answer_one = guard(
+                "operator_answer_question",
+                {"question_id": "q_1", "answer": "Blue"},
+                task_id="ordinary-turn-1",
+            )
+            answer_two = guard(
+                "operator_answer_question",
+                {"question_id": "q_1", "answer": "Green"},
+                task_id="ordinary-turn-2",
+            )
+            update_one = guard(
+                "operator_update_work",
+                {
+                    "work_id": "wrk_1",
+                    "expected_version": 4,
+                    "changes": {"status": "done"},
+                },
+                task_id="ordinary-turn-3",
+            )
+            update_two = guard(
+                "operator_update_work",
+                {
+                    "work_id": "wrk_1",
+                    "expected_version": 5,
+                    "changes": {"status": "done"},
+                },
+                task_id="ordinary-turn-4",
+            )
+        self.assertNotEqual(answer_one["rule_key"], answer_two["rule_key"])
+        self.assertNotEqual(update_one["rule_key"], update_two["rule_key"])
+        self.assertIn("version 4", update_one["message"])
 
     def test_managed_worker_cannot_use_conversational_authority_or_intake_tools(self):
         contract = self.contract()
@@ -1302,22 +1612,26 @@ class PolicyTests(unittest.TestCase):
             expected_profile="test-profile",
             delegation_mode="background",
         )
-        for name, args in (
-            ("operator_create_work", {"title": "Invent follow-up"}),
-            (
-                "operator_ingest_inbound",
-                {"source": "google.gmail", "events": []},
-            ),
-            (
-                "operator_answer_question",
-                {"question_id": "qst_1", "answer": "guess"},
-            ),
-            ("operator_authorize_work", {"work_id": "wrk_1"}),
-        ):
-            with self.subTest(name=name):
-                result = guard(name, args, task_id="task-1")
-                self.assertEqual(result["action"], "block")
-                self.assertIn("authorization", result["message"])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "task-1"}, clear=True):
+            for name, args in (
+                ("operator_create_work", {"title": "Invent follow-up"}),
+                (
+                    "operator_ingest_inbound",
+                    {"source": "google.gmail", "events": []},
+                ),
+                (
+                    "operator_answer_question",
+                    {"question_id": "qst_1", "answer": "guess"},
+                ),
+                (
+                    "operator_authorize_work",
+                    {"work_id": "wrk_1", "expected_version": 1},
+                ),
+            ):
+                with self.subTest(name=name):
+                    result = guard(name, args, task_id="task-1")
+                    self.assertEqual(result["action"], "block")
+                    self.assertIn("authorization", result["message"])
 
     def test_guard_allows_only_one_delegation_batch_per_canonical_run(self):
         contract = self.contract()
@@ -1613,19 +1927,25 @@ class PolicyTests(unittest.TestCase):
 
 
 class FakeManager:
-    def __init__(self):
-        self._hooks = {}
+    def __init__(self, existing_pre_tool_hooks=()):
+        self._hooks = {"pre_tool_call": list(existing_pre_tool_hooks)}
 
 
 class FakeContext:
-    def __init__(self, rejected_hook=None):
+    def __init__(
+        self,
+        rejected_hook=None,
+        *,
+        profile_name="default",
+        existing_pre_tool_hooks=(),
+    ):
         self.tools = []
         self.hooks = []
         self.commands = []
         self.skills = []
         self.rejected_hook = rejected_hook
-        self.profile_name = "default"
-        self._manager = FakeManager()
+        self.profile_name = profile_name
+        self._manager = FakeManager(existing_pre_tool_hooks)
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
@@ -1641,6 +1961,33 @@ class FakeContext:
 
     def register_skill(self, name, path):
         self.skills.append((name, path))
+
+
+class CompatibilityTests(unittest.TestCase):
+    def test_supported_hermes_target_is_exact_and_auditable(self):
+        self.assertEqual(compatibility_module.SUPPORTED_HERMES_VERSION, "0.18.2")
+        self.assertEqual(compatibility_module.SUPPORTED_HERMES_TAG, "v2026.7.7.2")
+        self.assertRegex(
+            compatibility_module.SUPPORTED_HERMES_COMMIT, r"^[0-9a-f]{40}$"
+        )
+
+    def test_only_positive_incompatibility_evidence_blocks_bridge(self):
+        unknown = {
+            "configured_profile_match": None,
+            "pre_tool_directive_semantics": "unknown",
+            "guard_hook_position": None,
+        }
+        self.assertEqual(compatibility_module.bridge_activation_blockers(unknown), ())
+
+        both = {
+            "configured_profile_match": False,
+            "pre_tool_directive_semantics": "first_valid",
+            "guard_hook_position": None,
+        }
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(both),
+            ("active_profile_mismatch", "operator_guard_not_first"),
+        )
 
 
 class RegistrationTests(unittest.TestCase):
@@ -1867,7 +2214,7 @@ class RegistrationTests(unittest.TestCase):
                 },
                 clear=True,
             ):
-                ctx = FakeContext()
+                ctx = FakeContext(profile_name="research")
                 plugin.register(ctx)
         self.assertEqual(len(ctx.tools), 11)
         attestation = RecordingHandler.requests[0]["body"]
@@ -1885,6 +2232,86 @@ class RegistrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(attestation["payload"]["policy_digest"]), 64)
+
+    def test_known_profile_mismatch_refuses_attestation_and_bridge_activation(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+                "HERMES_OPERATOR_PROFILE": "research",
+                "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
+                "HERMES_KANBAN_TASK": "task-1",
+            },
+            clear=True,
+        ):
+            ctx = FakeContext(profile_name="default")
+            with patch.object(
+                client_module.OperatorClient, "attest_policy"
+            ) as attest, patch.object(
+                client_module.OperatorClient, "execution_contract"
+            ) as execution_contract:
+                plugin.register(ctx)
+                guard = ctx.hooks[0][1]
+                blocked = guard(
+                    "terminal", {"command": "pytest -q"}, task_id="task-1"
+                )
+        self.assertEqual(ctx.tools, [])
+        self.assertEqual(blocked["action"], "block")
+        attest.assert_not_called()
+        execution_contract.assert_not_called()
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(plugin._diagnostics),
+            ("active_profile_mismatch",),
+        )
+
+    def test_known_first_valid_semantics_refuse_nonfirst_guard(self):
+        earlier_hook = lambda **kwargs: {"action": "approve"}
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+                "HERMES_OPERATOR_PROFILE": "default",
+                "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
+            },
+            clear=True,
+        ):
+            ctx = FakeContext(existing_pre_tool_hooks=(earlier_hook,))
+            with patch.object(
+                compatibility_module, "_pre_tool_semantics", return_value="first_valid"
+            ), patch.object(
+                client_module.OperatorClient, "attest_policy"
+            ) as attest:
+                plugin.register(ctx)
+        self.assertEqual(ctx.tools, [])
+        attest.assert_not_called()
+        self.assertEqual(plugin._diagnostics["guard_hook_position"], 2)
+        self.assertEqual(
+            compatibility_module.bridge_activation_blockers(plugin._diagnostics),
+            ("operator_guard_not_first",),
+        )
+
+    def test_first_valid_semantics_allow_guard_when_first(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_OPERATOR_BRIDGE_TOKEN": "bridge",
+                "HERMES_OPERATOR_PROFILE": "default",
+                "HERMES_OPERATOR_EMIT_LIFECYCLE": "false",
+            },
+            clear=True,
+        ):
+            ctx = FakeContext()
+            with patch.object(
+                compatibility_module, "_pre_tool_semantics", return_value="first_valid"
+            ), patch.object(
+                client_module.OperatorClient,
+                "attest_policy",
+                return_value={"accepted": True},
+            ) as attest:
+                plugin.register(ctx)
+        self.assertEqual(len(ctx.tools), 11)
+        attest.assert_called_once()
+        self.assertEqual(plugin._diagnostics["guard_hook_position"], 1)
 
     def test_attestation_failure_leaves_policy_only_mode(self):
         with patch.dict(

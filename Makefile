@@ -38,7 +38,7 @@ check:
 	$(PYTHON) -m compileall -q src integrations
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests
 	$(PYTHON) -m unittest discover -s integrations/hermes_operator_plugin/tests
-	@$(PYTHON) -c "import pathlib,sys; roots=[pathlib.Path(p) for p in ('README.md','LICENSE','Dockerfile','compose.yaml','Makefile','deploy','docs','config','scripts','src','integrations','tests')]; files=[p for root in roots for p in ([root] if root.is_file() else root.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc']; hits=[str(p) for p in files if any(mark in p.read_text(encoding='utf-8') for mark in (chr(0x2013),chr(0x2014)))]; print('Unicode dash found in: '+', '.join(hits)) if hits else None; sys.exit(bool(hits))"
+	@$(PYTHON) -c "import pathlib,sys; roots=[pathlib.Path(p) for p in ('README.md','LICENSE','Dockerfile','compose.yaml','Makefile','.github','deploy','docs','config','scripts','src','integrations','tests')]; files=[p for root in roots for p in ([root] if root.is_file() else root.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc']; hits=[str(p) for p in files if any(mark in p.read_text(encoding='utf-8') for mark in (chr(0x2013),chr(0x2014)))]; print('Unicode dash found in: '+', '.join(hits)) if hits else None; sys.exit(bool(hits))"
 
 dist: clean
 	$(PYTHON) -m pip wheel --no-deps --no-build-isolation --wheel-dir dist .

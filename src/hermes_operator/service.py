@@ -163,6 +163,13 @@ class OperatorService:
                 attention_redelivery_seconds=(
                     config.native_automation.attention_redelivery_seconds
                 ),
+                authorization_profile=(
+                    config.hermes.default_assignee or config.hermes.profile
+                ),
+                authorization_default_skills=tuple(
+                    config.hermes.default_skills
+                ),
+                authorization_goal_mode=config.hermes.goal_mode,
             )
             self.api = APIService(config.server.host, config.server.port, context)
 

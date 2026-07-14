@@ -14,7 +14,11 @@ from typing import Any
 
 from .client import OperatorClient
 from .config import ConfigurationError, PluginConfig
-from .compatibility import detect_delegate_mode, diagnose_host
+from .compatibility import (
+    bridge_activation_blockers,
+    detect_delegate_mode,
+    diagnose_host,
+)
 from .hooks import LifecycleEmitter, PolicyAttestationRefresher, build_hooks
 from .policy import (
     POLICY_DIGEST,
@@ -27,7 +31,7 @@ from . import schemas, tools
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 
 _active_refresher: PolicyAttestationRefresher | None = None
 _active_refresher_lock = Lock()
@@ -105,10 +109,18 @@ def _command(raw_args: str) -> str:
             _client(),
             {"question_id": tail[0], "answer": " ".join(tail[1:])},
         )
-    if command == "authorize" and tail:
+    if command == "authorize" and len(tail) >= 2:
+        try:
+            version = int(tail[1])
+        except ValueError:
+            version = 0
         return tools.authorize_work(
             _client(),
-            {"work_id": tail[0], "reason": " ".join(tail[1:])},
+            {
+                "work_id": tail[0],
+                "expected_version": version,
+                "reason": " ".join(tail[2:]),
+            },
         )
     if command == "done" and len(tail) == 2:
         try:
@@ -128,12 +140,13 @@ def _command(raw_args: str) -> str:
             version = int(tail[1])
         except ValueError:
             version = 0
-        return tools.update_work(
+        return tools.resolve_reminder(
             _client(),
             {
                 "work_id": tail[0],
                 "expected_version": version,
-                "changes": {"due_at": tail[2]},
+                "action": "snooze",
+                "until": tail[2],
             },
         )
     return json.dumps(
@@ -142,7 +155,7 @@ def _command(raw_args: str) -> str:
             "error": (
                 "Usage: /operator status|next|questions|reminders|diagnostics|"
                 "add <title>|remind <ISO-time> <title>|answer <question-id> <answer>|"
-                "authorize <work-id> [reason]|done <work-id> <version>|"
+                "authorize <work-id> <version> [reason]|done <work-id> <version>|"
                 "snooze <work-id> <version> <ISO-time>"
             ),
         }
@@ -184,8 +197,6 @@ def register(ctx: Any) -> None:
             exc,
         )
     guard = TaskScopedPolicyGuard(
-        client.execution_contract if client is not None else None,
-        client.claim_delegation if client is not None else None,
         expected_profile=client.config.profile if client is not None else "",
         delegation_mode=detect_delegate_mode(),
     )
@@ -196,6 +207,14 @@ def register(ctx: Any) -> None:
     global _diagnostics
     _diagnostics = diagnose_host(ctx, guard)
     if client is None:
+        return
+    activation_blockers = bridge_activation_blockers(_diagnostics)
+    if activation_blockers:
+        logger.error(
+            "Hermes operator compatibility gate refused bridge activation; "
+            "pre_tool_call policy remains active in policy-only mode: %s",
+            ", ".join(activation_blockers),
+        )
         return
 
     try:
@@ -235,6 +254,8 @@ def register(ctx: Any) -> None:
             exc,
         )
         return
+
+    guard.activate_bridge(client.execution_contract, client.claim_delegation)
 
     ctx.register_tool(
         name="operator_status",

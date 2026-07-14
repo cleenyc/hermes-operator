@@ -113,9 +113,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.3.0"]
-allowed_policy_versions = ["4.0.0"]
-allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
+allowed_plugin_versions = ["1.4.0"]
+allowed_policy_versions = ["5.0.0"]
+allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
 ```
 
 | Field | Implemented meaning |
@@ -237,7 +237,7 @@ A canonical work item may carry protected metadata like this:
 }
 ```
 
-The contract is included in the exact dispatch digest and rendered into the Hermes task. Model-authored work updates cannot replace it. Checks are selected only by this canonical contract, never by worker completion output. The dispatcher runs a preflight so the planning model can explain a deterministic failure, then the supervisor reruns the verifier after validating the exact event, card, run, attempt, and evidence fingerprint. That second result is authoritative: an applicable failure overrides a model's `passed` verdict and leaves the work blocked for correction. Text-only work with no contract and no native artifact declarations remains unaffected.
+The contract is included in the exact dispatch digest and rendered into the Hermes task. Model-authored work updates cannot replace it. Checks are selected only by this canonical contract, never by worker completion output. After the dispatcher records immutable completion evidence, the supervisor validates the exact event, card, run, attempt, and evidence fingerprint, then runs the verifier once outside every SQLite write transaction. The report is bound to the work version, canonical execution scope, run result, verification inputs, and observed artifact digests, and is cached by that completion binding. Only fast binding and report-digest validation occurs in the final state transaction. An applicable failure overrides a model's `passed` verdict and leaves the work blocked for correction. Text-only work with no contract and no native artifact declarations remains unaffected.
 
 Attach or replace a contract during explicit operator dispatch with `hermes-operator work dispatch WORK_ID --verification-contract contract.json`. The CLI validates the bounded schema, artifact-root names, and configured check names before issuing authorization. Use `--clear-verification-contract` to deliberately remove an existing contract before a fresh dispatch.
 

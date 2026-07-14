@@ -59,11 +59,11 @@ control_timeout_seconds = 10
 require_policy_attestation = true
 # The native plugin heartbeat defaults to 120 seconds. Keep this core TTL above it.
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.3.0"]
-allowed_policy_versions = ["4.0.0"]
+allowed_plugin_versions = ["1.4.0"]
+allowed_policy_versions = ["5.0.0"]
 # Exact SHA-256 of integrations/hermes_operator_plugin/policy.py in this release.
 # Recompute, review, and update this allowlist whenever that policy source changes.
-allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
+allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
 
 [obsidian]
 enabled = false

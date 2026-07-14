@@ -2,6 +2,46 @@
 
 All notable project changes are recorded in this file.
 
+## [0.3.0] - 2026-07-14
+
+### Added
+
+- Added canonical execution-scope digests and an independent authorization scope revision
+  covering work semantics, hierarchy, schedule, verification, execution profile, effective
+  skills, and goal mode.
+- Added durable work bindings for operator questions and explicit reauthorization follow-up
+  when an answer or approval becomes stale.
+- Added durable non-executable review items and operator questions for quarantined actionable
+  events.
+- Added pinned Hermes Agent `0.18.2` host-contract tests and CI against commit
+  `9de9c25f620ff7f1ce0fd5457d596052d5159596`, with an advisory current-`main` lane.
+- Added full-host coverage for ordinary turn IDs, first-valid hook resolution, and Gateway
+  completion artifact delivery.
+
+### Fixed
+
+- Treated `HERMES_KANBAN_TASK` as the authoritative managed-worker marker so ordinary Hermes
+  UUID turns retain native interactive and Cron behavior.
+- Invalidated authority when scope-bearing work or dependency state changes while preserving
+  valid approval across priority-only and runtime-only changes.
+- Moved deterministic filesystem and subprocess verification outside SQLite write
+  transactions, bound the report to immutable completion evidence, and eliminated duplicate
+  fixed-check execution.
+- Prevented actionable quarantine from reaching processed state without a durable review and
+  attention path.
+- Rejected explicit artifacts, workspace paths in completion prose, and non-string completion
+  payloads before Hermes can promote them into Gateway file delivery.
+- Disabled bridge attestation and managed execution when a known active-profile mismatch or
+  incompatible first-valid hook order is observed.
+- Preserved the recurrence schedule anchor when a reminder is snoozed.
+- Corrected read-only due-reminder previews to honor the current snooze window.
+
+### Changed
+
+- Updated the core to `0.3.0`, the native plugin to `1.4.0`, the policy contract to `5.0.0`,
+  and the database schema to version 12.
+- Expanded the release suite to 249 core tests and 88 plugin tests.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added

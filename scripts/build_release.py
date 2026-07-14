@@ -9,7 +9,7 @@ import tarfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ARCHIVE_ROOT = f"hermes-operator-{VERSION}"
 OUTPUT = ROOT / "dist" / f"hermes-operator-{VERSION}-complete.tar.gz"
 INCLUDE = (
@@ -19,6 +19,7 @@ INCLUDE = (
     "pyproject.toml",
     "Dockerfile",
     "compose.yaml",
+    ".github",
     "config",
     "deploy",
     "docs",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -8,6 +9,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
+from .authority import (
+    binding_matches_execution,
+    binding_matches_work,
+    execution_scope_binding,
+    execution_scope_digest,
+)
 from .config import AppConfig
 from .db import LeaseFenceLost, NotFound, SQLiteStore, StateConflict
 from .dispatcher import dispatch_contract_digest
@@ -27,7 +34,12 @@ from .models import (
 )
 from .prioritization import PriorityEngine
 from .prompts import SUPERVISOR_SYSTEM_PROMPT
-from .verifier import ArtifactVerifier
+from .verifier import (
+    ArtifactVerifier,
+    bind_verification_report,
+    validate_bound_verification_report,
+    verification_input_digest,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -125,6 +137,14 @@ class PassResult:
             "llm_model": self.llm_model,
             "llm_usage": self.llm_usage,
         }
+
+
+@dataclass(slots=True)
+class _CompletionVerificationContext:
+    work: WorkItem
+    event_payload: dict[str, Any]
+    completed_result: dict[str, Any]
+    binding: dict[str, Any]
 
 
 class PlanValidationError(ValueError):
@@ -275,6 +295,11 @@ def _event_authorizes(
     capability: str,
     *,
     work_id: str | None = None,
+    work: WorkItem | None = None,
+    profile: str | None = None,
+    skills: list[str] | None = None,
+    default_skills: list[str] | None = None,
+    goal_mode: bool | None = None,
 ) -> bool:
     if not _trusted_event(event):
         return False
@@ -292,18 +317,106 @@ def _event_authorizes(
         if str(payload.get("work_id", "")) != str(work_id or ""):
             return False
         raw_capabilities = payload.get("capabilities", [])
-        return isinstance(raw_capabilities, list) and capability in raw_capabilities
+        binding = payload.get("authorization_binding")
+        if (
+            not isinstance(raw_capabilities, list)
+            or capability not in raw_capabilities
+            or not isinstance(binding, dict)
+            or work is None
+            or str(binding.get("work_id", "")) != str(work_id or "")
+            or payload.get("work_version") != binding.get("work_version")
+            or payload.get("scope_revision") != binding.get("scope_revision")
+            or payload.get("scope_digest") != binding.get("scope_digest")
+        ):
+            return False
+        if capability == "dispatch" and profile is not None:
+            return binding_matches_execution(
+                binding,
+                work,
+                profile=profile,
+                skills=skills or [],
+                default_skills=default_skills or [],
+                goal_mode=bool(goal_mode),
+            )
+        return binding_matches_work(binding, work)
     if event_type == "question.answered" and capability in {"update", "dispatch"}:
-        blocking = payload.get("blocking_work_ids", [])
-        return isinstance(blocking, list) and str(work_id or "") in map(str, blocking)
+        bindings = payload.get("blocking_work_bindings", {})
+        if not isinstance(bindings, dict) or work is None:
+            return False
+        binding = bindings.get(str(work_id or ""))
+        if not isinstance(binding, dict):
+            return False
+        if capability == "dispatch":
+            if binding.get("execution_authorized") is not True:
+                return False
+            if profile is not None:
+                return binding_matches_execution(
+                    binding,
+                    work,
+                    profile=profile,
+                    skills=skills or [],
+                    default_skills=default_skills or [],
+                    goal_mode=bool(goal_mode),
+                )
+        return binding_matches_work(binding, work)
     if event_type.startswith("system."):
-        authorized_ids = payload.get("authorized_work_ids", [])
-        return (
-            isinstance(authorized_ids, list)
-            and str(work_id or "") in map(str, authorized_ids)
-            and capability in {"update", "dispatch"}
+        bindings = payload.get("authorized_work_bindings", {})
+        binding = (
+            bindings.get(str(work_id or ""))
+            if isinstance(bindings, dict)
+            else None
         )
+        if (
+            capability not in {"update", "dispatch"}
+            or not isinstance(binding, dict)
+            or work is None
+        ):
+            return False
+        if capability == "dispatch" and profile is not None:
+            return binding_matches_execution(
+                binding,
+                work,
+                profile=profile,
+                skills=skills or [],
+                default_skills=default_skills or [],
+                goal_mode=bool(goal_mode),
+            )
+        return binding_matches_work(binding, work)
     return False
+
+
+def _event_work_binding(
+    event: dict[str, Any] | None,
+    *,
+    work_id: str,
+    capability: str,
+) -> dict[str, Any] | None:
+    if not _trusted_event(event):
+        return None
+    payload = event.get("payload", {}) if event else {}
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(event.get("event_type", "")) if event else ""
+    if event_type in {"operator.work_authorized", "operator.work_updated"}:
+        capabilities = payload.get("capabilities", [])
+        binding = payload.get("authorization_binding")
+        if (
+            str(payload.get("work_id", "")) == work_id
+            and isinstance(capabilities, list)
+            and capability in capabilities
+            and isinstance(binding, dict)
+        ):
+            return binding
+        return None
+    if event_type == "question.answered":
+        bindings = payload.get("blocking_work_bindings", {})
+        binding = bindings.get(work_id) if isinstance(bindings, dict) else None
+        return binding if isinstance(binding, dict) else None
+    if event_type.startswith("system."):
+        bindings = payload.get("authorized_work_bindings", {})
+        binding = bindings.get(work_id) if isinstance(bindings, dict) else None
+        return binding if isinstance(binding, dict) else None
+    return None
 
 
 class Supervisor:
@@ -371,7 +484,7 @@ class Supervisor:
             with self.store.transaction():
                 self.leadership_guard()
                 self.priority_engine.rescore_store(self.store)
-            self._preflight_completion_events(events)
+            await self._preflight_completion_events(events, pass_id=pass_id)
             snapshot = self._snapshot_for_events(
                 self.store.snapshot(work_limit=150), events
             )
@@ -470,40 +583,269 @@ class Supervisor:
             )
             raise
 
-    def _preflight_completion_events(self, events: list[dict[str, Any]]) -> None:
-        """Attach a fresh deterministic report before the model assesses evidence.
+    @staticmethod
+    def _canonical_json_digest(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
 
-        This report is advisory context at planning time.  The same verifier is
-        run again after the event, card, fingerprint, and canonical run bindings
-        have been validated, and only that later result controls completion.
-        """
+    def _completion_verification_context(
+        self,
+        event: Mapping[str, Any],
+    ) -> _CompletionVerificationContext:
+        """Load and bind canonical completion state without filesystem access."""
+
+        if not _completion_event(dict(event)):
+            raise PlanValidationError("Deterministic verification needs a completion event")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            raise PlanValidationError("Completion evidence payload is invalid")
+        work_id = str(payload.get("work_id", ""))
+        hermes_task_id = str(payload.get("hermes_task_id", ""))
+        completion_run_id = str(payload.get("run_id", ""))
+        completion_attempt = payload.get("attempt")
+        evidence_fingerprint = str(payload.get("evidence_fingerprint", ""))
+        if (
+            not work_id
+            or not hermes_task_id
+            or not completion_run_id
+            or isinstance(completion_attempt, bool)
+            or not isinstance(completion_attempt, int)
+            or completion_attempt < 1
+            or not evidence_fingerprint
+        ):
+            raise PlanValidationError("Completion evidence has an invalid canonical binding")
+
+        work = self.store.get_work(work_id)
+        if work.hermes_task_id != hermes_task_id:
+            raise PlanValidationError(
+                f"Verification evidence is not bound to Hermes card for {work_id}"
+            )
+        hermes_metadata = work.metadata.get("hermes", {})
+        if not (
+            isinstance(hermes_metadata, dict)
+            and hermes_metadata.get("completion_fingerprint") == evidence_fingerprint
+            and hermes_metadata.get("completion_run_id") == completion_run_id
+            and hermes_metadata.get("completion_attempt") == completion_attempt
+        ):
+            raise PlanValidationError(
+                f"Verification evidence fingerprint does not match {work_id}"
+            )
+        with self.store.connection() as connection:
+            completed_run = connection.execute(
+                "SELECT result_json FROM runs WHERE id = ? AND work_item_id = ? "
+                "AND external_run_id = ? AND attempt = ? "
+                "AND status = 'completed' LIMIT 1",
+                (
+                    completion_run_id,
+                    work_id,
+                    hermes_task_id,
+                    completion_attempt,
+                ),
+            ).fetchone()
+        if completed_run is None:
+            raise PlanValidationError(
+                f"Verification evidence has no completed Hermes run for {work_id}"
+            )
+        try:
+            completed_result = json.loads(completed_run["result_json"] or "{}")
+        except (json.JSONDecodeError, TypeError) as error:
+            raise PlanValidationError(
+                f"Verification evidence has an invalid canonical run result for {work_id}"
+            ) from error
+        if not isinstance(completed_result, dict):
+            raise PlanValidationError(
+                f"Verification evidence has an invalid canonical run result for {work_id}"
+            )
+        canonical_fingerprint = str(completed_result.get("updated_at") or "")
+        if not canonical_fingerprint:
+            canonical_fingerprint = self._canonical_json_digest(completed_result)
+        if canonical_fingerprint != evidence_fingerprint:
+            raise PlanValidationError(
+                f"Verification fingerprint does not match canonical run evidence for {work_id}"
+            )
+        if work.status != WorkStatus.REVIEW:
+            raise PlanValidationError(f"Work {work_id} is not in review")
+
+        authorization = work.metadata.get("dispatch_authorization", {})
+        request = work.metadata.get("dispatch_request", {})
+        profile = (
+            _optional_text(authorization.get("profile"))
+            if isinstance(authorization, dict)
+            else None
+        ) or (
+            _optional_text(request.get("profile"))
+            if isinstance(request, dict)
+            else None
+        ) or work.assignee or self.config.hermes.default_assignee
+        raw_skills = (
+            authorization.get("skills", [])
+            if isinstance(authorization, dict)
+            else []
+        )
+        if not isinstance(raw_skills, list) or not all(
+            isinstance(value, str) for value in raw_skills
+        ):
+            raw_skills = []
+        goal_mode = (
+            request.get("goal_mode", self.config.hermes.goal_mode)
+            if isinstance(request, dict)
+            else self.config.hermes.goal_mode
+        )
+        if not isinstance(goal_mode, bool):
+            goal_mode = self.config.hermes.goal_mode
+        dispatch_digest = (
+            authorization.get("contract_digest")
+            if isinstance(authorization, dict)
+            and isinstance(authorization.get("contract_digest"), str)
+            else None
+        )
+        binding: dict[str, Any] = {
+            "schema": "hermes-operator.completion-verification.v1",
+            "event_id": str(event.get("id", "")),
+            "work_id": work.id,
+            "work_version": work.version,
+            "execution_scope_digest": execution_scope_digest(
+                work,
+                profile=str(profile or ""),
+                skills=raw_skills,
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=goal_mode,
+            ),
+            "dispatch_contract_digest": dispatch_digest,
+            "hermes_task_id": hermes_task_id,
+            "run_id": completion_run_id,
+            "attempt": completion_attempt,
+            "evidence_fingerprint": evidence_fingerprint,
+            "completion_result_digest": self._canonical_json_digest(completed_result),
+            "verification_input_digest": verification_input_digest(
+                work,
+                completed_result,
+            ),
+        }
+        binding["completion_binding_digest"] = self._canonical_json_digest(binding)
+        return _CompletionVerificationContext(
+            work=work,
+            event_payload=payload,
+            completed_result=completed_result,
+            binding=binding,
+        )
+
+    async def _preflight_completion_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        pass_id: str,
+    ) -> None:
+        """Prepare one cacheable deterministic report outside write transactions."""
 
         for event in events:
             if not _completion_event(event):
                 continue
             payload = event.get("payload")
             if not isinstance(payload, dict):
-                continue
+                raise PlanValidationError("Completion evidence payload is invalid")
             work_id = str(payload.get("work_id", ""))
-            evidence = payload.get("execution_evidence", {})
-            if not work_id or not isinstance(evidence, Mapping):
-                continue
             try:
                 work = self.store.get_work(work_id)
-                report = self.verifier.verify(
-                    work=work,
-                    completion=evidence,
-                ).to_dict()
-            except Exception as error:
-                report = {
+            except NotFound:
+                payload["deterministic_verification"] = {
                     "schema_version": 1,
                     "applicable": True,
                     "passed": False,
                     "artifacts": [],
                     "checks": [],
-                    "errors": [f"deterministic verifier error: {str(error)[:1000]}"],
+                    "errors": [
+                        "completion evidence is not bound to canonical completed work"
+                    ],
                     "verified_at": utc_now(),
                 }
+                continue
+            prior = work.metadata.get("last_verification", {})
+            if (
+                isinstance(prior, dict)
+                and prior.get("supervisor_pass") == pass_id
+                and isinstance(prior.get("deterministic"), dict)
+            ):
+                payload["deterministic_verification"] = dict(
+                    prior["deterministic"]
+                )
+                continue
+
+            try:
+                context = self._completion_verification_context(event)
+            except (NotFound, PlanValidationError):
+                # Malformed or stale completion evidence remains visible to the
+                # planner for an explicit quarantine disposition, but this
+                # unbound failure can never satisfy the transactional gate.
+                payload["deterministic_verification"] = {
+                    "schema_version": 1,
+                    "applicable": True,
+                    "passed": False,
+                    "artifacts": [],
+                    "checks": [],
+                    "errors": [
+                        "completion evidence is not bound to canonical completed work"
+                    ],
+                    "verified_at": utc_now(),
+                }
+                continue
+            cache_key = (
+                "verification.report:"
+                + str(context.binding["completion_binding_digest"])
+            )
+            cached = self.store.get_state(cache_key)
+            if isinstance(cached, Mapping):
+                try:
+                    payload["deterministic_verification"] = (
+                        validate_bound_verification_report(
+                            cached,
+                            context.binding,
+                        )
+                    )
+                    continue
+                except ValueError:
+                    logger.warning("Ignoring invalid deterministic report cache %s", cache_key)
+
+            try:
+                outcome = await asyncio.to_thread(
+                    self.verifier.verify,
+                    work=context.work,
+                    completion=context.completed_result,
+                )
+                raw_report = outcome.to_dict()
+            except Exception as error:
+                raw_report = {
+                    "schema_version": 1,
+                    "applicable": True,
+                    "passed": False,
+                    "artifacts": [],
+                    "checks": [],
+                    "errors": [
+                        f"deterministic verifier error: {str(error)[:1000]}"
+                    ],
+                    "verified_at": utc_now(),
+                }
+            report = bind_verification_report(raw_report, context.binding)
+            with self.store.transaction():
+                self.leadership_guard()
+                existing = self.store.get_state(cache_key)
+                if isinstance(existing, Mapping):
+                    try:
+                        report = validate_bound_verification_report(
+                            existing,
+                            context.binding,
+                        )
+                    except ValueError:
+                        self.store.set_state(cache_key, report)
+                else:
+                    self.store.set_state(cache_key, report)
             payload["deterministic_verification"] = report
 
     @staticmethod
@@ -1013,6 +1355,146 @@ class Supervisor:
             )
         return normalized
 
+    def _ensure_quarantine_review(
+        self,
+        *,
+        event: dict[str, Any],
+        reason: str,
+        result: PassResult,
+    ) -> tuple[str, str]:
+        """Persist one non-executable review item for a quarantined task signal."""
+
+        event_id = str(event["id"])
+        identity = hashlib.sha256(
+            f"quarantine-review:{event_id}".encode("utf-8")
+        ).hexdigest()
+        work_id = f"wrk_{identity[:24]}"
+        question_id = f"qst_{identity[24:48]}"
+        payload = event.get("payload", {})
+        try:
+            payload_text = json.dumps(
+                _bounded_context_value(payload),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            payload_text = "[payload could not be rendered safely]"
+        payload_digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        preview = payload_text[:2_000]
+        if len(payload_text) > len(preview):
+            preview += f"...[truncated {len(payload_text) - len(preview)} chars]"
+
+        try:
+            review = self.store.get_work(work_id)
+            marker = review.metadata.get("quarantine_review", {})
+            if (
+                review.source_event_id != event_id
+                or not isinstance(marker, dict)
+                or marker.get("event_id") != event_id
+            ):
+                raise StateConflict(
+                    f"Quarantine review identity collision for event {event_id}"
+                )
+        except NotFound:
+            review = WorkItem(
+                id=work_id,
+                title="Review quarantined inbound work signal",
+                kind=WorkKind.DECISION,
+                description=(
+                    "This record preserves a quarantined inbound event for human "
+                    "review. It has no execution authority.\n\n"
+                    f"Source: {str(event.get('source', 'unknown'))[:128]}\n"
+                    f"Event type: {str(event.get('event_type', 'unknown'))[:128]}\n"
+                    f"Event ID: {event_id}\n"
+                    f"Quarantine reason: {reason[:2_000]}\n"
+                    f"Payload SHA-256: {payload_digest}\n\n"
+                    "Untrusted evidence preview:\n"
+                    f"{preview}"
+                ),
+                status=WorkStatus.WAITING_INPUT,
+                source_event_id=event_id,
+                provenance={
+                    "source": str(event.get("source", "unknown"))[:128],
+                    "event_id": event_id,
+                    "trust_level": str(event.get("trust_level", "untrusted")),
+                },
+                priority=100,
+                impact=0.7,
+                urgency=0.9,
+                risk=0.8,
+                confidence=0.2,
+                effort_minutes=10,
+                execution_mode=ExecutionMode.NONE,
+                metadata={
+                    "governance": {
+                        "source_trust": str(
+                            event.get("trust_level", TrustLevel.UNTRUSTED.value)
+                        ),
+                        "creation_authorized": False,
+                        "update_authorized": False,
+                        "execution_authorized": False,
+                    },
+                    "quarantine_review": {
+                        "event_id": event_id,
+                        "source": str(event.get("source", "unknown"))[:128],
+                        "event_type": str(event.get("event_type", "unknown"))[:128],
+                        "payload_digest": payload_digest,
+                        "reason": reason[:2_000],
+                    },
+                },
+            )
+            self.store.create_work(review, actor=self.worker_id)
+            result.created_work_ids.append(review.id)
+
+        try:
+            existing_question = self.store.get_question(question_id)
+            if work_id not in map(
+                str, existing_question.get("blocking_work_ids", [])
+            ):
+                raise StateConflict(
+                    f"Quarantine question identity collision for event {event_id}"
+                )
+        except NotFound:
+            binding = execution_scope_binding(
+                review,
+                profile=review.assignee or self.config.hermes.default_assignee,
+                skills=[],
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=self.config.hermes.goal_mode,
+                execution_authorized=False,
+            )
+            self.store.create_question(
+                UserQuestion(
+                    id=question_id,
+                    question=(
+                        f"Review quarantined event {event_id}: should it become "
+                        "work, be dismissed, or be corrected?"
+                    ),
+                    context=(
+                        f"The event remains stored in review item {work_id}. "
+                        f"Source: {str(event.get('source', 'unknown'))[:128]}; "
+                        f"type: {str(event.get('event_type', 'unknown'))[:128]}. "
+                        "Inspect the untrusted evidence before granting any authority."
+                    ),
+                    urgency=0.9,
+                    blocking_work_ids=[work_id],
+                    blocking_work_bindings={work_id: binding},
+                ),
+                actor=self.worker_id,
+            )
+        if question_id not in result.question_ids:
+            result.question_ids.append(question_id)
+        self.store.audit(
+            self.worker_id,
+            "quarantine.review_ensured",
+            entity_type="event",
+            entity_id=event_id,
+            data={"work_id": work_id, "question_id": question_id},
+        )
+        return work_id, question_id
+
     def _resolve_event_dispositions(
         self,
         *,
@@ -1082,21 +1564,20 @@ class Supervisor:
                 references.get(str(value), str(value))
                 for value in proposal.get("blocking_work_ids", [])
             ]
-            identity = json.dumps(
-                {
-                    "question": str(proposal.get("question", "")).strip(),
-                    "context": str(proposal.get("context", "")).strip(),
-                    "blocking_work_ids": sorted(map(str, blocking)),
-                    "source_event_id": source_event_id,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            question_id = "qst_" + hashlib.sha256(identity.encode()).hexdigest()[:24]
-            if question_id in result.question_ids:
-                question_effects[source_event_id].append(question_id)
+            for question_id in result.question_ids:
+                try:
+                    created_question = self.store.get_question(question_id)
+                except NotFound:
+                    continue
+                if (
+                    created_question["question"]
+                    == str(proposal.get("question", "")).strip()
+                    and created_question["context"]
+                    == str(proposal.get("context", ""))
+                    and sorted(map(str, created_question["blocking_work_ids"]))
+                    == sorted(map(str, blocking))
+                ):
+                    question_effects[source_event_id].append(question_id)
 
         for candidate in plan["memory_candidates"]:
             source_event_id = _optional_text(candidate.get("source_event_id"))
@@ -1171,6 +1652,15 @@ class Supervisor:
                 raise PlanValidationError(
                     f"Task-like event {event_id} cannot be dismissed as non-actionable"
                 )
+            if outcome == "quarantined" and _task_like_event(event):
+                review_work_id, review_question_id = self._ensure_quarantine_review(
+                    event=event,
+                    reason=str(disposition["reason"]).strip(),
+                    result=result,
+                )
+                related_work_ids.add(review_work_id)
+                if review_question_id not in related_question_ids:
+                    related_question_ids.append(review_question_id)
             resolved_dispositions.append(
                 {
                     "event_id": event_id,
@@ -1211,6 +1701,7 @@ class Supervisor:
         reference_update_authority: dict[str, bool] = {}
         reference_execution_authority: dict[str, bool] = {}
         reference_reused: dict[str, bool] = {}
+        updated_authority_sources: dict[str, str] = {}
         version_lineage: dict[str, tuple[int, int]] = {}
 
         def effective_version(work_id: str, planned_version: int) -> int:
@@ -1234,6 +1725,134 @@ class Supervisor:
                 (planned_version, planned_version),
             )[0]
             version_lineage[work_id] = (initial_version, current_version)
+
+        def question_binding(work: WorkItem) -> dict[str, Any]:
+            prior = work.metadata.get("dispatch_authorization", {})
+            request = work.metadata.get("dispatch_request", {})
+            profile = (
+                _optional_text(prior.get("profile"))
+                if isinstance(prior, dict)
+                else None
+            ) or work.assignee or self.config.hermes.default_assignee
+            raw_skills = (
+                prior.get("skills", []) if isinstance(prior, dict) else []
+            )
+            skills = (
+                [str(value) for value in raw_skills]
+                if isinstance(raw_skills, list)
+                and all(isinstance(value, str) for value in raw_skills)
+                else []
+            )
+            goal_mode = (
+                request.get("goal_mode", self.config.hermes.goal_mode)
+                if isinstance(request, dict)
+                else self.config.hermes.goal_mode
+            )
+            governance = work.metadata.get("governance", {})
+            return execution_scope_binding(
+                work,
+                profile=str(profile or ""),
+                skills=skills,
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=bool(goal_mode),
+                execution_authorized=bool(
+                    isinstance(governance, dict)
+                    and governance.get("execution_authorized") is True
+                ),
+            )
+
+        def record_stale_authority_followup(
+            event: dict[str, Any] | None,
+            work: WorkItem,
+            capability: str,
+            *,
+            profile: str | None = None,
+            skills: list[str] | None = None,
+            goal_mode: bool | None = None,
+        ) -> None:
+            binding = _event_work_binding(
+                event,
+                work_id=work.id,
+                capability=capability,
+            )
+            event_type = str(event.get("event_type", "")) if event else ""
+            payload = event.get("payload", {}) if event else {}
+            malformed_explicit_authorization = bool(
+                event_type in {"operator.work_authorized", "operator.work_updated"}
+                and isinstance(payload, dict)
+                and str(payload.get("work_id", "")) == work.id
+                and capability in payload.get("capabilities", [])
+                and binding is None
+            )
+            if binding is None and not malformed_explicit_authorization:
+                return
+            if (
+                event_type == "question.answered"
+                and capability == "dispatch"
+                and isinstance(binding, dict)
+                and binding.get("execution_authorized") is not True
+            ):
+                # Answering context cannot elevate planning-only work into
+                # executable work. This is an expected denial, not stale auth.
+                return
+            if isinstance(binding, dict) and binding_matches_work(binding, work):
+                if capability != "dispatch" or profile is None:
+                    return
+                if binding_matches_execution(
+                    binding,
+                    work,
+                    profile=profile,
+                    skills=skills or [],
+                    default_skills=self.config.hermes.default_skills,
+                    goal_mode=bool(goal_mode),
+                ):
+                    return
+                reason = "The approved executor profile, skills, or goal mode changed"
+            elif malformed_explicit_authorization:
+                reason = "The authorization binding was missing or malformed"
+            else:
+                reason = "The work execution scope changed after approval"
+            source_event_id = str(event.get("id", "unknown")) if event else "unknown"
+            identity = json.dumps(
+                ["stale-authority", source_event_id, work.id, capability, reason],
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            question_id = "qst_" + hashlib.sha256(
+                identity.encode("utf-8")
+            ).hexdigest()[:24]
+            try:
+                self.store.get_question(question_id)
+            except NotFound:
+                self.store.create_question(
+                    UserQuestion(
+                        id=question_id,
+                        question=(
+                            f"Review and explicitly reauthorize the current scope of "
+                            f"work {work.id} before {capability}."
+                        ),
+                        context=(
+                            f"{reason}. The stale authorization event was "
+                            f"{source_event_id}; no mutation or dispatch was applied."
+                        ),
+                        urgency=max(0.8, float(work.urgency)),
+                    ),
+                    actor=self.worker_id,
+                )
+            if question_id not in result.question_ids:
+                result.question_ids.append(question_id)
+            self.store.audit(
+                self.worker_id,
+                "authorization.stale_followup_created",
+                entity_type="work",
+                entity_id=work.id,
+                data={
+                    "question_id": question_id,
+                    "source_event_id": source_event_id,
+                    "capability": capability,
+                    "reason": reason,
+                },
+            )
 
         creates = [op for op in plan["work_operations"] if op["op"] == "create"]
         pending = list(enumerate(creates))
@@ -1291,7 +1910,10 @@ class Supervisor:
                     and _optional_text(operation.get("parent_id"))
                     and not source_can_create
                     and not _event_authorizes(
-                        source_event, "update", work_id=str(parent_id)
+                        source_event,
+                        "update",
+                        work_id=str(parent_id),
+                        work=parent,
                     )
                 ):
                     parent_id = None
@@ -1497,6 +2119,7 @@ class Supervisor:
                             source_event,
                             "update",
                             work_id=item.id,
+                            work=item,
                         )
                     )
                 )
@@ -1526,10 +2149,16 @@ class Supervisor:
                 source_event_id = _optional_text(operation.get("source_event_id"))
                 source_event = event_by_id.get(source_event_id or "")
                 operation_trusted = _event_authorizes(
-                    source_event, "update", work_id=work_id
+                    source_event,
+                    "update",
+                    work_id=work_id,
+                    work=work_before,
                 )
                 trusted_source_authorization = _event_authorizes(
-                    source_event, "dispatch", work_id=work_id
+                    source_event,
+                    "dispatch",
+                    work_id=work_id,
+                    work=work_before,
                 )
                 governance = work_before.metadata.get("governance", {})
                 execution_authorized = bool(
@@ -1545,6 +2174,11 @@ class Supervisor:
                     # not turn a planning-only item into executable work.
                     trusted_source_authorization = False
                 if events and not operation_trusted:
+                    record_stale_authority_followup(
+                        source_event,
+                        work_before,
+                        "update",
+                    )
                     self.store.audit(
                         self.worker_id,
                         "work.update_quarantined",
@@ -1616,7 +2250,12 @@ class Supervisor:
                     changes["metadata"] = merged_metadata
                 target_status = changes.get("status")
                 trusted_terminal_event = any(
-                    _event_authorizes(event, "update", work_id=work_id)
+                    _event_authorizes(
+                        event,
+                        "update",
+                        work_id=work_id,
+                        work=work_before,
+                    )
                     and str(event.get("payload", {}).get("work_id", "")) == work_id
                     for event in events
                 )
@@ -1636,6 +2275,8 @@ class Supervisor:
                 )
                 record_version(work_id, planned_version, updated.version)
                 result.updated_work_ids.append(updated.id)
+                if operation_trusted and source_event_id:
+                    updated_authority_sources[work_id] = source_event_id
             elif operation["op"] == "link":
                 if not events:
                     self.store.audit(
@@ -1660,15 +2301,27 @@ class Supervisor:
                 to_ref = str(operation.get("to_ref", ""))
                 link_source_id = _optional_text(operation.get("source_event_id"))
                 link_source = event_by_id.get(link_source_id or "")
+                from_work = self.store.get_work(from_id)
+                to_work = self.store.get_work(to_id)
                 from_authorized = (
                     reference_update_authority.get(from_ref, False)
                     if from_ref
-                    else _event_authorizes(link_source, "update", work_id=from_id)
+                    else _event_authorizes(
+                        link_source,
+                        "update",
+                        work_id=from_id,
+                        work=from_work,
+                    )
                 )
                 to_authorized = (
                     reference_update_authority.get(to_ref, False)
                     if to_ref
-                    else _event_authorizes(link_source, "update", work_id=to_id)
+                    else _event_authorizes(
+                        link_source,
+                        "update",
+                        work_id=to_id,
+                        work=to_work,
+                    )
                 )
                 if not (from_authorized and to_authorized):
                     self.store.audit(
@@ -1709,35 +2362,34 @@ class Supervisor:
         for index, proposal in enumerate(plan["questions"]):
             blocking = [references.get(value, value) for value in proposal.get("blocking_work_ids", [])]
             question_source_id = _optional_text(proposal.get("source_event_id"))
-            question_identity = json.dumps(
-                {
-                    "question": str(proposal.get("question", "")).strip(),
-                    "context": str(proposal.get("context", "")).strip(),
-                    "blocking_work_ids": sorted(map(str, blocking)),
-                    "source_event_id": question_source_id,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            deterministic = hashlib.sha256(question_identity.encode()).hexdigest()[:24]
-            question_id = f"qst_{deterministic}"
             question_source = event_by_id.get(question_source_id or "")
             blocking_versions: dict[str, int | None] = {}
+            blocking_bindings: dict[str, dict[str, Any]] = {}
             if events:
                 allowed_blocking: list[str] = []
                 for raw, work_id in zip(
                     proposal.get("blocking_work_ids", []), blocking
                 ):
                     raw_text = str(raw)
-                    authorized = reference_update_authority.get(raw_text, False) or _event_authorizes(
-                        question_source, "update", work_id=str(work_id)
-                    )
+                    blocking_work = self.store.get_work(str(work_id))
+                    authorized = reference_update_authority.get(
+                        raw_text, False
+                    ) or (
+                        updated_authority_sources.get(str(work_id))
+                        == question_source_id
+                    ) or _event_authorizes(
+                            question_source,
+                            "update",
+                            work_id=str(work_id),
+                            work=blocking_work,
+                        )
                     if not authorized:
                         continue
                     if raw_text in references:
                         blocking_versions[str(work_id)] = None
+                        blocking_bindings[str(work_id)] = question_binding(
+                            blocking_work
+                        )
                         allowed_blocking.append(str(work_id))
                         continue
                     expected = proposal["blocking_work_versions"].get(
@@ -1755,10 +2407,31 @@ class Supervisor:
                         str(work_id),
                         int(expected),
                     )
+                    blocking_bindings[str(work_id)] = question_binding(
+                        blocking_work
+                    )
                     allowed_blocking.append(str(work_id))
                 blocking = allowed_blocking
             else:
                 blocking = []
+            question_identity = json.dumps(
+                {
+                    "question": str(proposal.get("question", "")).strip(),
+                    "context": str(proposal.get("context", "")).strip(),
+                    "blocking_work_ids": sorted(map(str, blocking)),
+                    "blocking_scope_digests": {
+                        work_id: binding["scope_digest"]
+                        for work_id, binding in sorted(blocking_bindings.items())
+                    },
+                    "source_event_id": question_source_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            deterministic = hashlib.sha256(question_identity.encode()).hexdigest()[:24]
+            question_id = f"qst_{deterministic}"
             try:
                 try:
                     self.store.get_question(question_id)
@@ -1772,6 +2445,7 @@ class Supervisor:
                     context=str(proposal.get("context", "")),
                     urgency=_bounded_factor(proposal.get("urgency")),
                     blocking_work_ids=blocking,
+                    blocking_work_bindings=blocking_bindings,
                 )
                 if not question.question:
                     continue
@@ -1889,92 +2563,40 @@ class Supervisor:
                 and str(event.get("payload", {}).get("hermes_task_id", ""))
                 == str(work.hermes_task_id or "")
             ]
-            if not matching_events or not work.hermes_task_id:
+            if len(matching_events) != 1 or not work.hermes_task_id:
                 raise PlanValidationError(
                     f"Verification evidence is not bound to Hermes card for {work_id}"
                 )
-            completion_payload = matching_events[0].get("payload", {})
-            if not isinstance(completion_payload, dict):
-                raise PlanValidationError(
-                    f"Verification evidence payload is invalid for {work_id}"
-                )
-            evidence_fingerprint = str(
-                completion_payload.get("evidence_fingerprint", "")
+            completion_context = self._completion_verification_context(
+                matching_events[0]
             )
-            completion_run_id = str(completion_payload.get("run_id", ""))
-            completion_attempt = completion_payload.get("attempt")
-            if (
-                not completion_run_id
-                or isinstance(completion_attempt, bool)
-                or not isinstance(completion_attempt, int)
-                or completion_attempt < 1
-            ):
-                raise PlanValidationError(
-                    f"Verification evidence has no canonical run binding for {work_id}"
+            if completion_context.work.version != work.version:
+                raise StateConflict(
+                    f"Work changed while verification was being applied: {work_id}"
                 )
-            hermes_metadata = work.metadata.get("hermes", {})
-            if not evidence_fingerprint or not (
-                isinstance(hermes_metadata, dict)
-                and hermes_metadata.get("completion_fingerprint")
-                == evidence_fingerprint
-                and hermes_metadata.get("completion_run_id") == completion_run_id
-                and hermes_metadata.get("completion_attempt") == completion_attempt
-            ):
-                raise PlanValidationError(
-                    f"Verification evidence fingerprint does not match {work_id}"
-                )
-            with self.store.connection() as connection:
-                completed_run = connection.execute(
-                    "SELECT result_json FROM runs WHERE id = ? AND work_item_id = ? "
-                    "AND external_run_id = ? AND attempt = ? "
-                    "AND status = 'completed' LIMIT 1",
-                    (
-                        completion_run_id,
-                        work_id,
-                        work.hermes_task_id,
-                        completion_attempt,
-                    ),
-                ).fetchone()
-            if completed_run is None:
-                raise PlanValidationError(
-                    f"Verification evidence has no completed Hermes run for {work_id}"
-                )
-            try:
-                completed_result = json.loads(completed_run["result_json"] or "{}")
-            except (json.JSONDecodeError, TypeError) as error:
-                raise PlanValidationError(
-                    f"Verification evidence has an invalid canonical run result for {work_id}"
-                ) from error
-            if not isinstance(completed_result, dict):
-                raise PlanValidationError(
-                    f"Verification evidence has an invalid canonical run result for {work_id}"
-                )
-            canonical_fingerprint = str(completed_result.get("updated_at") or "")
-            if not canonical_fingerprint:
-                canonical_fingerprint = hashlib.sha256(
-                    json.dumps(
-                        completed_result,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        default=str,
-                        ensure_ascii=False,
-                    ).encode("utf-8")
-                ).hexdigest()
-            if canonical_fingerprint != evidence_fingerprint:
-                raise PlanValidationError(
-                    f"Verification fingerprint does not match canonical run evidence for {work_id}"
-                )
-            if work.status != WorkStatus.REVIEW:
-                raise PlanValidationError(f"Work {work_id} is not in review")
+            completion_payload = completion_context.event_payload
+            evidence_fingerprint = str(
+                completion_context.binding["evidence_fingerprint"]
+            )
             requested_verdict = str(verification.get("verdict", ""))
             if requested_verdict not in {"passed", "failed", "needs_input"}:
                 raise PlanValidationError(
                     f"Invalid verification verdict: {requested_verdict}"
                 )
-            deterministic = self.verifier.verify(
-                work=work,
-                completion=completed_result,
-            ).to_dict()
+            prepared_report = completion_payload.get("deterministic_verification")
+            if not isinstance(prepared_report, Mapping):
+                raise PlanValidationError(
+                    f"Deterministic verification report is missing for {work_id}"
+                )
+            try:
+                deterministic = validate_bound_verification_report(
+                    prepared_report,
+                    completion_context.binding,
+                )
+            except ValueError as error:
+                raise PlanValidationError(
+                    f"Deterministic verification report is stale or invalid for {work_id}: {error}"
+                ) from error
             verdict = requested_verdict
             if (
                 requested_verdict == "passed"
@@ -2188,13 +2810,31 @@ class Supervisor:
                             ).fetchone()[0]
                         )
                     retry_authorized = latest_attempt < configured_attempts
+            event_dispatch_authorized = _event_authorizes(
+                dispatch_source,
+                "dispatch",
+                work_id=work_id,
+                work=work,
+                profile=str(candidate_profile or ""),
+                skills=candidate_skills,
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=candidate_goal_mode,
+            )
             if events and not (
-                _event_authorizes(dispatch_source, "dispatch", work_id=work_id)
+                event_dispatch_authorized
                 or reference_execution_authority.get(
                     str(dispatch.get("work_ref", "")), False
                 )
                 or retry_authorized
             ):
+                record_stale_authority_followup(
+                    dispatch_source,
+                    work,
+                    "dispatch",
+                    profile=str(candidate_profile or ""),
+                    skills=candidate_skills,
+                    goal_mode=candidate_goal_mode,
+                )
                 self.store.audit(
                     self.worker_id,
                     "dispatch.quarantined_untrusted_trigger",
@@ -2268,6 +2908,13 @@ class Supervisor:
                 default_skills=self.config.hermes.default_skills,
                 goal_mode=goal_mode,
             )
+            authorization_scope_digest_value = execution_scope_digest(
+                work,
+                profile=requested_profile,
+                skills=requested_skills,
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=goal_mode,
+            )
             authorization_root = (
                 str(prior_authorization.get("authorization_root"))
                 if retry_authorized and isinstance(prior_authorization, dict)
@@ -2325,6 +2972,7 @@ class Supervisor:
                 "supervisor_pass": pass_id,
                 "plan_digest": plan_digest,
                 "contract_digest": contract_digest_value,
+                "authorization_scope_digest": authorization_scope_digest_value,
             }
             changes: dict[str, Any] = {
                 "execution_mode": ExecutionMode.HERMES.value,

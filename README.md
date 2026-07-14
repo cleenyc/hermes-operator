@@ -19,11 +19,15 @@ The daemon has no outbound connector and no outbound execution route. It may sta
 - One atomic SQLite transaction for each validated supervisor plan, event consumption, finalized plan digest, and audit result.
 - Event authority isolation. A privileged event is processed alone, untrusted text is redacted from authority-bearing context, and specific event types grant only specific capabilities.
 - Optimistic version fences on model-requested work updates, links, questions, verification, and dispatch decisions.
+- Exact execution-scope authorization with an independent scope revision and SHA-256 binding over work semantics, hierarchy, schedule, verification contract, profile, effective skills, and goal mode. Priority-only changes do not invalidate approval; scope changes and dependency edges do.
+- Durable quarantine review: every task-like quarantined event creates a non-executable decision item and a pending human question instead of leaving the active workflow.
+- Per-question work bindings preserve answers while refusing stale mutation or resume authority and creating a durable reauthorization follow-up.
 - Deterministic priority scoring across impact, urgency, alignment, dependency value, due date, age, effort, confidence, risk, state, and operator priority.
 - Hermes Kanban dispatch through public CLI commands plus an authenticated run-control endpoint for terminating native compute. The adapter uses `create`, `show`, `list`, `comment`, `block`, `unblock`, and `runs`.
 - Atomic run-slot reservations with one compute-active run per work item and a database-wide `max_parallel_work` cap. A blocked Hermes attempt is closed and releases compute capacity.
 - Finalized-plan, exact-contract, allowlisted-profile, skill, timing, attempt-budget, work-version, and fresh per-profile policy-attestation checks before dispatch.
 - Native Hermes plugin with scoped read and conversational-management tools, bounded context injection, lifecycle observations, a managed-card pre-tool guard, and policy-attestation refresh.
+- A required pinned real-host compatibility lane for Hermes Agent `0.18.2` (`v2026.7.7.2`, commit `9de9c25f620ff7f1ce0fd5457d596052d5159596`) plus an advisory current-`main` lane, including ordinary-turn UUID, first-valid hook-order, and completion-delivery integration checks.
 - Parallel execution through multiple independent canonical Operator cards, atomically capped by `max_parallel_work`. Current top-level `delegate_task` is background and non-durable, so it is blocked on Operator-managed cards; unmanaged interactive Hermes sessions keep native delegation behavior.
 - Installed Hermes-native Cron contracts for Google Workspace intake, durable reminder and question delivery, and daily briefings. Signed webhooks and fixed-argv command readers remain optional extension paths.
 - Exact-action, expiring, one-use approval grants bound to action type, integration, recipients, target, attributes, and content digest.
@@ -173,9 +177,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.3.0"]
-allowed_policy_versions = ["4.0.0"]
-allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
+allowed_plugin_versions = ["1.4.0"]
+allowed_policy_versions = ["5.0.0"]
+allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
 ```
 
 `profile`, `default_assignee`, `orchestrator_profile`, and entries in `allowed_profiles` form the effective execution-profile allowlist. Each selected profile installs the plugin with its own `HERMES_OPERATOR_PROFILE` value and must produce a fresh accepted attestation before receiving work. This supports multiple attested profiles without adding profile-specific capacity pools.

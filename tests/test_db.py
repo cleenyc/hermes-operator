@@ -666,6 +666,73 @@ class SQLiteStoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_work_authorization_capture_is_atomically_version_fenced(self) -> None:
+        work = WorkItem(title="Exact scope before the race")
+        self.store.create_work(work)
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+
+        def authorize() -> None:
+            barrier.wait()
+            try:
+                self.store.enqueue_work_authorization(
+                    work.id,
+                    expected_version=work.version,
+                    profile="operator",
+                    skills=[],
+                    default_skills=[],
+                    goal_mode=False,
+                    reason="Approved the displayed revision",
+                )
+                outcomes.append("authorized")
+            except StateConflict:
+                outcomes.append("authorization_conflict")
+
+        def mutate() -> None:
+            barrier.wait()
+            try:
+                self.store.update_work(
+                    work.id,
+                    {"description": "Changed concurrently"},
+                    expected_version=work.version,
+                    actor="operator-api",
+                )
+                outcomes.append("updated")
+            except StateConflict:
+                outcomes.append("update_conflict")
+
+        threads = [threading.Thread(target=authorize), threading.Thread(target=mutate)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertIn("updated", outcomes)
+        with self.store.connection() as connection:
+            event = connection.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = 'operator.work_authorized'"
+            ).fetchone()
+            audit = connection.execute(
+                "SELECT event FROM audit_log "
+                "WHERE event IN ('event.enqueued', 'work.updated') "
+                "ORDER BY sequence"
+            ).fetchall()
+        if "authorized" in outcomes:
+            self.assertIsNotNone(event)
+            payload = json.loads(event["payload_json"])
+            self.assertEqual(payload["work_version"], work.version)
+            # If both commits succeeded, capture necessarily committed before
+            # the version-changing update. It can therefore be detected as
+            # stale later, never mislabeled as approval of the changed scope.
+            self.assertEqual(
+                [row["event"] for row in audit[-2:]],
+                ["event.enqueued", "work.updated"],
+            )
+        else:
+            self.assertIn("authorization_conflict", outcomes)
+            self.assertIsNone(event)
+
     def test_duplicate_terminal_run_attempt_is_idempotent_under_concurrency(self) -> None:
         work = WorkItem(title="Terminal run")
         self.store.create_work(work)

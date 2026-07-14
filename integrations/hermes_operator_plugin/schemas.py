@@ -157,16 +157,25 @@ OPERATOR_ANSWER_QUESTION = {
 OPERATOR_AUTHORIZE_WORK = {
     "name": "operator_authorize_work",
     "description": (
-        "Authorize execution for one exact Operator work ID after Hermes native human "
-        "confirmation. This does not authorize external communication or publication."
+        "Authorize execution for one exact Operator work version and execution shape "
+        "after Hermes native human confirmation. This does not authorize external "
+        "communication or publication."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "work_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "expected_version": {"type": "integer", "minimum": 1},
             "reason": {"type": "string", "maxLength": 2000},
+            "profile": {"type": "string", "minLength": 1, "maxLength": 128},
+            "skills": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+            "goal_mode": {"type": "boolean"},
         },
-        "required": ["work_id"],
+        "required": ["work_id", "expected_version"],
         "additionalProperties": False,
     },
 }

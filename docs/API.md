@@ -175,6 +175,34 @@ POST /v1/hermes/inbound
 POST /v1/hermes/delegation-claim
 ```
 
+`POST /v1/hermes/work/{id}/authorize` is an optimistic, exact-scope
+authorization. The request requires the work version the user reviewed and
+may name the exact executor shape:
+
+```json
+{
+  "expected_version": 7,
+  "reason": "Approved this bounded implementation",
+  "profile": "operator",
+  "skills": ["kanban-orchestrator"],
+  "goal_mode": false
+}
+```
+
+Omitted executor fields use the configured work and Hermes defaults. In one
+immediate SQLite transaction, the API verifies `expected_version`, computes a
+scope digest over the work identity, title, description, hierarchy, criteria,
+schedule, recurrence, verifier contract, profile, effective skills, and goal
+mode, then enqueues the authorization event. A concurrent mutation returns
+`409 state_conflict`. The response includes `work_version`,
+`authorization_scope_revision`, and `authorization_scope_digest` so the exact
+captured scope is auditable.
+
+Priority rescoring and runtime status changes do not alter the authorization
+scope. Scope-bearing work changes and dependency graph changes advance a
+dedicated scope revision, revoke existing execution governance, and invalidate
+the prior digest.
+
 Ordinary lifecycle observations use the generic envelope and remain `authenticated_untrusted`.
 
 An event whose `event_type` is `policy.attested` has a stricter fixed contract. It must use the bridge token and contain exactly the expected source, provenance, occurrence time, external identity, dedupe identity, and seven payload fields:
@@ -182,8 +210,8 @@ An event whose `event_type` is `policy.attested` has a stricter fixed contract. 
 ```json
 {
   "profile": "operator",
-  "plugin_version": "1.3.0",
-  "policy_version": "4.0.0",
+  "plugin_version": "1.4.0",
+  "policy_version": "5.0.0",
   "policy_digest": "64-lowercase-hex-characters",
   "guard_active": true,
   "policy_mode": "default_deny",
@@ -291,7 +319,7 @@ curl -sS \
   http://127.0.0.1:8787/v1/questions/QUESTION_ID/answer
 ```
 
-Answering atomically updates the question, creates a trusted `question.answered` event scoped to the recorded blocking work IDs, and wakes the loop.
+Answering atomically updates the question, creates a trusted `question.answered` event scoped to the recorded per-work scope bindings, and wakes the loop. The answer is always retained, but it grants mutation or resume authority only while each stored scope revision and digest still matches. A stale binding creates a durable operator follow-up and applies no work mutation or dispatch. An answer cannot make work executable when it was not executable when the question was created.
 
 ## Exact-action approvals
 

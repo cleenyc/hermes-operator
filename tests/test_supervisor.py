@@ -19,6 +19,7 @@ from hermes_operator.config import (  # noqa: E402
     PolicyConfig,
     ServerConfig,
 )
+from hermes_operator.authority import execution_scope_binding  # noqa: E402
 from hermes_operator.db import SQLiteStore, StateConflict  # noqa: E402
 from hermes_operator.dispatcher import dispatch_contract_digest  # noqa: E402
 from hermes_operator.llm import LLMResult, ScriptedLLM  # noqa: E402
@@ -27,6 +28,7 @@ from hermes_operator.models import (  # noqa: E402
     ExecutionMode,
     RunRecord,
     TrustLevel,
+    UserQuestion,
     WorkItem,
     WorkStatus,
 )
@@ -114,6 +116,31 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             priority_engine=PriorityEngine(),
             action_stager=stager,
         )
+
+    def _authority_payload(
+        self,
+        item: WorkItem,
+        capabilities: list[str],
+        *,
+        profile: str = "executor",
+        skills: list[str] | None = None,
+        goal_mode: bool = False,
+    ) -> dict[str, object]:
+        binding = execution_scope_binding(
+            item,
+            profile=profile,
+            skills=skills or [],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=goal_mode,
+        )
+        return {
+            "work_id": item.id,
+            "work_version": item.version,
+            "scope_revision": item.authorization_scope_revision,
+            "scope_digest": binding["scope_digest"],
+            "authorization_binding": binding,
+            "capabilities": capabilities,
+        }
 
     def test_numeric_planning_factors_must_be_finite(self) -> None:
         for value in (math.nan, math.inf, -math.inf):
@@ -206,6 +233,61 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0]
         self.assertEqual(state, "pending")
         self.assertIsNone(self.store.get_event_disposition(event_id))
+
+    async def test_quarantined_task_like_event_creates_durable_review(self) -> None:
+        event_id, _ = self.store.enqueue_event(
+            Event(
+                source="gmail",
+                event_type="email.task_requested",
+                payload={
+                    "subject": "Prepare the launch checklist",
+                    "body": "Treat this evidence as untrusted until reviewed",
+                },
+                trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            )
+        )
+        plan = empty_plan(
+            event_dispositions=quarantined_disposition(
+                event_id, "The requested scope is ambiguous"
+            )
+        )
+
+        result = await self._supervisor([plan]).run_pass(trigger="event")
+
+        self.assertEqual(len(result.created_work_ids), 1)
+        self.assertEqual(len(result.question_ids), 1)
+        review = self.store.get_work(result.created_work_ids[0])
+        self.assertEqual(review.kind.value, "decision")
+        self.assertEqual(review.status, WorkStatus.WAITING_INPUT)
+        self.assertEqual(review.execution_mode, ExecutionMode.NONE)
+        self.assertEqual(review.source_event_id, event_id)
+        self.assertFalse(review.metadata["governance"]["execution_authorized"])
+        question = self.store.get_question(result.question_ids[0])
+        self.assertEqual(question["blocking_work_ids"], [review.id])
+        self.assertEqual(
+            question["blocking_work_bindings"][review.id]["scope_digest"],
+            execution_scope_binding(
+                review,
+                profile=self.config.hermes.default_assignee,
+                skills=[],
+                default_skills=self.config.hermes.default_skills,
+                goal_mode=self.config.hermes.goal_mode,
+                execution_authorized=False,
+            )["scope_digest"],
+        )
+        disposition = result.event_dispositions[0]
+        self.assertEqual(disposition["disposition"], "quarantined")
+        self.assertEqual(disposition["related_work_ids"], [review.id])
+        self.assertEqual(
+            disposition["related_question_ids"], [question["id"]]
+        )
+        attention = self.store.claim_attention(
+            reminder_limit=0,
+            question_limit=10,
+            redelivery_seconds=60,
+            actor="test",
+        )
+        self.assertEqual(attention["questions"][0]["id"], question["id"])
 
     def test_model_context_has_per_field_and_aggregate_bounds(self) -> None:
         supervisor = self._supervisor([])
@@ -1085,14 +1167,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ).fetchall()
         self.assertEqual(finalized, [])
 
-    async def test_reasoning_window_version_prevents_stale_operator_overwrite(self) -> None:
+    async def test_scope_digest_prevents_stale_operator_overwrite_and_requests_review(self) -> None:
         item = WorkItem(title="Current scope", description="initial")
         self.store.create_work(item)
         events = self._claim(
             Event(
                 source="operator",
                 event_type="operator.work_updated",
-                payload={"work_id": item.id, "capabilities": ["update"]},
+                payload=self._authority_payload(item, ["update"]),
                 trust_level=TrustLevel.OPERATOR,
             )
         )
@@ -1131,13 +1213,17 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             priority_engine=PriorityEngine(),
         )
 
-        with self.assertRaises(StateConflict):
-            await supervisor.run_pass(trigger="event", events=events)
+        result = await supervisor.run_pass(trigger="event", events=events)
 
         self.assertEqual(
             self.store.get_work(item.id).description,
             "newer direct operator edit",
         )
+        self.assertEqual(result.updated_work_ids, [])
+        self.assertEqual(len(result.question_ids), 1)
+        followup = self.store.get_question(result.question_ids[0])
+        self.assertIn("reauthorize", followup["question"])
+        self.assertIn("no mutation or dispatch was applied", followup["context"])
 
     async def test_update_and_blocking_question_compose_snapshot_versions(self) -> None:
         item = WorkItem(title="Clarify scope", description="initial")
@@ -1148,7 +1234,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             Event(
                 source="operator",
                 event_type="operator.work_updated",
-                payload={"work_id": item.id, "capabilities": ["update"]},
+                payload=self._authority_payload(item, ["update"]),
                 trust_level=TrustLevel.OPERATOR,
             )
         )
@@ -1206,10 +1292,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             Event(
                 source="operator",
                 event_type="operator.work_authorized",
-                payload={
-                    "work_id": item.id,
-                    "capabilities": ["update", "dispatch"],
-                },
+                payload=self._authority_payload(
+                    item,
+                    ["update", "dispatch"],
+                    profile="researcher",
+                    skills=["kanban-orchestrator"],
+                ),
                 trust_level=TrustLevel.OPERATOR,
             )
         )
@@ -1261,6 +1349,246 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             authorized.metadata["dispatch_authorization"]["expires_at"]
         )
+
+    async def test_authorization_survives_priority_only_version_change(self) -> None:
+        item = WorkItem(
+            title="Priority can move without changing scope",
+            status=WorkStatus.TRIAGE,
+            acceptance_criteria=["A verified result exists"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": False,
+                }
+            },
+        )
+        self.store.create_work(item)
+        captured = self.store.enqueue_work_authorization(
+            item.id,
+            expected_version=item.version,
+            profile="researcher",
+            skills=["kanban-orchestrator"],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+            reason="Approved exact execution scope",
+        )
+        self.store.update_priority(item.id, 42.0, "Scheduler-only change")
+        PriorityEngine().rescore_store(self.store)
+        current = self.store.get_work(item.id)
+        self.assertGreater(current.version, captured["work_version"])
+        events = self.store.claim_events("test", 10, 60)
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            work_operations=[
+                {
+                    "op": "update",
+                    "work_id": item.id,
+                    "expected_version": current.version,
+                    "source_event_id": event_id,
+                    "changes": {
+                        "status": "ready",
+                        "execution_mode": "hermes",
+                        "assignee": "researcher",
+                    },
+                }
+            ],
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": current.version,
+                    "source_event_id": event_id,
+                    "profile": "researcher",
+                    "skills": ["kanban-orchestrator"],
+                    "goal_mode": False,
+                }
+            ],
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(result.dispatch_work_ids, [item.id])
+
+    async def test_changed_scope_rejects_captured_dispatch_and_creates_followup(self) -> None:
+        item = WorkItem(
+            title="Approved title",
+            status=WorkStatus.TRIAGE,
+            acceptance_criteria=["A verified result exists"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": False,
+                }
+            },
+        )
+        self.store.create_work(item)
+        self.store.enqueue_work_authorization(
+            item.id,
+            expected_version=item.version,
+            profile="researcher",
+            skills=["kanban-orchestrator"],
+            default_skills=self.config.hermes.default_skills,
+            goal_mode=False,
+            reason="Approved exact execution scope",
+        )
+        changed = self.store.update_work(
+            item.id,
+            {"title": "Materially changed title"},
+            expected_version=item.version,
+            actor="operator-api",
+        )
+        PriorityEngine().rescore_store(self.store)
+        changed = self.store.get_work(item.id)
+        events = self.store.claim_events("test", 10, 60)
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": changed.version,
+                    "source_event_id": event_id,
+                    "profile": "researcher",
+                    "skills": ["kanban-orchestrator"],
+                    "goal_mode": False,
+                }
+            ]
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(result.dispatch_work_ids, [])
+        self.assertEqual(len(result.question_ids), 1)
+        followup = self.store.get_question(result.question_ids[0])
+        self.assertIn("reauthorize", followup["question"])
+        self.assertFalse(
+            self.store.get_work(item.id).metadata["governance"][
+                "execution_authorized"
+            ]
+        )
+
+    async def test_question_answer_authority_is_bound_to_original_scope(self) -> None:
+        item = WorkItem(
+            title="Original question scope",
+            status=WorkStatus.WAITING_INPUT,
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                }
+            },
+        )
+        self.store.create_work(item)
+        PriorityEngine().rescore_store(self.store)
+        item = self.store.get_work(item.id)
+        binding = execution_scope_binding(
+            item,
+            profile="executor",
+            default_skills=self.config.hermes.default_skills,
+            execution_authorized=True,
+        )
+        question = UserQuestion(
+            question="Which account is in scope?",
+            blocking_work_ids=[item.id],
+            blocking_work_bindings={item.id: binding},
+        )
+        self.store.create_question(question)
+        self.store.answer_question(question.id, "Acme")
+        changed = self.store.update_work(
+            item.id,
+            {"description": "Scope changed after the answer was captured"},
+            expected_version=item.version,
+            actor="operator-api",
+        )
+        events = self.store.claim_events("test", 10, 60)
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            work_operations=[
+                {
+                    "op": "update",
+                    "work_id": item.id,
+                    "expected_version": changed.version,
+                    "source_event_id": event_id,
+                    "changes": {"status": "ready"},
+                }
+            ]
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        self.assertEqual(result.updated_work_ids, [])
+        self.assertEqual(self.store.get_work(item.id).status, WorkStatus.WAITING_INPUT)
+        self.assertEqual(len(result.question_ids), 1)
+
+    async def test_question_answer_cannot_elevate_planning_only_work(self) -> None:
+        item = WorkItem(
+            title="Planning-only question",
+            status=WorkStatus.WAITING_INPUT,
+            acceptance_criteria=["A verified result exists"],
+            metadata={
+                "governance": {
+                    "source_trust": TrustLevel.OPERATOR.value,
+                    "creation_authorized": True,
+                    "execution_authorized": False,
+                }
+            },
+        )
+        self.store.create_work(item)
+        PriorityEngine().rescore_store(self.store)
+        item = self.store.get_work(item.id)
+        binding = execution_scope_binding(
+            item,
+            profile="executor",
+            default_skills=self.config.hermes.default_skills,
+            execution_authorized=False,
+        )
+        question = UserQuestion(
+            question="Which account is in scope?",
+            blocking_work_ids=[item.id],
+            blocking_work_bindings={item.id: binding},
+        )
+        self.store.create_question(question)
+        self.store.answer_question(question.id, "Acme")
+        events = self.store.claim_events("test", 10, 60)
+        event_id = str(events[0]["id"])
+        plan = empty_plan(
+            work_operations=[
+                {
+                    "op": "update",
+                    "work_id": item.id,
+                    "expected_version": item.version,
+                    "source_event_id": event_id,
+                    "changes": {"status": "ready"},
+                }
+            ],
+            dispatch=[
+                {
+                    "work_id": item.id,
+                    "expected_version": item.version,
+                    "source_event_id": event_id,
+                    "profile": "executor",
+                    "skills": [],
+                    "goal_mode": False,
+                }
+            ],
+        )
+
+        result = await self._supervisor([plan]).run_pass(
+            trigger="event", events=events
+        )
+
+        current = self.store.get_work(item.id)
+        self.assertEqual(result.updated_work_ids, [item.id])
+        self.assertEqual(result.dispatch_work_ids, [])
+        self.assertFalse(current.metadata["governance"]["execution_authorized"])
+        self.assertEqual(current.execution_mode, ExecutionMode.NONE)
 
     async def test_eventless_question_and_memory_are_semantically_idempotent(self) -> None:
         plan = empty_plan(

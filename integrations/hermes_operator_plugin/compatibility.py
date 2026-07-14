@@ -14,6 +14,11 @@ import json
 from typing import Any, Mapping
 
 
+SUPPORTED_HERMES_VERSION = "0.18.2"
+SUPPORTED_HERMES_TAG = "v2026.7.7.2"
+SUPPORTED_HERMES_COMMIT = "9de9c25f620ff7f1ce0fd5457d596052d5159596"
+
+
 def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
     """Return a bounded, JSON-compatible compatibility observation."""
 
@@ -26,6 +31,10 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
     artifacts = _kanban_completion_artifacts()
 
     warnings: list[str] = []
+    if hermes_version not in {"unknown", SUPPORTED_HERMES_VERSION}:
+        warnings.append(
+            "installed Hermes version differs from the pinned integration-test target"
+        )
     if configured_profile and active_profile not in {"", "unknown", configured_profile}:
         warnings.append("active Hermes profile differs from the configured Operator profile")
     if delegate_mode != "foreground":
@@ -36,16 +45,22 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
         warnings.append(
             "Hermes completion may transport artifacts; Operator-managed completions reject artifact fields"
         )
-    if hook_semantics == "first_valid" and hook_position not in {None, 1}:
+    if hook_semantics == "first_valid" and hook_position != 1:
         warnings.append(
-            "another pre_tool_call hook precedes the Operator guard; Hermes uses the first valid directive"
+            "the Operator guard is not proven first; Hermes uses the first valid pre-tool directive"
         )
     elif hook_semantics == "unknown":
         warnings.append("pre_tool_call directive resolution semantics could not be identified")
 
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "hermes_version": hermes_version,
+        "supported_hermes_version": SUPPORTED_HERMES_VERSION,
+        "supported_hermes_tag": SUPPORTED_HERMES_TAG,
+        "supported_hermes_commit": SUPPORTED_HERMES_COMMIT,
+        "supported_hermes_version_match": (
+            None if hermes_version == "unknown" else hermes_version == SUPPORTED_HERMES_VERSION
+        ),
         "active_profile": active_profile,
         "configured_profile": configured_profile,
         "configured_profile_match": (
@@ -60,7 +75,7 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
             else "blocked_non_durable"
         ),
         "kanban_completion_artifacts": artifacts,
-        "operator_artifact_policy": "reject_artifact_fields",
+        "operator_artifact_policy": "reject_artifact_fields_and_workspace_paths",
         "pre_tool_directive_semantics": hook_semantics,
         "guard_hook_position": hook_position,
         "guard_hook_count": hook_count,
@@ -71,6 +86,26 @@ def diagnose_host(ctx: Any, guard: Any) -> dict[str, Any]:
     ).encode("utf-8")
     report["diagnostic_digest"] = hashlib.sha256(canonical).hexdigest()
     return report
+
+
+def bridge_activation_blockers(report: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return known host incompatibilities that make bridge attestation unsafe.
+
+    Unknown host internals remain visible diagnostics rather than speculative
+    blockers.  Known profile mismatches and known first-valid hook resolution are
+    different: attesting in either case would claim protection that this process has
+    positively observed it does not provide.
+    """
+
+    blockers: list[str] = []
+    if report.get("configured_profile_match") is False:
+        blockers.append("active_profile_mismatch")
+    if (
+        report.get("pre_tool_directive_semantics") == "first_valid"
+        and report.get("guard_hook_position") != 1
+    ):
+        blockers.append("operator_guard_not_first")
+    return tuple(blockers)
 
 
 def _distribution_version() -> str:
@@ -134,13 +169,27 @@ def _pre_tool_semantics() -> str:
 
 
 def _kanban_completion_artifacts() -> bool | None:
+    observations: list[bool] = []
     try:
         module = import_module("tools.kanban_tools")
         callback = getattr(module, "_handle_complete")
         source = inspect.getsource(callback)
     except Exception:
-        return None
-    return "artifacts" in source and "metadata" in source
+        pass
+    else:
+        observations.append("artifacts" in source and "metadata" in source)
+    try:
+        module = import_module("hermes_cli.kanban_db")
+        callback = getattr(module, "complete_task")
+        source = inspect.getsource(callback)
+    except Exception:
+        pass
+    else:
+        observations.append(
+            "_merge_completion_prose_artifacts" in source
+            or ("artifacts" in source and "metadata" in source)
+        )
+    return any(observations) if observations else None
 
 
 def _guard_position(ctx: Any, guard: Any) -> tuple[int | None, int | None]:
@@ -159,4 +208,11 @@ def _guard_position(ctx: Any, guard: Any) -> tuple[int | None, int | None]:
     return position, len(callbacks)
 
 
-__all__ = ["detect_delegate_mode", "diagnose_host"]
+__all__ = [
+    "SUPPORTED_HERMES_COMMIT",
+    "SUPPORTED_HERMES_TAG",
+    "SUPPORTED_HERMES_VERSION",
+    "bridge_activation_blockers",
+    "detect_delegate_mode",
+    "diagnose_host",
+]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -32,7 +34,9 @@ from hermes_operator.prioritization import PriorityEngine  # noqa: E402
 from hermes_operator.supervisor import Supervisor  # noqa: E402
 from hermes_operator.verifier import (  # noqa: E402
     ArtifactVerifier,
+    bind_verification_report,
     validate_verification_contract,
+    validate_bound_verification_report,
 )
 
 
@@ -231,6 +235,39 @@ class ArtifactVerifierTests(unittest.TestCase):
             second.artifacts[0]["sha256"],
         )
 
+    def test_bound_report_detects_artifact_and_binding_tampering(self) -> None:
+        artifact = self.root / "bound.txt"
+        artifact.write_text("bound output\n", encoding="utf-8")
+        outcome = self._verifier().verify(
+            work=WorkItem(title="Bound report"),
+            completion={
+                "artifacts": [
+                    {"root": "workspace", "path": "bound.txt", "type": "file"}
+                ]
+            },
+        )
+        binding = {
+            "schema": "hermes-operator.completion-verification.v1",
+            "work_id": "wrk_bound",
+            "work_version": 3,
+            "run_id": "run_bound",
+        }
+        report = bind_verification_report(outcome.to_dict(), binding)
+
+        validated = validate_bound_verification_report(report, binding)
+
+        self.assertEqual(validated["report_digest"], report["report_digest"])
+        tampered = dict(report)
+        tampered["artifacts"] = [dict(report["artifacts"][0])]
+        tampered["artifacts"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "artifact binding mismatch"):
+            validate_bound_verification_report(tampered, binding)
+        with self.assertRaisesRegex(ValueError, "binding mismatch"):
+            validate_bound_verification_report(
+                report,
+                {**binding, "work_version": 4},
+            )
+
 
 class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -365,6 +402,174 @@ class DeterministicCompletionGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verification["requested_verdict"], "passed")
         self.assertEqual(verification["verdict"], "failed")
         self.assertFalse(verification["deterministic"]["passed"])
+
+    async def test_check_runs_once_without_blocking_lease_or_api_writer(self) -> None:
+        check = VerificationCheckConfig(
+            name="unit",
+            command=[sys.executable, "-c", "print('ok')"],
+            cwd=self.root,
+            timeout_seconds=5,
+            max_output_bytes=1_000,
+        )
+        run = RunRecord(
+            work_item_id="placeholder",
+            runner="hermes-kanban",
+            external_run_id="task-nonblocking",
+            status="completed",
+            result={"updated_at": "nonblocking-evidence"},
+        )
+        item = WorkItem(
+            title="Run one nonblocking check",
+            status=WorkStatus.REVIEW,
+            hermes_task_id="task-nonblocking",
+            acceptance_criteria=["The fixed check passes"],
+            metadata={
+                "verification_contract": {
+                    "artifacts": [],
+                    "checks": ["unit"],
+                },
+                "hermes": {
+                    "completion_fingerprint": "nonblocking-evidence",
+                    "completion_run_id": run.id,
+                    "completion_attempt": 1,
+                },
+                "governance": {
+                    "source_trust": "operator",
+                    "creation_authorized": True,
+                    "execution_authorized": True,
+                },
+            },
+        )
+        run.work_item_id = item.id
+        self.store.create_work(item)
+        self.store.create_run(run)
+        event = Event(
+            source="hermes",
+            external_id="task-nonblocking",
+            event_type="execution.completed",
+            payload={
+                "work_id": item.id,
+                "hermes_task_id": "task-nonblocking",
+                "run_id": run.id,
+                "attempt": 1,
+                "evidence_fingerprint": "nonblocking-evidence",
+            },
+            trust_level=TrustLevel.AUTHENTICATED_UNTRUSTED,
+            provenance={"adapter": "hermes-kanban"},
+        )
+        self.store.enqueue_event(event)
+        events = self.store.claim_events("test-verifier", 1, 60)
+        PriorityEngine().rescore_store(self.store)
+        current = self.store.get_work(item.id)
+        plan = {
+            "summary": "Assessed one fixed check",
+            "observations": [],
+            "event_dispositions": [
+                {
+                    "event_id": event.id,
+                    "disposition": "execution_reconciled",
+                    "reason": "The completion and fixed check were assessed",
+                    "related_work_ids": [item.id],
+                    "related_work_refs": [],
+                }
+            ],
+            "work_operations": [],
+            "questions": [],
+            "dispatch": [],
+            "memory_candidates": [],
+            "verifications": [
+                {
+                    "work_id": item.id,
+                    "expected_version": current.version,
+                    "verdict": "passed",
+                    "confidence": 0.99,
+                    "summary": "The deployment-owned check passed",
+                    "criteria_results": [
+                        {
+                            "criterion": "The fixed check passes",
+                            "passed": True,
+                            "evidence": "The named fixed check returned zero",
+                        }
+                    ],
+                }
+            ],
+            "external_action_proposals": [],
+        }
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingVerifier:
+            def __init__(self) -> None:
+                self.delegate = ArtifactVerifier(
+                    VerificationConfig(
+                        artifact_roots={"workspace": self_root},
+                        checks=[check],
+                    )
+                )
+                self.calls = 0
+
+            def verify(self, *, work: WorkItem, completion: dict):
+                self.calls += 1
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release deterministic verifier")
+                return self.delegate.verify(work=work, completion=completion)
+
+        self_root = self.root
+        blocking = BlockingVerifier()
+        supervisor = Supervisor(
+            config=self.config,
+            store=self.store,
+            llm=ScriptedLLM([plan]),
+            priority_engine=PriorityEngine(),
+        )
+        supervisor.verifier = blocking  # type: ignore[assignment]
+        epoch = self.store.acquire_service_lease(
+            "verification-test",
+            "owner",
+            ttl_seconds=60,
+        )
+        assert epoch is not None
+        supervisor_task = asyncio.create_task(
+            supervisor.run_pass(trigger="event", events=events)
+        )
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+            renewed = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.store.renew_service_lease,
+                    "verification-test",
+                    "owner",
+                    ttl_seconds=60,
+                    epoch=epoch,
+                ),
+                timeout=1,
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.store.set_state,
+                    "api.concurrent-write",
+                    {"accepted": True},
+                ),
+                timeout=1,
+            )
+            self.assertTrue(renewed)
+            self.assertEqual(
+                self.store.get_state("api.concurrent-write"),
+                {"accepted": True},
+            )
+        finally:
+            release.set()
+        result = await asyncio.wait_for(supervisor_task, timeout=5)
+
+        assert result is not None
+        self.assertEqual(blocking.calls, 1)
+        self.assertEqual(result.verified_work_ids, [item.id])
+        deterministic = self.store.get_work(item.id).metadata["last_verification"][
+            "deterministic"
+        ]
+        self.assertEqual(len(deterministic["checks"]), 1)
+        self.assertIn("completion_binding_digest", deterministic["binding"])
 
 
 if __name__ == "__main__":

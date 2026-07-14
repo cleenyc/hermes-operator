@@ -86,8 +86,12 @@ It requires the current `expected_version` and one action:
 ```
 
 Snooze requires a future absolute time. It resets delivery eligibility for the
-new occurrence. Version fencing prevents an action based on stale Cron output
-from overwriting a newer snooze, completion, or supervisor update.
+current occurrence by storing `reminder_snoozed_until`; it does not overwrite
+`due_at`. Completing or acknowledging the reminder therefore advances from the
+original recurring schedule rather than from the snooze time. Explicit schedule
+edits clear the temporary override. Version fencing prevents an action based on
+stale Cron output from overwriting a newer snooze, completion, or supervisor
+update.
 
 Equivalent local commands are available:
 

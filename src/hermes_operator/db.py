@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .authority import execution_scope_binding
 from .models import (
     ALLOWED_WORK_TRANSITIONS,
     TERMINAL_WORK_STATUSES,
@@ -32,7 +33,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 
 
 class StateConflict(RuntimeError):
@@ -150,6 +151,7 @@ class SQLiteStore:
                     due_at TEXT,
                     scheduled_at TEXT,
                     recurrence_rule TEXT,
+                    reminder_snoozed_until TEXT,
                     reminder_last_delivered_at TEXT,
                     reminder_last_acknowledged_at TEXT,
                     reminder_delivery_count INTEGER NOT NULL DEFAULT 0,
@@ -159,6 +161,7 @@ class SQLiteStore:
                     acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     version INTEGER NOT NULL DEFAULT 1,
+                    authorization_scope_revision INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     completed_at TEXT
@@ -201,6 +204,7 @@ class SQLiteStore:
                     context TEXT NOT NULL DEFAULT '',
                     urgency REAL NOT NULL DEFAULT 0.5,
                     blocking_work_ids_json TEXT NOT NULL DEFAULT '[]',
+                    blocking_work_bindings_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL,
                     answer TEXT,
                     created_at TEXT NOT NULL,
@@ -323,9 +327,11 @@ class SQLiteStore:
             }
             for name, declaration in (
                 ("recurrence_rule", "TEXT"),
+                ("reminder_snoozed_until", "TEXT"),
                 ("reminder_last_delivered_at", "TEXT"),
                 ("reminder_last_acknowledged_at", "TEXT"),
                 ("reminder_delivery_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("authorization_scope_revision", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in work_columns:
                     connection.execute(
@@ -340,6 +346,7 @@ class SQLiteStore:
             for name, declaration in (
                 ("last_delivered_at", "TEXT"),
                 ("delivery_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("blocking_work_bindings_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in question_columns:
                     connection.execute(
@@ -1369,11 +1376,12 @@ class SQLiteStore:
                     provenance_json, priority, priority_score, priority_rationale,
                     impact, urgency, strategic_alignment, unlock_value, risk, confidence,
                     effort_minutes, due_at, scheduled_at, recurrence_rule,
-                    reminder_last_delivered_at, reminder_last_acknowledged_at,
+                    reminder_snoozed_until, reminder_last_delivered_at,
+                    reminder_last_acknowledged_at,
                     reminder_delivery_count, assignee, execution_mode,
                     hermes_task_id, acceptance_criteria_json, metadata_json, version,
-                    created_at, updated_at, completed_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    authorization_scope_revision, created_at, updated_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.id,
@@ -1397,6 +1405,7 @@ class SQLiteStore:
                     item.due_at,
                     item.scheduled_at,
                     item.recurrence_rule,
+                    item.reminder_snoozed_until,
                     item.reminder_last_delivered_at,
                     item.reminder_last_acknowledged_at,
                     item.reminder_delivery_count,
@@ -1406,6 +1415,7 @@ class SQLiteStore:
                     self._json(item.acceptance_criteria),
                     self._json(item.metadata),
                     item.version,
+                    item.authorization_scope_revision,
                     item.created_at,
                     item.updated_at,
                     item.completed_at,
@@ -1432,6 +1442,7 @@ class SQLiteStore:
         if item.reminder_delivery_count < 0:
             raise ValueError("reminder_delivery_count cannot be negative")
         for field_name in (
+            "reminder_snoozed_until",
             "reminder_last_delivered_at",
             "reminder_last_acknowledged_at",
         ):
@@ -1567,7 +1578,11 @@ class SQLiteStore:
             "priority": "priority_score DESC, priority DESC, created_at ASC",
             "created": "created_at DESC",
             "updated": "updated_at DESC",
-            "due": "due_at IS NULL, due_at ASC, priority_score DESC",
+            "due": (
+                "COALESCE(reminder_snoozed_until, due_at) IS NULL, "
+                "COALESCE(reminder_snoozed_until, due_at) ASC, "
+                "priority_score DESC"
+            ),
         }
         order = orders.get(order_by, orders["priority"])
         params.append(max(1, min(limit, 5000)))
@@ -1604,6 +1619,7 @@ class SQLiteStore:
             "due_at",
             "scheduled_at",
             "recurrence_rule",
+            "reminder_snoozed_until",
             "reminder_last_delivered_at",
             "reminder_last_acknowledged_at",
             "reminder_delivery_count",
@@ -1619,6 +1635,42 @@ class SQLiteStore:
             raise ValueError(f"Unsupported work fields: {sorted(unknown)}")
         current = self.get_work(work_id)
         normalized = dict(changes)
+        scope_fields = {
+            "title",
+            "description",
+            "parent_id",
+            "due_at",
+            "scheduled_at",
+            "recurrence_rule",
+            "acceptance_criteria",
+        }
+        scope_changed = any(
+            field in normalized
+            and normalized[field] != getattr(current, field)
+            for field in scope_fields
+        )
+        if "metadata" in normalized and isinstance(normalized["metadata"], dict):
+            scope_changed = scope_changed or (
+                normalized["metadata"].get("verification_contract")
+                != current.metadata.get("verification_contract")
+            )
+        if scope_changed:
+            scoped_metadata = dict(
+                normalized.get("metadata", current.metadata)
+                if isinstance(normalized.get("metadata", current.metadata), dict)
+                else current.metadata
+            )
+            governance = dict(scoped_metadata.get("governance", {}))
+            governance["execution_authorized"] = False
+            scoped_metadata["governance"] = governance
+            scoped_metadata.pop("dispatch_authorization", None)
+            scoped_metadata.pop("dispatch_request", None)
+            scoped_metadata["authorization_invalidated"] = {
+                "reason": "execution_scope_changed",
+                "from_work_version": current.version,
+                "invalidated_at": utc_now(),
+            }
+            normalized["metadata"] = scoped_metadata
         acknowledged_recurring = False
         if "status" in normalized:
             target = WorkStatus(normalized["status"])
@@ -1648,6 +1700,7 @@ class SQLiteStore:
                     normalized[timestamp], timestamp
                 )
         for timestamp in (
+            "reminder_snoozed_until",
             "reminder_last_delivered_at",
             "reminder_last_acknowledged_at",
         ):
@@ -1681,13 +1734,16 @@ class SQLiteStore:
                 after=datetime.fromisoformat(acknowledged_at.replace("Z", "+00:00")),
             )
             normalized["completed_at"] = None
+            normalized["reminder_snoozed_until"] = None
             normalized["reminder_last_acknowledged_at"] = acknowledged_at
             normalized["reminder_last_delivered_at"] = None
             acknowledged_recurring = True
         elif current.kind == WorkKind.REMINDER and (
             "due_at" in normalized or "recurrence_rule" in normalized
         ):
-            # A changed occurrence is immediately eligible at its new due time.
+            # A schedule edit replaces any temporary snooze and is immediately
+            # eligible at its new due time.
+            normalized["reminder_snoozed_until"] = None
             normalized["reminder_last_delivered_at"] = None
         if "title" in normalized:
             if not isinstance(normalized["title"], str) or not normalized["title"].strip():
@@ -1708,11 +1764,18 @@ class SQLiteStore:
                     raise ValueError(f"{factor} must be between 0 and 1")
         normalized["updated_at"] = utc_now()
         assignments = ", ".join(f"{field} = ?" for field in normalized)
+        if scope_changed:
+            assignments += (
+                ", authorization_scope_revision = "
+                "authorization_scope_revision + 1"
+            )
         params = list(normalized.values())
         if expected_version is not None and expected_version != current.version:
             raise StateConflict(f"Work item changed concurrently: {work_id}")
-        where = "id = ? AND version = ?"
-        params.extend((work_id, current.version))
+        where = "id = ? AND version = ? AND authorization_scope_revision = ?"
+        params.extend(
+            (work_id, current.version, current.authorization_scope_revision)
+        )
         with self.connection() as connection:
             self._begin_immediate(connection)
             if "parent_id" in changes:
@@ -1720,11 +1783,17 @@ class SQLiteStore:
                     connection, work_id, changes["parent_id"]
                 )
             live = connection.execute(
-                "SELECT version FROM work_items WHERE id = ?", (work_id,)
+                "SELECT version, authorization_scope_revision FROM work_items "
+                "WHERE id = ?",
+                (work_id,),
             ).fetchone()
             if live is None:
                 raise NotFound(work_id)
-            if int(live["version"]) != current.version:
+            if (
+                int(live["version"]) != current.version
+                or int(live["authorization_scope_revision"])
+                != current.authorization_scope_revision
+            ):
                 raise StateConflict(f"Work item changed concurrently: {work_id}")
             queued = connection.execute(
                 "SELECT id FROM runs WHERE work_item_id = ? AND status = 'queued' LIMIT 1",
@@ -1781,6 +1850,18 @@ class SQLiteStore:
                 data={"changes": changes, "from_version": current.version},
                 connection=connection,
             )
+            if scope_changed:
+                self.audit(
+                    actor,
+                    "work.authorization_invalidated",
+                    entity_type="work",
+                    entity_id=work_id,
+                    data={
+                        "reason": "execution_scope_changed",
+                        "from_version": current.version,
+                    },
+                    connection=connection,
+                )
             if acknowledged_recurring:
                 self.audit(
                     actor,
@@ -1888,7 +1969,7 @@ class SQLiteStore:
                 candidates = connection.execute(
                     "SELECT * FROM work_items WHERE kind = ? "
                     "AND status NOT IN (?, ?, ?) "
-                    "AND COALESCE(due_at, scheduled_at) IS NOT NULL "
+                    "AND COALESCE(reminder_snoozed_until, due_at, scheduled_at) IS NOT NULL "
                     "ORDER BY priority_score DESC, priority DESC, created_at ASC "
                     "LIMIT 5000",
                     (
@@ -1900,7 +1981,11 @@ class SQLiteStore:
                 ).fetchall()
                 due_candidates: list[tuple[datetime, sqlite3.Row]] = []
                 for row in candidates:
-                    raw_due = row["due_at"] or row["scheduled_at"]
+                    raw_due = (
+                        row["reminder_snoozed_until"]
+                        or row["due_at"]
+                        or row["scheduled_at"]
+                    )
                     try:
                         due = datetime.fromisoformat(
                             str(raw_due).replace("Z", "+00:00")
@@ -2034,7 +2119,10 @@ class SQLiteStore:
                 raise ValueError("Snooze time must be in the future")
             return self.update_work(
                 work_id,
-                {"due_at": snooze_until},
+                {
+                    "reminder_snoozed_until": snooze_until,
+                    "reminder_last_delivered_at": None,
+                },
                 actor=actor,
                 expected_version=expected_version,
                 allow_transition_override=True,
@@ -2143,7 +2231,7 @@ class SQLiteStore:
                 ).fetchone()
                 if cycle is not None:
                     raise StateConflict("Dependency graph cannot contain a cycle")
-            connection.execute(
+            inserted = connection.execute(
                 "INSERT OR IGNORE INTO work_links(id, from_id, to_id, relation, created_at) "
                 "VALUES(?, ?, ?, ?, ?)",
                 (link_id, from_id, to_id, relation_value, utc_now()),
@@ -2154,6 +2242,53 @@ class SQLiteStore:
             ).fetchone()
             assert row is not None
             link_id = str(row["id"])
+            if inserted.rowcount == 1 and relation_value in {
+                WorkRelation.DEPENDS_ON.value,
+                WorkRelation.BLOCKS.value,
+            }:
+                for affected_id in (from_id, to_id):
+                    affected = connection.execute(
+                        "SELECT metadata_json, version, authorization_scope_revision "
+                        "FROM work_items WHERE id = ?",
+                        (affected_id,),
+                    ).fetchone()
+                    assert affected is not None
+                    metadata = json.loads(affected["metadata_json"] or "{}")
+                    governance = dict(metadata.get("governance", {}))
+                    governance["execution_authorized"] = False
+                    metadata["governance"] = governance
+                    metadata.pop("dispatch_authorization", None)
+                    metadata.pop("dispatch_request", None)
+                    metadata["authorization_invalidated"] = {
+                        "reason": "dependency_graph_changed",
+                        "from_work_version": int(affected["version"]),
+                        "invalidated_at": utc_now(),
+                    }
+                    connection.execute(
+                        "UPDATE work_items SET metadata_json = ?, updated_at = ?, "
+                        "authorization_scope_revision = "
+                        "authorization_scope_revision + 1 "
+                        "WHERE id = ? AND authorization_scope_revision = ?",
+                        (
+                            self._json(metadata),
+                            utc_now(),
+                            affected_id,
+                            int(affected["authorization_scope_revision"]),
+                        ),
+                    )
+                    self.audit(
+                        actor,
+                        "work.authorization_invalidated",
+                        entity_type="work",
+                        entity_id=affected_id,
+                        data={
+                            "reason": "dependency_graph_changed",
+                            "relation": relation_value,
+                            "from_id": from_id,
+                            "to_id": to_id,
+                        },
+                        connection=connection,
+                    )
             self.audit(
                 actor,
                 "work.linked",
@@ -2203,15 +2338,120 @@ class SQLiteStore:
                 (score, rationale, utc_now(), work_id, score, rationale, work_id),
             )
 
+    def enqueue_work_authorization(
+        self,
+        work_id: str,
+        *,
+        expected_version: int,
+        profile: str,
+        skills: Sequence[str],
+        default_skills: Sequence[str],
+        goal_mode: bool,
+        reason: str,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Fence an authorization to the exact work revision and execution scope.
+
+        The version check, digest calculation, and event insert share one
+        immediate transaction. A concurrent work mutation therefore happens
+        entirely before or after this authorization, never between its check
+        and durable capture.
+        """
+
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            raise ValueError("expected_version must be a positive integer")
+        normalized_profile = str(profile).strip()
+        if not normalized_profile:
+            raise ValueError("profile must be a nonempty string")
+        normalized_skills = [str(value).strip() for value in skills]
+        normalized_defaults = [str(value).strip() for value in default_skills]
+        if any(not value for value in [*normalized_skills, *normalized_defaults]):
+            raise ValueError("skills must contain nonempty strings")
+        with self.transaction():
+            item = self.get_work(work_id)
+            if item.version != expected_version:
+                raise StateConflict(f"Work item changed concurrently: {work_id}")
+            binding = execution_scope_binding(
+                item,
+                profile=normalized_profile,
+                skills=normalized_skills,
+                default_skills=normalized_defaults,
+                goal_mode=goal_mode,
+            )
+            authorization_id = f"hermes-authorize:{new_id('auth')}"
+            event = Event(
+                source="operator",
+                event_type="operator.work_authorized",
+                external_id=authorization_id,
+                dedupe_key=authorization_id,
+                trust_level=TrustLevel.OPERATOR,
+                payload={
+                    "work_id": item.id,
+                    "work_version": item.version,
+                    "scope_revision": item.authorization_scope_revision,
+                    "scope_digest": binding["scope_digest"],
+                    "authorization_binding": binding,
+                    "capabilities": ["update", "dispatch"],
+                    "reason": reason,
+                },
+                provenance={
+                    "ingress": "hermes-bridge",
+                    "authenticated": True,
+                    "actor": actor,
+                },
+            )
+            event_id, created = self.enqueue_event(event, actor=actor)
+            self.audit(
+                actor,
+                "work.authorization_captured",
+                entity_type="work",
+                entity_id=item.id,
+                data={
+                    "event_id": event_id,
+                    "work_version": item.version,
+                    "scope_revision": item.authorization_scope_revision,
+                    "scope_digest": binding["scope_digest"],
+                    "profile": normalized_profile,
+                    "skills": normalized_skills,
+                    "goal_mode": bool(goal_mode),
+                },
+            )
+        return {
+            "work_id": item.id,
+            "work_version": item.version,
+            "authorization_scope_revision": item.authorization_scope_revision,
+            "authorization_scope_digest": binding["scope_digest"],
+            "profile": normalized_profile,
+            "skills": normalized_skills,
+            "goal_mode": bool(goal_mode),
+            "event_id": event_id,
+            "created": created,
+        }
+
     def create_question(self, question: UserQuestion, *, actor: str = "supervisor") -> UserQuestion:
+        blocking_ids = set(map(str, question.blocking_work_ids))
+        if set(question.blocking_work_bindings) - blocking_ids:
+            raise ValueError(
+                "Question authority bindings must name recorded blocking work"
+            )
+        for work_id, binding in question.blocking_work_bindings.items():
+            if not isinstance(binding, dict) or str(binding.get("work_id", "")) != str(
+                work_id
+            ):
+                raise ValueError("Question authority binding identity is invalid")
         with self.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO user_questions(
                     id, question, context, urgency, blocking_work_ids_json,
+                    blocking_work_bindings_json,
                     status, answer, created_at, answered_at,
                     last_delivered_at, delivery_count
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     question.id,
@@ -2219,6 +2459,7 @@ class SQLiteStore:
                     question.context,
                     question.urgency,
                     self._json(question.blocking_work_ids),
+                    self._json(question.blocking_work_bindings),
                     question.status.value,
                     question.answer,
                     question.created_at,
@@ -2232,7 +2473,13 @@ class SQLiteStore:
                 "question.created",
                 entity_type="question",
                 entity_id=question.id,
-                data={"blocking_work_ids": question.blocking_work_ids},
+                data={
+                    "blocking_work_ids": question.blocking_work_ids,
+                    "binding_scope_digests": {
+                        work_id: binding.get("scope_digest")
+                        for work_id, binding in question.blocking_work_bindings.items()
+                    },
+                },
                 connection=connection,
             )
         return question
@@ -2245,6 +2492,9 @@ class SQLiteStore:
             "context": row["context"],
             "urgency": row["urgency"],
             "blocking_work_ids": json.loads(row["blocking_work_ids_json"]),
+            "blocking_work_bindings": json.loads(
+                row["blocking_work_bindings_json"] or "{}"
+            ),
             "status": row["status"],
             "answer": row["answer"],
             "created_at": row["created_at"],
@@ -2321,6 +2571,7 @@ class SQLiteStore:
                 connection=connection,
             )
             blocking = json.loads(row["blocking_work_ids_json"] or "[]")
+            bindings = json.loads(row["blocking_work_bindings_json"] or "{}")
             event = Event(
                 source="operator",
                 event_type="question.answered",
@@ -2331,11 +2582,18 @@ class SQLiteStore:
                     "question": row["question"],
                     "answer": clean_answer,
                     "blocking_work_ids": blocking,
+                    "blocking_work_bindings": bindings,
                 },
                 provenance={"actor": actor},
             )
             self.enqueue_event(event, actor=actor)
-        return {"id": question_id, "answer": clean_answer, "blocking_work_ids": blocking}
+        return {
+            "id": question_id,
+            "status": QuestionStatus.ANSWERED.value,
+            "answer": clean_answer,
+            "blocking_work_ids": blocking,
+            "blocking_work_bindings": bindings,
+        }
 
     def create_run(self, run: RunRecord, *, actor: str = "dispatcher") -> RunRecord:
         with self.connection() as connection:

@@ -1,0 +1,44 @@
+name: Pinned Hermes compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-host:
+    continue-on-error: ${{ matrix.experimental }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - hermes_ref: 9de9c25f620ff7f1ce0fd5457d596052d5159596
+            experimental: false
+          - hermes_ref: main
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install selected Hermes host
+        run: >-
+          python -m pip install
+          "git+https://github.com/NousResearch/hermes-agent.git@${{ matrix.hermes_ref }}"
+      - name: Install Operator plugin
+        run: python -m pip install ./integrations/hermes_operator_plugin
+      - name: Exercise real host contracts
+        env:
+          HERMES_OPERATOR_REQUIRE_HOST_INTEGRATION: "1"
+        run: >-
+          python -m unittest discover
+          -s integrations/hermes_operator_plugin/tests
+          -p "test_hermes_host_integration.py"
+          -v

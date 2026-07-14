@@ -71,7 +71,12 @@ def authorize_work(client: OperatorClient, args: dict, **kwargs: Any) -> str:
     del kwargs
     return _result(
         lambda: client.authorize_work(
-            args.get("work_id", ""), args.get("reason", "")
+            args.get("work_id", ""),
+            args.get("expected_version", 0),
+            args.get("reason", ""),
+            profile=args.get("profile"),
+            skills=args.get("skills"),
+            goal_mode=args.get("goal_mode"),
         )
     )
 
@@ -83,6 +88,18 @@ def update_work(client: OperatorClient, args: dict, **kwargs: Any) -> str:
             args.get("work_id", ""),
             args.get("expected_version", 0),
             args.get("changes", {}),
+        )
+    )
+
+
+def resolve_reminder(client: OperatorClient, args: dict, **kwargs: Any) -> str:
+    del kwargs
+    return _result(
+        lambda: client.resolve_reminder(
+            args.get("work_id", ""),
+            args.get("expected_version", 0),
+            args.get("action", ""),
+            until=args.get("until"),
         )
     )
 

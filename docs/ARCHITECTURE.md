@@ -76,10 +76,10 @@ The implemented authority mappings are:
 | Event type | Authority |
 | --- | --- |
 | `operator.request` | Create work; may authorize execution of newly created work only when `allow_internal_execution` is exactly `true` |
-| `operator.work_authorized` | Update or dispatch the exact `work_id` for listed capabilities |
-| `operator.work_updated` | Update or dispatch the exact `work_id` for listed capabilities |
-| `question.answered` | Update only work IDs recorded as blocked by that question |
-| `system.*` | Update or dispatch only IDs listed in `authorized_work_ids` |
+| `operator.work_authorized` | Update or dispatch only the exact work scope digest and approved executor shape for listed capabilities |
+| `operator.work_updated` | Update only the exact work scope digest for listed capabilities |
+| `question.answered` | Update only current per-work scope bindings recorded by that question; resume only authority that already existed |
+| `system.*` | Update or dispatch only exact entries in `authorized_work_bindings` |
 | External and Hermes observations | Evidence, triage, quarantine, and verification input; no operator capability |
 
 An event lease token is renewed after the model returns. If another worker reclaimed the event, the stale pass cannot apply.
@@ -90,7 +90,7 @@ The OpenAI-compatible transport accepts only an HTTP or HTTPS base path without 
 
 ## Atomic supervisor transaction
 
-The model returns one structured plan containing an explicit disposition for every claimed event, work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, allowlisted worker profiles, skills, and expected versions before the transaction can commit. A disposition must be backed by the effect it claims, such as applied work, a created question, or a verification. `duplicate` must identify existing work. `non_actionable` and `quarantined` require an auditable reason. An empty plan cannot silently consume an event. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
+The model returns one structured plan containing an explicit disposition for every claimed event, work operations, questions, dispatch proposals, memory candidates, verifications, and external-action proposals. The supervisor normalizes and validates shape, limits, references, timestamps, status values, allowlisted worker profiles, skills, and expected versions before the transaction can commit. A disposition must be backed by the effect it claims, such as applied work, a created question, or a verification. `duplicate` must identify existing work. `non_actionable` and `quarantined` require an auditable reason. A quarantined task-like signal deterministically creates a non-executable decision item and a bound pending question, so the source event may be finalized without disappearing from the active attention workflow. An empty plan cannot silently consume an event. `operator.max_authorizations_per_pass` caps exact dispatch authorizations in one plan independently of event and operation limits. Idempotent create reuse must match the original pass, source event, plan reference, and full normalized creation-identity digest, so a model-supplied key collision cannot borrow an existing task's authority.
 
 The normalized plan is canonicalized and hashed with SHA-256. Plan application then occurs inside one `BEGIN IMMEDIATE` SQLite transaction. Nested store calls share that connection. The same transaction:
 
@@ -107,9 +107,11 @@ The dispatcher treats supervisor-issued authorization as inert unless the matchi
 
 ## Version-fenced mutations
 
-Every model-requested update of existing work carries `expected_version`. Existing endpoints of a dependency link carry their expected versions. Blocking questions, verification, and dispatch also carry version fences.
+Every model-requested update of existing work carries `expected_version`. Existing endpoints of a dependency link carry their expected versions. Blocking questions, verification, and dispatch also carry version fences. Interactive authorization first atomically fences the exact displayed work version, then stores a dedicated authorization scope revision and SHA-256 digest. The digest binds title, description, criteria, parent hierarchy, schedule, recurrence, verifier contract, profile, effective skills, and goal mode.
 
 SQLite increments `work_items.version` on material mutation. A mismatch raises a state conflict and rolls back the entire supervisor plan. Model output therefore cannot silently overwrite operator or dispatcher changes made after the snapshot.
+
+Priority rescoring and runtime lifecycle changes do not invalidate an otherwise identical approval. Scope-bearing field changes increment `authorization_scope_revision`, revoke execution governance, and remove pending dispatch authorization. New `depends_on` and `blocks` edges do the same for both endpoints without perturbing their ordinary scheduler versions. Before every authorized update and dispatch, the supervisor rechecks the persisted scope revision and digest. It also rechecks the exact profile, effective skill set, and goal mode before dispatch. A stale authorization or stale question binding cannot mutate work; it creates a durable operator follow-up instead.
 
 Queued dispatch reservations add a stronger contract-field fence. Dependency semantics are stricter: SQLite rejects new `depends_on` or `blocks` edges while either endpoint has a compute-active or uncertain canonical run in `queued`, `running`, `cancel_requested`, `lost`, or `legacy_conflict`. It also prevents a completed dependency from reopening while dependent work has one of those runs.
 
@@ -187,7 +189,7 @@ The native plugin registers a local `pre_tool_call` guard before it initializes 
 - `default_deny` mode
 - UTC attestation time
 
-The example core configuration accepts plugin `1.3.0`, policy `4.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
+The example core configuration accepts plugin `1.4.0`, policy `5.0.0`, and the included policy digest for 300 seconds. After synchronous startup attestation, the plugin starts one daemon heartbeat that attempts a fresh attestation every 120 seconds by default. Pre-LLM and lifecycle hooks opportunistically use the same monotonic lock and rate limiter, so competing refresh paths do not duplicate a call. A stale or invalid attestation prevents new run reservation for that profile.
 
 The heartbeat is process-scoped because current Hermes exposes no plugin-unload hook. It uses a process-exit wake and bounded join. A refresh failure leaves the local guard and bridge installed, but core freshness expires and blocks subsequent reservations.
 
@@ -209,7 +211,7 @@ A completion event is bound to:
 - A completion evidence fingerprint stored in the work metadata
 - A completed local run for the same card
 
-The supervisor can mark review work done only when its verification lists every acceptance criterion exactly, every criterion has specific passing evidence, and confidence is at least `0.75`. A separate deterministic gate inspects every native Hermes artifact declaration and every artifact or named check in the canonical protected `verification_contract`. It confines paths to configured roots, rejects traversal and symlinks, computes SHA-256 content identities under count and byte limits, and runs only deployment-approved fixed argv with bounded time, output, cwd, and environment. It is evaluated before planning and again after canonical run binding. An applicable deterministic failure overrides a model's passed verdict. Failed or inconclusive verification moves work to `blocked` or `waiting_input`.
+The supervisor can mark review work done only when its verification lists every acceptance criterion exactly, every criterion has specific passing evidence, and confidence is at least `0.75`. A separate deterministic gate inspects every native Hermes artifact declaration and every artifact or named check in the canonical protected `verification_contract`. It confines paths to configured roots, rejects traversal and symlinks, computes SHA-256 content identities under count and byte limits, and runs only deployment-approved fixed argv with bounded time, output, cwd, and environment. The supervisor runs that gate once, outside SQLite write transactions, after validating the canonical completion identity. It binds and caches the result using work version, execution-scope digest, card, run, attempt, evidence fingerprint, canonical result digest, verification-input digest, and observed artifact digest. The final transaction performs only fast identity and digest checks. An applicable deterministic failure overrides a model's passed verdict. Failed or inconclusive verification moves work to `blocked` or `waiting_input`.
 
 ## Approval and outbound integration
 

@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
+from .authority import execution_scope_digest
 from .config import load_config
 from .dispatcher import dispatch_contract_digest
 from .inbound import normalize_operator_event
@@ -77,9 +78,9 @@ control_token_env = "HERMES_KANBAN_CONTROL_TOKEN"
 control_timeout_seconds = 10
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.3.0"]
-allowed_policy_versions = ["4.0.0"]
-allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
+allowed_plugin_versions = ["1.4.0"]
+allowed_policy_versions = ["5.0.0"]
+allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
 
 [obsidian]
 enabled = false
@@ -492,6 +493,30 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
         unknown_skills = set(arguments.skill) - allowed_skills
         if unknown_skills:
             raise ValueError(f"Hermes skills are not allowed: {sorted(unknown_skills)}")
+        contract_metadata = dict(item.metadata)
+        if arguments.verification_contract is not None:
+            raw_contract = arguments.verification_contract.read_bytes()
+            if len(raw_contract) > 256_000:
+                raise ValueError("Verification contract is too large")
+            try:
+                contract_value = json.loads(raw_contract.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("Verification contract must be UTF-8 JSON") from error
+            contract_metadata["verification_contract"] = validate_verification_contract(
+                contract_value,
+                service.config.verification,
+            )
+        elif arguments.clear_verification_contract:
+            contract_metadata.pop("verification_contract", None)
+        if contract_metadata.get("verification_contract") != item.metadata.get(
+            "verification_contract"
+        ):
+            item = service.store.update_work(
+                item.id,
+                {"metadata": contract_metadata},
+                actor="operator-cli",
+                expected_version=item.version,
+            )
         metadata = dict(item.metadata)
         metadata["governance"] = {
             "source_trust": "operator",
@@ -505,23 +530,16 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
             "reason": "Explicit operator CLI dispatch",
             "shadow": service.config.operator.autonomy_mode == "shadow",
         }
-        if arguments.verification_contract is not None:
-            raw_contract = arguments.verification_contract.read_bytes()
-            if len(raw_contract) > 256_000:
-                raise ValueError("Verification contract is too large")
-            try:
-                contract_value = json.loads(raw_contract.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError("Verification contract must be UTF-8 JSON") from error
-            metadata["verification_contract"] = validate_verification_contract(
-                contract_value,
-                service.config.verification,
-            )
-        elif arguments.clear_verification_contract:
-            metadata.pop("verification_contract", None)
         # The verification contract is part of the exact dispatch digest.
         item.metadata = metadata
         contract_digest_value = dispatch_contract_digest(
+            item,
+            profile=profile,
+            skills=list(arguments.skill),
+            default_skills=service.config.hermes.default_skills,
+            goal_mode=arguments.goal_mode,
+        )
+        authorization_scope_digest_value = execution_scope_digest(
             item,
             profile=profile,
             skills=list(arguments.skill),
@@ -556,6 +574,7 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
             "max_attempts": service.config.hermes.max_execution_attempts,
             "authorization_kind": "operator_direct",
             "contract_digest": contract_digest_value,
+            "authorization_scope_digest": authorization_scope_digest_value,
         }
         updated = service.store.update_work(
             item.id,
@@ -566,6 +585,7 @@ def _handle_work(service: OperatorService, arguments: argparse.Namespace) -> int
                 "metadata": metadata,
             },
             actor="operator-cli",
+            expected_version=item.version,
             allow_transition_override=True,
         )
         _emit(updated.to_dict())

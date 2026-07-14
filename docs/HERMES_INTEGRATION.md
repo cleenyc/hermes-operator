@@ -139,9 +139,19 @@ treats `pre_tool_call` registration as required and stops its own registration i
 rejects the hook. Operator-managed dispatch should remain disabled until plugin health
 verification succeeds; the plugin does not attempt to stop or reorder the Hermes host.
 
+The tested host target is Hermes Agent `0.18.2`, tag `v2026.7.7.2`, commit
+`9de9c25f620ff7f1ce0fd5457d596052d5159596`. The release CI installs that exact commit
+and exercises the real turn-ID, hook-resolution, and completion-delivery contracts as a
+required lane. A separate advisory lane runs the same contracts against current Hermes
+`main`; failures there do not weaken the pinned release gate. Other versions remain
+diagnostic-only until they are pilot-tested or added to the required compatibility lane.
+
 The plugin records a separate `compatibility_observed` diagnostic and exposes
-`operator_diagnostics`. It reports the host surfaces and detected delegation mode without
-changing policy attestation or attempting to reorder Hermes plugins and hooks. Unsupported
+`operator_diagnostics`. It reports host surfaces, active profile, hook position, and
+detected delegation mode without attempting to reorder Hermes plugins and hooks. A known
+active-profile mismatch, or known first-valid hook semantics with the Operator guard not
+first, disables bridge tools and policy attestation while leaving the local guard installed
+in fail-closed policy-only mode. Unknown internals remain visible diagnostics. Unsupported
 optional hooks reduce observation only; rejection of the required pre-tool hook disables
 the bridge for managed execution.
 
@@ -189,8 +199,8 @@ The request envelope is:
   "occurred_at": "2026-07-13T22:30:00+00:00",
   "payload": {
     "profile": "operator",
-    "plugin_version": "1.3.0",
-    "policy_version": "4.0.0",
+    "plugin_version": "1.4.0",
+    "policy_version": "5.0.0",
     "policy_digest": "<64 lowercase SHA-256 hex characters>",
     "guard_active": true,
     "policy_mode": "default_deny",
@@ -357,7 +367,7 @@ The plugin is packaged independently from the control plane. A release wheel can
 
 ```bash
 export HERMES_PLUGIN_ROOT="${HERMES_HOME:-$HOME/.hermes}/plugins"
-export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.3.0-py3-none-any.whl"
+export PLUGIN_WHEEL="/path/to/hermes_operator_plugin-1.4.0-py3-none-any.whl"
 export PLUGIN_STAGE="$(mktemp -d)"
 python -m pip install --no-deps --target "$PLUGIN_STAGE" "$PLUGIN_WHEEL"
 install -d "$HERMES_PLUGIN_ROOT"

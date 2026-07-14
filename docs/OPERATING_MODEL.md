@@ -48,8 +48,8 @@ The CLI `ingest` command and `POST /v1/ingest` create `operator` trust events. E
 - `operator.request` may authorize work creation.
 - It authorizes execution of work created from that request only when its payload has `allow_internal_execution: true`.
 - Without execution authorization, the planner may still organize new operator-owned work into planning or ready states, ask a blocking question, and recommend it. Execution mode and assignee remain disabled.
-- `operator.work_authorized` and `operator.work_updated` may update or dispatch only the exact `work_id` and listed capabilities.
-- Answering a question produces `question.answered`, which may update only the question's recorded blocking work IDs.
+- `operator.work_authorized` and `operator.work_updated` may update or dispatch only the exact `work_id`, listed capabilities, current scope revision and digest, and approved executor profile, effective skills, and goal mode.
+- Answering a question produces `question.answered`, which may update only the question's recorded per-work scope bindings while those bindings remain current.
 
 An arbitrary operator-trusted event does not receive blanket mutation or dispatch authority.
 
@@ -81,7 +81,7 @@ pending -> processing -> processed
 
 Processing uses a unique claim token and expiry. The supervisor renews its claim after the model returns and before applying the plan. If the claim has been reclaimed, the pass fails without mutation.
 
-Every claimed event needs exactly one durable disposition: work recorded, question requested, execution reconciled, memory recorded, external action proposed, duplicate, non-actionable, or quarantined. Effect-bearing dispositions are checked against the effects that actually survived policy. Non-actionable and quarantine outcomes require a specific reason. Conservatively detected task signals, including request/task event types, structured action or deadline fields, and common imperative subjects, cannot be dismissed as non-actionable. A response that omits an event, duplicates a disposition, returns empty action arrays without a disposition, or tries to dismiss task-like intake fails and leaves the event retryable.
+Every claimed event needs exactly one durable disposition: work recorded, question requested, execution reconciled, memory recorded, external action proposed, duplicate, non-actionable, or quarantined. Effect-bearing dispositions are checked against the effects that actually survived policy. Non-actionable and quarantine outcomes require a specific reason. Conservatively detected task signals, including request/task event types, structured action or deadline fields, and common imperative subjects, cannot be dismissed as non-actionable. If one is quarantined, the supervisor creates a deterministic `decision` item in `waiting_input` with `execution_mode = none`, preserves a bounded untrusted evidence preview, and creates a pending bound question for private attention delivery. A response that omits an event, duplicates a disposition, returns empty action arrays without a disposition, or tries to dismiss task-like intake fails and leaves the event retryable.
 
 A validated plan, event dispositions, event consumption, finalized plan record, last-pass state, and completion audit commit in one immediate SQLite transaction. A late validation or version failure rolls back all plan effects.
 
@@ -176,7 +176,7 @@ Answering a question:
 3. Creates an operator-trusted `question.answered` event.
 4. Wakes the live loop.
 
-That event can update only the work IDs already linked to the question. It cannot authorize unrelated work.
+That event can update only the work IDs already linked to the question, and only when each persisted scope revision and digest still matches. The answer remains recorded even when a binding is stale, but no stale mutation or dispatch is applied and a durable reauthorization follow-up is created. If the work was not execution-authorized when the question was created, its answer cannot make it executable. If an answer materially changes title, description, criteria, hierarchy, schedule, recurrence, or verifier contract, the resulting scope needs fresh explicit authorization before dispatch.
 
 ## Hermes dispatch policy
 

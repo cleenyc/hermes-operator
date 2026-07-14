@@ -191,17 +191,75 @@ class OperatorClient:
             raise OperatorUnavailable("operator returned an invalid question result")
         return data
 
-    def authorize_work(self, work_id: str, reason: str = "") -> Any:
-        """Authorize exactly one work ID after Hermes native human approval."""
+    def authorize_work(
+        self,
+        work_id: str,
+        expected_version: int,
+        reason: str = "",
+        *,
+        profile: str | None = None,
+        skills: list[str] | None = None,
+        goal_mode: bool | None = None,
+    ) -> Any:
+        """Authorize one exact work version and execution shape after approval."""
 
         work_id = _required_identity(work_id, "work_id")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+        ):
+            raise ValueError("expected_version must be a positive integer")
         reason = _bounded_text(reason, "reason", 2_000)
+        body: dict[str, Any] = {"expected_version": expected_version}
+        if reason.strip():
+            body["reason"] = reason
+        if profile is not None:
+            body["profile"] = _bounded_text(
+                profile, "profile", 128, required=True
+            ).strip()
+        if skills is not None:
+            if not isinstance(skills, list) or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 128
+                for value in skills
+            ):
+                raise ValueError("skills must be a list of nonempty bounded strings")
+            body["skills"] = [value.strip() for value in skills]
+        if goal_mode is not None:
+            if not isinstance(goal_mode, bool):
+                raise ValueError("goal_mode must be a boolean")
+            body["goal_mode"] = goal_mode
         path = f"/v1/hermes/work/{parse.quote(work_id, safe='')}/authorize"
-        body = {"reason": reason} if reason.strip() else {}
         data = self._request("POST", path, body).data
+        expected_keys = {
+            "authorization_scope_digest",
+            "authorization_scope_revision",
+            "created",
+            "event_id",
+            "goal_mode",
+            "profile",
+            "skills",
+            "work_id",
+            "work_version",
+        }
         if (
             not isinstance(data, Mapping)
+            or set(data) != expected_keys
             or data.get("work_id") != work_id
+            or data.get("work_version") != expected_version
+            or not isinstance(data.get("authorization_scope_revision"), int)
+            or isinstance(data.get("authorization_scope_revision"), bool)
+            or data["authorization_scope_revision"] < 1
+            or not isinstance(data.get("authorization_scope_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", data["authorization_scope_digest"])
+            or not isinstance(data.get("profile"), str)
+            or not data["profile"]
+            or not isinstance(data.get("skills"), list)
+            or any(
+                not isinstance(value, str) or not value
+                for value in data["skills"]
+            )
+            or not isinstance(data.get("goal_mode"), bool)
             or not isinstance(data.get("event_id"), str)
             or not isinstance(data.get("created"), bool)
         ):
@@ -237,6 +295,46 @@ class OperatorClient:
             or not isinstance(work.get("version"), int)
         ):
             raise OperatorUnavailable("operator returned an invalid work update")
+        return data
+
+    def resolve_reminder(
+        self,
+        work_id: str,
+        expected_version: int,
+        action: str,
+        *,
+        until: str | None = None,
+    ) -> Any:
+        """Apply a reminder lifecycle action without changing its schedule anchor."""
+
+        work_id = _required_identity(work_id, "work_id")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+        ):
+            raise ValueError("expected_version must be a positive integer")
+        if action not in {"snooze", "acknowledge", "complete"}:
+            raise ValueError("action must be snooze, acknowledge, or complete")
+        body: dict[str, Any] = {
+            "expected_version": expected_version,
+            "action": action,
+        }
+        if action == "snooze":
+            body["until"] = _optional_timestamp(until, "until")
+            if body["until"] is None:
+                raise ValueError("snooze requires an ISO 8601 until timestamp")
+        elif until is not None:
+            raise ValueError("until is accepted only for snooze")
+        path = f"/v1/hermes/work/{parse.quote(work_id, safe='')}/reminder"
+        data = self._request("POST", path, body).data
+        work = data.get("work") if isinstance(data, Mapping) else None
+        if (
+            not isinstance(work, Mapping)
+            or work.get("id") != work_id
+            or not isinstance(work.get("version"), int)
+        ):
+            raise OperatorUnavailable("operator returned an invalid reminder result")
         return data
 
     def ingest_inbound(self, source: str, events: list[Mapping[str, Any]]) -> Any:
@@ -529,6 +627,7 @@ class OperatorClient:
                 re.fullmatch(r"/v1/hermes/questions/[^/]+/answer", endpoint)
                 or re.fullmatch(r"/v1/hermes/work/[^/]+/authorize", endpoint)
                 or re.fullmatch(r"/v1/hermes/work/[^/]+/update", endpoint)
+                or re.fullmatch(r"/v1/hermes/work/[^/]+/reminder", endpoint)
             )
         )
         if (normalized_method, endpoint) not in allowed and not bridge_mutation:
@@ -539,7 +638,7 @@ class OperatorClient:
         encoded = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "hermes-operator-plugin/1.3.0",
+            "User-Agent": "hermes-operator-plugin/1.4.0",
         }
         if body is not None:
             encoded = json.dumps(

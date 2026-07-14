@@ -154,9 +154,9 @@ The example allows:
 ```toml
 require_policy_attestation = true
 policy_attestation_ttl_seconds = 300
-allowed_plugin_versions = ["1.3.0"]
-allowed_policy_versions = ["4.0.0"]
-allowed_policy_digests = ["dde4664b6db0ac57fb5ef9b773e2f707c63831cc81ad0086a139f76dbfd17685"]
+allowed_plugin_versions = ["1.4.0"]
+allowed_policy_versions = ["5.0.0"]
+allowed_policy_digests = ["d60b426683ab183711e24656bb6dadf28ef4906860bab06ddd2e37f75110efeb"]
 ```
 
 The plugin performs a synchronous startup attestation and starts one process-scoped daemon heartbeat that attempts refresh every 120 seconds by default. Normal hooks share the same lock and rate limiter. Core dispatch validates freshness, profile, active default-deny guard, plugin version, policy version, and source digest. The dispatch reservation also binds the exact attestation state digest used for its decision. Enabling Hermes with required attestation also requires the built-in HTTP server and a nonempty bridge token; configuration fails closed otherwise.

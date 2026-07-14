@@ -364,11 +364,17 @@ class APITests(unittest.TestCase):
         status, authorized = self.request(
             "POST",
             f"/v1/hermes/work/{work_id}/authorize",
-            document={"reason": "The operator approved internal execution"},
+            document={
+                "expected_version": item.version,
+                "reason": "The operator approved internal execution",
+            },
             headers=self.bridge_headers(),
         )
         self.assertEqual(status, 202)
         self.assertEqual(authorized["work_id"], work_id)
+        self.assertEqual(authorized["work_version"], item.version)
+        self.assertEqual(authorized["authorization_scope_revision"], 2)
+        self.assertEqual(len(authorized["authorization_scope_digest"]), 64)
         with self.store.connection() as connection:
             row = connection.execute(
                 "SELECT source, event_type, trust_level, payload_json FROM events "
@@ -378,15 +384,47 @@ class APITests(unittest.TestCase):
         self.assertEqual(row["source"], "operator")
         self.assertEqual(row["event_type"], "operator.work_authorized")
         self.assertEqual(row["trust_level"], "operator")
-        self.assertEqual(json.loads(row["payload_json"])["work_id"], work_id)
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["work_id"], work_id)
+        self.assertEqual(payload["work_version"], item.version)
+        self.assertEqual(
+            payload["scope_digest"],
+            authorized["authorization_scope_digest"],
+        )
 
         status, _ = self.request(
             "POST",
             f"/v1/hermes/work/{work_id}/authorize",
-            document={},
+            document={"expected_version": item.version},
             headers=self.operator_headers(),
         )
         self.assertEqual(status, 401)
+
+    def test_bridge_authorization_rejects_a_revision_changed_before_capture(self) -> None:
+        item = WorkItem(title="Displayed revision")
+        self.store.create_work(item)
+        self.store.update_work(
+            item.id,
+            {"description": "Changed after it was displayed"},
+            expected_version=item.version,
+            actor="operator-api",
+        )
+
+        status, document = self.request(
+            "POST",
+            f"/v1/hermes/work/{item.id}/authorize",
+            document={"expected_version": item.version},
+            headers=self.bridge_headers(),
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(document["error"]["code"], "state_conflict")
+        with self.store.connection() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_type = 'operator.work_authorized'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_bridge_google_skill_ingress_is_revision_deduplicated_untrusted_evidence(self) -> None:
         envelope = {
@@ -454,8 +492,16 @@ class APITests(unittest.TestCase):
             status=WorkStatus.READY,
             due_at="2099-01-01T09:00:00Z",
         )
+        snoozed = WorkItem(
+            title="Review after snooze",
+            kind=WorkKind.REMINDER,
+            status=WorkStatus.READY,
+            due_at="2020-01-01T09:00:00Z",
+            reminder_snoozed_until="2099-01-02T09:00:00Z",
+        )
         self.store.create_work(due)
         self.store.create_work(future)
+        self.store.create_work(snoozed)
 
         status, document = self.request(
             "GET",
@@ -475,6 +521,17 @@ class APITests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual([item["id"] for item in preview["items"]], [due.id])
+
+        status, attention_preview = self.request(
+            "GET",
+            "/v1/hermes/attention?limit=20",
+            headers=self.bridge_headers(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in attention_preview["reminders"]],
+            [due.id],
+        )
 
         status, claimed = self.request(
             "POST",

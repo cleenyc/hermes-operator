@@ -36,6 +36,179 @@ _SAFE_ENV_NAMES = {
 }
 
 
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def verification_input_digest(
+    work: WorkItem,
+    completion: Mapping[str, Any],
+) -> str:
+    """Hash the immutable declarations consumed by deterministic verification.
+
+    This is intentionally a metadata-only operation. It does not resolve paths,
+    read files, or execute checks, so callers may safely recompute it while
+    validating a previously prepared report inside a short database transaction.
+    """
+
+    evidence_artifacts, extraction_errors = ArtifactVerifier._extract_artifacts(
+        completion
+    )
+    return _canonical_digest(
+        {
+            "verification_contract": work.metadata.get("verification_contract"),
+            "evidence_artifacts": evidence_artifacts,
+            "extraction_errors": extraction_errors,
+        }
+    )
+
+
+def bind_verification_report(
+    report: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one verifier result to canonical completion and artifact identities."""
+
+    detached = json.loads(
+        json.dumps(
+            dict(report),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    expected_report_keys = {
+        "schema_version",
+        "applicable",
+        "passed",
+        "artifacts",
+        "checks",
+        "errors",
+        "verified_at",
+    }
+    if set(detached) != expected_report_keys:
+        raise ValueError("deterministic verification report has an invalid shape")
+    artifacts = detached.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("deterministic verification artifacts must be a list")
+    detached_binding = json.loads(
+        json.dumps(
+            dict(binding),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    detached_binding["artifact_report_digest"] = _canonical_digest(artifacts)
+    detached_binding["binding_digest"] = _canonical_digest(detached_binding)
+    detached["binding"] = detached_binding
+    detached["report_digest"] = _canonical_digest(detached)
+    return detached
+
+
+def validate_bound_verification_report(
+    report: Mapping[str, Any],
+    expected_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fast-validate a prepared report without touching files or subprocesses."""
+
+    try:
+        detached = json.loads(
+            json.dumps(
+                dict(report),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("deterministic verification report is not canonical JSON") from error
+    expected_report_keys = {
+        "schema_version",
+        "applicable",
+        "passed",
+        "artifacts",
+        "checks",
+        "errors",
+        "verified_at",
+        "binding",
+        "report_digest",
+    }
+    if set(detached) != expected_report_keys:
+        raise ValueError("deterministic verification report has an invalid shape")
+    if (
+        detached.get("schema_version") != 1
+        or not isinstance(detached.get("applicable"), bool)
+        or not isinstance(detached.get("passed"), bool)
+        or not isinstance(detached.get("artifacts"), list)
+        or not isinstance(detached.get("checks"), list)
+        or not isinstance(detached.get("errors"), list)
+        or not all(isinstance(value, str) for value in detached["errors"])
+        or not isinstance(detached.get("verified_at"), str)
+        or not detached["verified_at"]
+    ):
+        raise ValueError("deterministic verification report fields are invalid")
+    for artifact in detached["artifacts"]:
+        if (
+            not isinstance(artifact, dict)
+            or not isinstance(artifact.get("sha256"), str)
+            or _SHA256_RE.fullmatch(artifact["sha256"]) is None
+        ):
+            raise ValueError("deterministic verification artifact digest is invalid")
+    if not all(isinstance(value, dict) for value in detached["checks"]):
+        raise ValueError("deterministic verification checks are invalid")
+
+    raw_binding = detached.get("binding")
+    if not isinstance(raw_binding, dict):
+        raise ValueError("deterministic verification binding is missing")
+    expected = json.loads(
+        json.dumps(
+            dict(expected_binding),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    expected_keys = set(expected) | {"artifact_report_digest", "binding_digest"}
+    if set(raw_binding) != expected_keys:
+        raise ValueError("deterministic verification binding has an invalid shape")
+    for key, value in expected.items():
+        if raw_binding.get(key) != value:
+            raise ValueError(
+                f"deterministic verification binding mismatch: {key}"
+            )
+    if raw_binding.get("artifact_report_digest") != _canonical_digest(
+        detached["artifacts"]
+    ):
+        raise ValueError("deterministic verification artifact binding mismatch")
+    supplied_binding_digest = raw_binding.get("binding_digest")
+    if not isinstance(supplied_binding_digest, str):
+        raise ValueError("deterministic verification binding digest is missing")
+    binding_without_digest = dict(raw_binding)
+    binding_without_digest.pop("binding_digest", None)
+    if supplied_binding_digest != _canonical_digest(binding_without_digest):
+        raise ValueError("deterministic verification binding digest mismatch")
+    supplied_report_digest = detached.get("report_digest")
+    if not isinstance(supplied_report_digest, str):
+        raise ValueError("deterministic verification report digest is missing")
+    report_without_digest = dict(detached)
+    report_without_digest.pop("report_digest", None)
+    if supplied_report_digest != _canonical_digest(report_without_digest):
+        raise ValueError("deterministic verification report digest mismatch")
+    return detached
+
+
 def validate_verification_contract(
     value: Any,
     config: VerificationConfig,

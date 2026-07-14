@@ -29,7 +29,6 @@ from .models import (
     WorkStatus,
     utc_now,
 )
-from .verifier import ArtifactVerifier
 
 
 logger = logging.getLogger(__name__)
@@ -143,7 +142,6 @@ class HermesDispatcher:
         self.should_stop = should_stop or (lambda: False)
         self.leadership_guard = leadership_guard or (lambda: None)
         self.actor = f"dispatcher:{config.operator.instance_id}"
-        self.verifier = ArtifactVerifier(config.verification)
 
     def cycle(self) -> DispatchReport:
         """Reconcile linked cards, then fill available execution capacity."""
@@ -1140,11 +1138,6 @@ class HermesDispatcher:
         ):
             return False, None
 
-        deterministic_verification = self.verifier.verify(
-            work=item,
-            completion=payload,
-        ).to_dict()
-
         metadata = self._hermes_metadata(item, task, phase="awaiting_verification")
         hermes_metadata = metadata.get("hermes", {})
         if isinstance(hermes_metadata, dict):
@@ -1179,7 +1172,6 @@ class HermesDispatcher:
                 "acceptance_criteria": item.acceptance_criteria,
                 "execution_evidence": payload,
                 "evidence_fingerprint": fingerprint,
-                "deterministic_verification": deterministic_verification,
             },
             provenance={
                 "adapter": "hermes-kanban",

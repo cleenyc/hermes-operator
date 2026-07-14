@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .approvals import ApprovalStateError, ExternalActionStager
+from .authority import execution_scope_binding
 from .db import NotFound, SQLiteStore, StateConflict
 from .inbound import (
     InboundValidationError,
@@ -49,6 +50,9 @@ class APIContext:
     action_stager: ExternalActionStager | None = None
     allow_unsigned_webhooks: bool = False
     attention_redelivery_seconds: int = 3600
+    authorization_profile: str = "operator"
+    authorization_default_skills: Sequence[str] = field(default_factory=tuple)
+    authorization_goal_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.max_body_bytes < 1:
@@ -65,6 +69,15 @@ class APIContext:
             and hmac.compare_digest(self.api_token, self.bridge_token)
         ):
             raise ValueError("Operator and Hermes bridge tokens must be distinct")
+        if self.authorization_profile and not self.authorization_profile.strip():
+            raise ValueError("authorization_profile must be empty or nonempty text")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in self.authorization_default_skills
+        ):
+            raise ValueError(
+                "authorization_default_skills must contain nonempty strings"
+            )
         reserved = RESERVED_WEBHOOK_SOURCES.intersection(self.webhook_secrets)
         if reserved:
             raise ValueError(
@@ -654,6 +667,14 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 context.store.create_work(item, actor="hermes-bridge")
+                authority_binding = execution_scope_binding(
+                    item,
+                    profile=item.assignee or context.authorization_profile,
+                    skills=(),
+                    default_skills=context.authorization_default_skills,
+                    goal_mode=context.authorization_goal_mode,
+                    execution_authorized=False,
+                )
                 event = Event(
                     source="operator",
                     event_type="operator.work_updated",
@@ -662,6 +683,10 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     trust_level=TrustLevel.OPERATOR,
                     payload={
                         "work_id": item.id,
+                        "work_version": item.version,
+                        "scope_revision": item.authorization_scope_revision,
+                        "scope_digest": authority_binding["scope_digest"],
+                        "authorization_binding": authority_binding,
                         "capabilities": ["update"],
                         "reason": "User captured work in a Hermes conversation",
                     },
@@ -894,41 +919,59 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                 ).strip("/")
                 if not work_id or "/" in work_id:
                     raise APIError(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found")
-                item = context.store.get_work(work_id)
                 _, document = self._read_json(allow_empty=True)
-                if set(document) - {"reason"}:
-                    raise ValueError("authorize accepts only an optional reason")
+                allowed = {
+                    "expected_version",
+                    "reason",
+                    "profile",
+                    "skills",
+                    "goal_mode",
+                }
+                if set(document) - allowed or "expected_version" not in document:
+                    raise ValueError(
+                        "authorize requires expected_version and accepts optional reason, profile, skills, and goal_mode"
+                    )
+                expected_version = document.get("expected_version")
+                if (
+                    not isinstance(expected_version, int)
+                    or isinstance(expected_version, bool)
+                    or expected_version < 1
+                ):
+                    raise ValueError("expected_version must be a positive integer")
                 reason = document.get("reason", "Explicit approval in Hermes")
                 if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
                     raise ValueError("reason must be a nonempty string of at most 2000 characters")
-                authorization_id = f"hermes-authorize:{uuid.uuid4().hex}"
-                event = Event(
-                    source="operator",
-                    event_type="operator.work_authorized",
-                    external_id=authorization_id,
-                    dedupe_key=authorization_id,
-                    trust_level=TrustLevel.OPERATOR,
-                    payload={
-                        "work_id": item.id,
-                        "work_version": item.version,
-                        "capabilities": ["update", "dispatch"],
-                        "reason": reason.strip(),
-                    },
-                    provenance={
-                        "ingress": "hermes-bridge",
-                        "authenticated": True,
-                        "actor": "hermes-user-approved",
-                    },
+                item = context.store.get_work(work_id)
+                profile = document.get(
+                    "profile", item.assignee or context.authorization_profile
                 )
-                event_id, created = context.store.enqueue_event(
-                    event,
+                skills = document.get("skills", [])
+                goal_mode = document.get(
+                    "goal_mode", context.authorization_goal_mode
+                )
+                if not isinstance(profile, str) or not profile.strip():
+                    raise ValueError("profile must be a nonempty string")
+                if not isinstance(skills, list) or not all(
+                    isinstance(value, str) and value.strip() for value in skills
+                ):
+                    raise ValueError("skills must be a list of nonempty strings")
+                if not isinstance(goal_mode, bool):
+                    raise ValueError("goal_mode must be a boolean")
+                result = context.store.enqueue_work_authorization(
+                    work_id,
+                    expected_version=expected_version,
+                    profile=profile,
+                    skills=skills,
+                    default_skills=context.authorization_default_skills,
+                    goal_mode=goal_mode,
+                    reason=reason.strip(),
                     actor="hermes-user-approved",
                 )
-                if created:
+                if result["created"]:
                     self._wake("hermes-work-authorized")
                 self._send_json(
                     HTTPStatus.ACCEPTED,
-                    {"work_id": item.id, "event_id": event_id, "created": created},
+                    result,
                 )
                 return
 
@@ -1443,7 +1486,11 @@ def _handler_for(context: APIContext) -> type[BaseHTTPRequestHandler]:
                     WorkStatus.ARCHIVED,
                 }:
                     continue
-                raw_due = item.due_at or item.scheduled_at
+                raw_due = (
+                    item.reminder_snoozed_until
+                    or item.due_at
+                    or item.scheduled_at
+                )
                 if not raw_due:
                     continue
                 try:
